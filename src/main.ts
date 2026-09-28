@@ -48,7 +48,11 @@ export async function run(): Promise<void> {
     if (!token) throw new Error("Missing github-token (GITHUB_TOKEN).");
     const octokit = github.getOctokit(token);
     const ctx = github.context;
-    const prNumber = ctx.payload.pull_request?.number ?? Number(process.env.PR_NUMBER ?? 0);
+    const issue = (ctx.payload as any).issue;
+    const prNumber =
+      ctx.payload.pull_request?.number ??
+      (issue?.pull_request ? issue.number : undefined) ??
+      Number(process.env.PR_NUMBER ?? 0);
     if (!prNumber) {
       core.warning("No pull_request context; nothing to review. (Supports pull_request + issue_comment /review)");
       return;
@@ -122,12 +126,16 @@ export async function run(): Promise<void> {
     core.setOutput("verdict", global);
 
     const runUrl = `${process.env.GITHUB_SERVER_URL ?? "https://github.com"}/${owner}/${repo}/actions/runs/${process.env.GITHUB_RUN_ID ?? ""}`;
-    const sticky = renderStickyBody({
+    const stickyBase = renderStickyBody({
       verdict: global,
       perReview: perReview.map((r) => ({ id: r.id, verdict: r.verdict, count: r.findings.length })),
       findings: all,
       runUrl,
     });
+    const hasAnyKey = Boolean(keys.anthropicApiKey || keys.openaiApiKey || keys.opencodeApiKey);
+    const sticky = hasAnyKey
+      ? stickyBase
+      : `${stickyBase}\n\n> ⚠️ No provider API keys configured — agents were skipped. Add \`ANTHROPIC_API_KEY\`, \`OPENAI_API_KEY\`, or \`OPENCODE_API_KEY\` as repo Actions secrets (only the ones your \`providers{}\` use).`;
 
     if (dryRun) {
       core.info(`DRY RUN verdict=${global}\n${sticky.slice(0, 2000)}`);
