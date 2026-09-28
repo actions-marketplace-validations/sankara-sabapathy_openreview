@@ -8,11 +8,37 @@ export const ProviderKind = z.enum([
 ]);
 export type ProviderKind = z.infer<typeof ProviderKind>;
 
+export const ProviderProtocol = z.enum(["openai-chat", "anthropic-messages"]);
+export type ProviderProtocol = z.infer<typeof ProviderProtocol>;
+
+export const AuthConfig = z.object({
+  // Header carrying the key. "Authorization" (default), "x-api-key", "api-key" (Azure).
+  header: z.string().default("Authorization"),
+  // Scheme prefix, e.g. "Bearer". "" sends the raw key (Azure api-key style).
+  scheme: z.string().default("Bearer"),
+});
+export type AuthConfig = z.infer<typeof AuthConfig>;
+
 export const ProviderConfig = z.object({
-  kind: ProviderKind.default("openai"),
+  // Deprecated alias kept for back-compat; maps to protocol + default base_url.
+  // Prefer the generic fields below: any provider works with base_url + key_from + model.
+  kind: ProviderKind.optional(),
+  protocol: ProviderProtocol.optional(),
   model: z.string(),
   base_url: z.string().optional(),
-  key_from: z.string().optional(), // e.g. "secrets.ANTHROPIC_API_KEY" (docs only; action reads inputs/env)
+  // Env var holding the key: "secrets.MY_KEY" or "env.MY_KEY" -> $MY_KEY.
+  // Falls back to legacy fixed inputs (ANTHROPIC_API_KEY / OPENAI_API_KEY / OPENCODE_API_KEY).
+  key_from: z.string().optional(),
+  auth: AuthConfig.default({}),
+  // Extra headers merged into every request (e.g. custom gateway headers).
+  headers: z.record(z.string()).default({}),
+  // Endpoint path appended to base_url. Defaults: "/chat/completions" (openai-chat),
+  // "/v1/messages" (anthropic-messages).
+  endpoint_path: z.string().optional(),
+  // Send response_format json_object (openai-chat). Disable for providers that reject it.
+  json_mode: z.boolean().default(true),
+  // Extra JSON body fields merged into the request (provider-specific params).
+  extra_body: z.record(z.unknown()).default({}),
 });
 export type ProviderConfig = z.infer<typeof ProviderConfig>;
 

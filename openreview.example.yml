@@ -22,6 +22,19 @@ providers:
     model: big-pickle
     key_from: secrets.OPENCODE_API_KEY
     base_url: https://opencode.ai/zen/v1 # Go subscription: https://opencode.ai/zen/go/v1 (models: glm-5.3-flash, kimi-k2.7-code, ...)
+  # Any OpenAI-compatible provider works with protocol + base_url + key_from + model:
+  groq:
+    protocol: openai-chat
+    model: llama-3.3-70b-versatile
+    base_url: https://api.groq.com/openai/v1
+    key_from: secrets.GROQ_API_KEY
+  # Azure OpenAI uses an api-key header with no scheme:
+  azure:
+    protocol: openai-chat
+    model: my-deployment
+    base_url: https://RESOURCE.openai.azure.com/openai/deployments/my-deployment
+    key_from: secrets.AZURE_OPENAI_KEY
+    auth: { header: api-key, scheme: "" }
 
 reviews:
   - id: security-strict

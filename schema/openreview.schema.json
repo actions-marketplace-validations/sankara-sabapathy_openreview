@@ -25,9 +25,21 @@
         "required": ["model"],
         "properties": {
           "kind": { "enum": ["anthropic", "openai", "opencode", "openai-compatible"] },
+          "protocol": { "enum": ["openai-chat", "anthropic-messages"] },
           "model": { "type": "string" },
           "base_url": { "type": "string" },
-          "key_from": { "type": "string" }
+          "key_from": { "type": "string" },
+          "auth": {
+            "type": "object",
+            "properties": {
+              "header": { "type": "string" },
+              "scheme": { "type": "string" }
+            }
+          },
+          "headers": { "type": "object", "additionalProperties": { "type": "string" } },
+          "endpoint_path": { "type": "string" },
+          "json_mode": { "type": "boolean" },
+          "extra_body": { "type": "object" }
         }
       }
     },

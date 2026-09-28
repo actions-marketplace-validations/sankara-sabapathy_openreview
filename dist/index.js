@@ -44488,11 +44488,33 @@ const ProviderKind = enumType([
     "opencode",
     "openai-compatible",
 ]);
+const ProviderProtocol = enumType(["openai-chat", "anthropic-messages"]);
+const AuthConfig = objectType({
+    // Header carrying the key. "Authorization" (default), "x-api-key", "api-key" (Azure).
+    header: stringType().default("Authorization"),
+    // Scheme prefix, e.g. "Bearer". "" sends the raw key (Azure api-key style).
+    scheme: stringType().default("Bearer"),
+});
 const ProviderConfig = objectType({
-    kind: ProviderKind.default("openai"),
+    // Deprecated alias kept for back-compat; maps to protocol + default base_url.
+    // Prefer the generic fields below: any provider works with base_url + key_from + model.
+    kind: ProviderKind.optional(),
+    protocol: ProviderProtocol.optional(),
     model: stringType(),
     base_url: stringType().optional(),
-    key_from: stringType().optional(), // e.g. "secrets.ANTHROPIC_API_KEY" (docs only; action reads inputs/env)
+    // Env var holding the key: "secrets.MY_KEY" or "env.MY_KEY" -> $MY_KEY.
+    // Falls back to legacy fixed inputs (ANTHROPIC_API_KEY / OPENAI_API_KEY / OPENCODE_API_KEY).
+    key_from: stringType().optional(),
+    auth: AuthConfig.default({}),
+    // Extra headers merged into every request (e.g. custom gateway headers).
+    headers: recordType(stringType()).default({}),
+    // Endpoint path appended to base_url. Defaults: "/chat/completions" (openai-chat),
+    // "/v1/messages" (anthropic-messages).
+    endpoint_path: stringType().optional(),
+    // Send response_format json_object (openai-chat). Disable for providers that reject it.
+    json_mode: booleanType().default(true),
+    // Extra JSON body fields merged into the request (provider-specific params).
+    extra_body: recordType(unknownType()).default({}),
 });
 const AgentConfig = objectType({
     name: stringType().optional(),
@@ -44556,18 +44578,16 @@ function truncate(s, n) {
     return s.length > n ? s.slice(0, n) + "\n...[truncated]" : s;
 }
 async function callAnthropic(opts) {
-    const res = await fetch("https://api.anthropic.com/v1/messages", {
+    const base = opts.baseUrl.replace(/\/$/, "");
+    const res = await fetch(`${base}${opts.endpointPath}`, {
         method: "POST",
-        headers: {
-            "content-type": "application/json",
-            "x-api-key": opts.apiKey,
-            "anthropic-version": "2023-06-01",
-        },
+        headers: opts.headers,
         body: JSON.stringify({
             model: opts.model,
             max_tokens: 2000,
             system: opts.system,
             messages: [{ role: "user", content: opts.user }],
+            ...opts.extraBody,
         }),
     });
     if (!res.ok)
@@ -44581,64 +44601,123 @@ async function callAnthropic(opts) {
 }
 async function callOpenAICompatible(opts) {
     const base = opts.baseUrl.replace(/\/$/, "");
-    const headers = {
-        "content-type": "application/json",
-        authorization: `Bearer ${opts.apiKey}`,
+    const body = {
+        model: opts.model,
+        messages: [
+            { role: "system", content: opts.system },
+            { role: "user", content: opts.user },
+        ],
+        temperature: 0.2,
+        max_tokens: 2000,
+        ...opts.extraBody,
     };
-    if (base.includes("opencode.ai")) {
-        // OpenCode Zen/Go require coding-agent traffic identification + stable session.
-        headers["user-agent"] = "OpenReview/1.0 (github-action)";
-        headers["x-opencode-session"] = opts.sessionId;
-    }
-    const res = await fetch(`${base}/chat/completions`, {
+    if (opts.jsonMode)
+        body.response_format = { type: "json_object" };
+    const res = await fetch(`${base}${opts.endpointPath}`, {
         method: "POST",
-        headers,
-        body: JSON.stringify({
-            model: opts.model,
-            messages: [
-                { role: "system", content: opts.system },
-                { role: "user", content: opts.user },
-            ],
-            temperature: 0.2,
-            max_tokens: 2000,
-            response_format: { type: "json_object" },
-        }),
+        headers: opts.headers,
+        body: JSON.stringify(body),
     });
     if (!res.ok)
         throw new Error(`llm ${base} ${res.status}: ${await res.text()}`);
     const j = (await res.json());
     return j.choices?.[0]?.message?.content ?? '{"findings":[]}';
 }
-function pickKey(providerName, provider, keys) {
-    const kind = provider.kind;
+function kindDefaults(kind) {
+    switch (kind) {
+        case "anthropic":
+            return { protocol: "anthropic-messages", baseUrl: "https://api.anthropic.com" };
+        case "openai":
+            return { protocol: "openai-chat", baseUrl: "https://api.openai.com/v1" };
+        case "opencode":
+        case "openai-compatible":
+            return { protocol: "openai-chat", baseUrl: "https://opencode.ai/zen/go/v1" };
+        default:
+            return { protocol: "openai-chat", baseUrl: "https://api.openai.com/v1" };
+    }
+}
+function legacyKey(kind, keys) {
     if (kind === "anthropic")
-        return { apiKey: keys.anthropicApiKey, baseUrl: "https://api.anthropic.com" };
+        return keys.anthropicApiKey;
     if (kind === "openai")
-        return { apiKey: keys.openaiApiKey, baseUrl: "https://api.openai.com/v1" };
-    // opencode + openai-compatible share the OpenAI-compatible path
+        return keys.openaiApiKey;
+    return keys.opencodeApiKey || keys.openaiApiKey;
+}
+function resolveProvider(provider, keys, env, sessionId) {
+    const def = kindDefaults(provider.kind);
+    const protocol = provider.protocol ?? def.protocol;
+    const baseUrl = provider.base_url ?? def.baseUrl;
+    const endpointPath = provider.endpoint_path ??
+        (protocol === "anthropic-messages" ? "/v1/messages" : "/chat/completions");
+    // key_from: "secrets.FOO" | "env.FOO" -> $FOO, else legacy fixed inputs.
+    let apiKey = "";
+    if (provider.key_from) {
+        const name = provider.key_from.replace(/^(secrets|env)\./, "");
+        apiKey = env[name] ?? "";
+    }
+    if (!apiKey)
+        apiKey = legacyKey(provider.kind, keys);
+    const headers = {
+        "content-type": "application/json",
+        // Identify as coding-agent traffic (required by OpenCode Go/Zen, harmless elsewhere).
+        "user-agent": "OpenReview/1.0 (github-action)",
+        "x-opencode-session": sessionId,
+        ...Object.fromEntries(Object.entries(provider.headers).map(([k, v]) => [k.toLowerCase(), v])),
+    };
+    const authHeader = (provider.auth.header || "Authorization").toLowerCase();
+    const authCustomized = provider.auth.header !== "Authorization" || provider.auth.scheme !== "Bearer";
+    if (protocol === "anthropic-messages" && !authCustomized) {
+        // Anthropic default: x-api-key carries the raw key.
+        headers["x-api-key"] = apiKey;
+    }
+    else {
+        headers[authHeader] = provider.auth.scheme
+            ? `${provider.auth.scheme} ${apiKey}`
+            : apiKey;
+    }
+    if (protocol === "anthropic-messages" && !headers["anthropic-version"]) {
+        headers["anthropic-version"] = "2023-06-01";
+    }
     return {
-        apiKey: keys.opencodeApiKey || keys.openaiApiKey,
-        baseUrl: provider.base_url || keys.opencodeBaseUrl,
+        protocol,
+        apiKey,
+        baseUrl,
+        endpointPath,
+        headers,
+        jsonMode: provider.json_mode,
+        extraBody: provider.extra_body ?? {},
     };
 }
 async function runAgent(opts) {
     const system = SYSTEM_WRAPPER(opts.lang, opts.instructions);
     const user = `Review this unified diff (truncated):\n\n${truncate(opts.diff, opts.maxDiffChars)}`;
-    const { apiKey, baseUrl } = pickKey(opts.providerName, opts.provider, opts.keys);
-    if (!apiKey)
+    const rp = resolveProvider(opts.provider, opts.keys, process.env, opts.sessionId);
+    if (!rp.apiKey)
         return []; // missing BYOK key -> skip silently, caller warns
     let raw;
-    if (opts.provider.kind === "anthropic") {
-        raw = await callAnthropic({ apiKey, model: opts.provider.model, system, user });
-    }
-    else {
-        raw = await callOpenAICompatible({
-            apiKey,
-            baseUrl,
+    if (rp.protocol === "anthropic-messages") {
+        raw = await callAnthropic({
+            apiKey: rp.apiKey,
+            baseUrl: rp.baseUrl,
+            endpointPath: rp.endpointPath,
+            headers: rp.headers,
             model: opts.provider.model,
             system,
             user,
-            sessionId: opts.sessionId,
+            extraBody: rp.extraBody,
+        });
+    }
+    else {
+        raw = await callOpenAICompatible({
+            apiKey: rp.apiKey,
+            baseUrl: rp.baseUrl,
+            endpointPath: rp.endpointPath,
+            headers: rp.headers,
+            model: opts.provider.model,
+            system,
+            user,
+            jsonMode: rp.jsonMode,
+            extraBody: rp.extraBody,
         });
     }
     try {
