@@ -1,0 +1,42 @@
+name: "OpenReview"
+description: "Free BYOK multi-provider multi-agent PR review. Configure via .github/openreview.yml"
+author: "OpenReview"
+branding:
+  icon: "eye"
+  color: "blue"
+inputs:
+  github-token:
+    description: "GITHUB_TOKEN for posting comments/checks"
+    required: true
+    default: ${{ github.token }}
+  config-path:
+    description: "Path to config file"
+    required: false
+    default: ".github/openreview.yml"
+  anthropic-api-key:
+    description: "BYOK: Anthropic API key (Claude)"
+    required: false
+    default: ""
+  openai-api-key:
+    description: "BYOK: OpenAI API key (Codex)"
+    required: false
+    default: ""
+  opencode-api-key:
+    description: "BYOK: OpenCode / Zen API key"
+    required: false
+    default: ""
+  opencode-base-url:
+    description: "OpenCode OpenAI-compatible base URL"
+    required: false
+    default: "https://api.opencode.ai/v1"
+  dry-run:
+    description: "If true, log verdict without posting"
+    required: false
+    default: "false"
+outputs:
+  verdict:
+    description: "Global verdict: approve|comment|request_changes"
+    value: ${{ steps.review.outputs.verdict }}
+runs:
+  using: "node20"
+  main: "dist/index.js"

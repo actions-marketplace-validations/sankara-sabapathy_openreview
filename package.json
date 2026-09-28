@@ -1,0 +1,29 @@
+{
+  "name": "openreview",
+  "version": "0.1.0",
+  "description": "Free, open-source, BYOK multi-provider multi-agent PR reviewer. Config: .github/openreview.yml",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "package": "npx @vercel/ncc build dist-src/index.js -o dist --source-map --license licenses.txt",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test dist-src/**/*.test.js",
+    "docs:validate": "node dist-src/validate.js"
+  },
+  "dependencies": {
+    "@actions/core": "^1.11.1",
+    "@actions/github": "^6.0.0",
+    "yaml": "^2.7.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@vercel/ncc": "^0.38.3",
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}
