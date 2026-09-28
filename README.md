@@ -81,8 +81,8 @@ config needs — the workflow `uses:` ref selects the release, the yaml only set
 floor), `defaults`, `providers{}`, `reviews[]`, `global_verdict`.
 
 Known gap: per-review `strategy` is accepted but currently ignored — verdicts come
-from `main` synthesis + `min_severity`. Tracked in [`BACKLOG.md`](./BACKLOG.md)
-as OPENREVIEW-1.
+from `main` synthesis + `min_severity`. Tracked in
+[issue #12](https://github.com/sankara-sabapathy/openreview/issues/12).
 
 ## BYOK
 
