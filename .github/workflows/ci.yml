@@ -17,4 +17,7 @@ jobs:
       - run: npm ci || npm install
       - run: npm run typecheck
       - run: npm run build
+      - run: npm run package
+      - name: Check dist/ is committed and fresh
+        run: git diff --exit-code -- dist/ || (echo "::error::dist/ is stale. Run npm run build && npm run package and commit." && exit 1)
       - run: node dist-src/validate.js openreview.example.yml
