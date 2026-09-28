@@ -18,7 +18,7 @@ export function resolveKeysFromEnv(env: NodeJS.ProcessEnv): ResolvedKeys {
     opencodeBaseUrl:
       env["INPUT_OPENCODE-BASE-URL"] ||
       env["OPENCODE_BASE_URL"] ||
-      "https://opencode.ai/zen/v1",
+      "https://opencode.ai/zen/go/v1",
     githubToken:
       env["INPUT_GITHUB-TOKEN"] || env["GITHUB_TOKEN"] || env["GH_TOKEN"] || "",
   };
@@ -77,14 +77,21 @@ async function callOpenAICompatible(opts: {
   model: string;
   system: string;
   user: string;
+  sessionId: string;
 }): Promise<string> {
   const base = opts.baseUrl.replace(/\/$/, "");
+  const headers: Record<string, string> = {
+    "content-type": "application/json",
+    authorization: `Bearer ${opts.apiKey}`,
+  };
+  if (base.includes("opencode.ai")) {
+    // OpenCode Zen/Go require coding-agent traffic identification + stable session.
+    headers["user-agent"] = "OpenReview/1.0 (github-action)";
+    headers["x-opencode-session"] = opts.sessionId;
+  }
   const res = await fetch(`${base}/chat/completions`, {
     method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${opts.apiKey}`,
-    },
+    headers,
     body: JSON.stringify({
       model: opts.model,
       messages: [
@@ -127,6 +134,7 @@ export async function runAgent(opts: {
   lang: string;
   keys: ResolvedKeys;
   maxDiffChars: number;
+  sessionId: string;
 }): Promise<Finding[]> {
   const system = SYSTEM_WRAPPER(opts.lang, opts.instructions);
   const user = `Review this unified diff (truncated):\n\n${truncate(opts.diff, opts.maxDiffChars)}`;
@@ -143,6 +151,7 @@ export async function runAgent(opts: {
       model: opts.provider.model,
       system,
       user,
+      sessionId: opts.sessionId,
     });
   }
   try {

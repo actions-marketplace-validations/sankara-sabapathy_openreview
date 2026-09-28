@@ -64,6 +64,9 @@ export async function run(): Promise<void> {
     const { config, path } = await loadConfig(configPath);
     core.info(`Loaded config: ${path} (${config.reviews.length} reviews)`);
     const keys = resolveKeysFromEnv(process.env as any);
+    // Stable session per workflow run (required by OpenCode Go/Zen routing).
+    const sessionId =
+      process.env.GITHUB_RUN_ID ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
     const { fileNames, diff, headSha } = await getPrDiff(octokit, owner, repo, prNumber);
     const inScope = filterIgnored(fileNames, config.defaults.ignore ?? []);
     if (!diff.trim() || inScope.length === 0) {
@@ -101,6 +104,7 @@ export async function run(): Promise<void> {
             lang: config.defaults.lang ?? "en",
             keys,
             maxDiffChars: config.defaults.max_diff_chars ?? 80000,
+            sessionId,
           })
             .then((findings) => ({ findings, agent: a.name ?? "agent" }))
             .catch((e) => {

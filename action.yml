@@ -26,9 +26,9 @@ inputs:
     required: false
     default: ""
   opencode-base-url:
-    description: "OpenCode Zen OpenAI-compatible base URL"
+    description: "OpenCode base URL (Go subscription default; Zen pay-as-you-go: https://opencode.ai/zen/v1)"
     required: false
-    default: "https://opencode.ai/zen/v1"
+    default: "https://opencode.ai/zen/go/v1"
   dry-run:
     description: "If true, log verdict without posting"
     required: false

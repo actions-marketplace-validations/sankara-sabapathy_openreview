@@ -44547,7 +44547,7 @@ function resolveKeysFromEnv(env) {
         opencodeApiKey: env["INPUT_OPENCODE-API-KEY"] || env["OPENCODE_API_KEY"] || "",
         opencodeBaseUrl: env["INPUT_OPENCODE-BASE-URL"] ||
             env["OPENCODE_BASE_URL"] ||
-            "https://opencode.ai/zen/v1",
+            "https://opencode.ai/zen/go/v1",
         githubToken: env["INPUT_GITHUB-TOKEN"] || env["GITHUB_TOKEN"] || env["GH_TOKEN"] || "",
     };
 }
@@ -44581,12 +44581,18 @@ async function callAnthropic(opts) {
 }
 async function callOpenAICompatible(opts) {
     const base = opts.baseUrl.replace(/\/$/, "");
+    const headers = {
+        "content-type": "application/json",
+        authorization: `Bearer ${opts.apiKey}`,
+    };
+    if (base.includes("opencode.ai")) {
+        // OpenCode Zen/Go require coding-agent traffic identification + stable session.
+        headers["user-agent"] = "OpenReview/1.0 (github-action)";
+        headers["x-opencode-session"] = opts.sessionId;
+    }
     const res = await fetch(`${base}/chat/completions`, {
         method: "POST",
-        headers: {
-            "content-type": "application/json",
-            authorization: `Bearer ${opts.apiKey}`,
-        },
+        headers,
         body: JSON.stringify({
             model: opts.model,
             messages: [
@@ -44632,6 +44638,7 @@ async function runAgent(opts) {
             model: opts.provider.model,
             system,
             user,
+            sessionId: opts.sessionId,
         });
     }
     try {
@@ -44844,6 +44851,8 @@ async function run() {
         const { config, path } = await loadConfig(configPath);
         core.info(`Loaded config: ${path} (${config.reviews.length} reviews)`);
         const keys = resolveKeysFromEnv(process.env);
+        // Stable session per workflow run (required by OpenCode Go/Zen routing).
+        const sessionId = process.env.GITHUB_RUN_ID ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
         const { fileNames, diff, headSha } = await getPrDiff(octokit, owner, repo, prNumber);
         const inScope = filterIgnored(fileNames, config.defaults.ignore ?? []);
         if (!diff.trim() || inScope.length === 0) {
@@ -44879,6 +44888,7 @@ async function run() {
                     lang: config.defaults.lang ?? "en",
                     keys,
                     maxDiffChars: config.defaults.max_diff_chars ?? 80000,
+                    sessionId,
                 })
                     .then((findings) => ({ findings, agent: a.name ?? "agent" }))
                     .catch((e) => {
