@@ -1,4 +1,4 @@
-name: "OpenReview"
+name: "OpenReview AI"
 description: "Free BYOK multi-provider multi-agent PR review. Configure via .github/openreview.yml"
 author: "OpenReview"
 branding:
