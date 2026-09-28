@@ -1,4 +1,7 @@
 version: 1
+# Floor for the running action release (the workflow uses: ref selects the
+# release; this only fails fast with a clear message when the runner is older).
+requires_action: ">=0.3.0"
 defaults:
   ignore: ["**.lock", "dist/**", "website/build/**"]
   max_diff_chars: 80000
