@@ -1,5 +1,6 @@
 node_modules/
-dist/
+# dist/ is the compiled GitHub Action bundle and MUST be committed.
+# (GitHub runs the action from dist/index.js.)
 dist-src/
 .website/
 website/build/
