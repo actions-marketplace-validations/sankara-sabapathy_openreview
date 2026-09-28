@@ -8,6 +8,7 @@ import { resolveKeysFromEnv, runAgent, type Finding } from "./providers.js";
 import {
   matchesAny, filterIgnored, dedupeFindings,
   decideReviewVerdict, combineVerdicts, type Verdict,
+  satisfiesActionVersion, runningActionVersion,
 } from "./reviewer.js";
 import { renderStickyBody, upsertStickyComment, createInlineReview } from "./github.js";
 
@@ -63,6 +64,15 @@ export async function run(): Promise<void> {
 
     const { config, path } = await loadConfig(configPath);
     core.info(`Loaded config: ${path} (${config.reviews.length} reviews)`);
+    if (config.requires_action) {
+      const running = runningActionVersion(process.env as any);
+      if (running && !satisfiesActionVersion(config.requires_action, running)) {
+        throw new Error(
+          `This openreview.yml needs action ${config.requires_action} but the runner is ${running}. ` +
+            `Bump the workflow ref (e.g. uses: sankara-sabapathy/openreview@v1) to a release satisfying the constraint.`
+        );
+      }
+    }
     const keys = resolveKeysFromEnv(process.env as any);
     // Stable session per workflow run (required by OpenCode Go/Zen routing).
     const sessionId =

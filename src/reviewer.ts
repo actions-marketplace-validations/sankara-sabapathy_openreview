@@ -71,3 +71,46 @@ export function combineVerdicts(
   if (verdicts.includes("comment")) return "comment";
   return "approve";
 }
+
+type Semver = [number, number, number];
+
+function parseSemver(s: string): Semver | null {
+  const m = /^v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/.exec(s.trim());
+  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+}
+
+function cmpSemver(a: Semver, b: Semver): number {
+  for (let i = 0; i < 3; i++) {
+    if (a[i] !== b[i]) return a[i] < b[i] ? -1 : 1;
+  }
+  return 0;
+}
+
+// Supports ">=1.2.3", ">1.2.3", "=1.2.3", "1.2.3", "^1.2.3", "~1.2.3".
+export function satisfiesActionVersion(requires: string, running: string): boolean {
+  const req = requires.trim();
+  const runningV = parseSemver(running);
+  if (!runningV) return true; // unknown runner version -> don't block
+  const m = /^(>=|>|=|\^|~)?\s*v?(\d+\.\d+\.\d+(?:[-+].*)?)$/.exec(req);
+  if (!m) return true; // unparseable constraint -> don't block (validated elsewhere)
+  const floor = parseSemver(m[2]);
+  if (!floor) return true;
+  const op = m[1] ?? "=";
+  const c = cmpSemver(runningV, floor);
+  switch (op) {
+    case ">": return c > 0;
+    case ">=": return c >= 0;
+    case "^": return c >= 0 && runningV[0] === floor[0];
+    case "~": return c >= 0 && runningV[0] === floor[0] && runningV[1] === floor[1];
+    default: return c === 0;
+  }
+}
+
+// Best-effort running version: exact tag ref (v0.3.0) or explicit env override.
+// Floating refs (v1, main) can't be resolved locally -> null means "skip the check".
+export function runningActionVersion(env: NodeJS.ProcessEnv): string | null {
+  if (env["OPENREVIEW_ACTION_VERSION"]) return env["OPENREVIEW_ACTION_VERSION"] as string;
+  const ref = env["GITHUB_ACTION_REF"] ?? "";
+  if (/^v?\d+\.\d+\.\d+/.test(ref)) return ref;
+  return null;
+}

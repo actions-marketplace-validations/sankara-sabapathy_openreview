@@ -6,6 +6,10 @@
   "required": ["version", "providers", "reviews"],
   "properties": {
     "version": { "const": 1 },
+    "requires_action": {
+      "type": "string",
+      "description": "Optional minimum action release, e.g. '>=0.3.0'. The workflow ref selects the release; this only fails fast."
+    },
     "defaults": {
       "type": "object",
       "properties": {

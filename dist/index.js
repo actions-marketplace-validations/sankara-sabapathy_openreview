@@ -44539,6 +44539,10 @@ const ReviewConfig = objectType({
 });
 const OpenReviewConfig = objectType({
     version: literalType(1),
+    // Optional floor for the running action, e.g. ">=0.3.0". The workflow ref
+    // (uses: ...@v1) selects the release; this only fails fast with a clear
+    // message when the runner is older than the config needs.
+    requires_action: stringType().optional(),
     defaults: objectType({
         on: arrayType(stringType()).default(["opened", "synchronize", "ready_for_review"]),
         command: stringType().default("/review"),
@@ -44816,6 +44820,49 @@ function combineVerdicts(verdicts, strategy) {
         return "comment";
     return "approve";
 }
+function parseSemver(s) {
+    const m = /^v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/.exec(s.trim());
+    return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+}
+function cmpSemver(a, b) {
+    for (let i = 0; i < 3; i++) {
+        if (a[i] !== b[i])
+            return a[i] < b[i] ? -1 : 1;
+    }
+    return 0;
+}
+// Supports ">=1.2.3", ">1.2.3", "=1.2.3", "1.2.3", "^1.2.3", "~1.2.3".
+function satisfiesActionVersion(requires, running) {
+    const req = requires.trim();
+    const runningV = parseSemver(running);
+    if (!runningV)
+        return true; // unknown runner version -> don't block
+    const m = /^(>=|>|=|\^|~)?\s*v?(\d+\.\d+\.\d+(?:[-+].*)?)$/.exec(req);
+    if (!m)
+        return true; // unparseable constraint -> don't block (validated elsewhere)
+    const floor = parseSemver(m[2]);
+    if (!floor)
+        return true;
+    const op = m[1] ?? "=";
+    const c = cmpSemver(runningV, floor);
+    switch (op) {
+        case ">": return c > 0;
+        case ">=": return c >= 0;
+        case "^": return c >= 0 && runningV[0] === floor[0];
+        case "~": return c >= 0 && runningV[0] === floor[0] && runningV[1] === floor[1];
+        default: return c === 0;
+    }
+}
+// Best-effort running version: exact tag ref (v0.3.0) or explicit env override.
+// Floating refs (v1, main) can't be resolved locally -> null means "skip the check".
+function runningActionVersion(env) {
+    if (env["OPENREVIEW_ACTION_VERSION"])
+        return env["OPENREVIEW_ACTION_VERSION"];
+    const ref = env["GITHUB_ACTION_REF"] ?? "";
+    if (/^v?\d+\.\d+\.\d+/.test(ref))
+        return ref;
+    return null;
+}
 
 ;// CONCATENATED MODULE: ./dist-src/github.js
 const STICKY_MARKER = "<!-- openreview:sticky -->";
@@ -44929,6 +44976,13 @@ async function run() {
         const dryRun = (core.getInput("dry-run") || "false").toLowerCase() === "true";
         const { config, path } = await loadConfig(configPath);
         core.info(`Loaded config: ${path} (${config.reviews.length} reviews)`);
+        if (config.requires_action) {
+            const running = runningActionVersion(process.env);
+            if (running && !satisfiesActionVersion(config.requires_action, running)) {
+                throw new Error(`This openreview.yml needs action ${config.requires_action} but the runner is ${running}. ` +
+                    `Bump the workflow ref (e.g. uses: sankara-sabapathy/openreview@v1) to a release satisfying the constraint.`);
+            }
+        }
         const keys = resolveKeysFromEnv(process.env);
         // Stable session per workflow run (required by OpenCode Go/Zen routing).
         const sessionId = process.env.GITHUB_RUN_ID ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;

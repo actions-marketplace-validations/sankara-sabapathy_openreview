@@ -1,4 +1,7 @@
 version: 1
+# Optional: fail fast if the running action release is older than this.
+# The workflow ref (uses: ...@v1) selects the release; this is only a floor check.
+# requires_action: ">=0.3.0"
 
 defaults:
   on: [opened, synchronize, ready_for_review]
