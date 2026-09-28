@@ -5,7 +5,7 @@ defaults:
 providers:
   opencode:
     kind: opencode
-    model: opencode/big-pickle
+    model: big-pickle
     key_from: secrets.OPENCODE_API_KEY
 reviews:
   - id: general-quality

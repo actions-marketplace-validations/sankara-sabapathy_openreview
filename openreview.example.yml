@@ -19,9 +19,9 @@ providers:
     key_from: secrets.OPENAI_API_KEY
   opencode:
     kind: opencode
-    model: opencode/big-pickle
+    model: big-pickle
     key_from: secrets.OPENCODE_API_KEY
-    base_url: https://api.opencode.ai/v1
+    base_url: https://opencode.ai/zen/v1
 
 reviews:
   - id: security-strict

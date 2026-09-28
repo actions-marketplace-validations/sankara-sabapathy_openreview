@@ -71,7 +71,7 @@ export async function run(): Promise<void> {
       return;
     }
 
-    const perReview: { id: string; verdict: Verdict; findings: Finding[] }[] = [];
+    const perReview: { id: string; verdict: Verdict; findings: Finding[]; errors: string[] }[] = [];
     for (const review of config.reviews) {
       const scopedFiles = inScope.filter((f) => matchesAny(f, review.if_paths));
       if (scopedFiles.length === 0) {
@@ -80,7 +80,7 @@ export async function run(): Promise<void> {
       }
       // Build a scoped diff (best-effort: filter diff hunks by filename header)
       const scopedDiff = scopedFiles.length === inScope.length ? diff : diff; // keep full diff; agents see file names
-      const tasks: Promise<Finding[]>[] = [];
+      const tasks: Promise<{ findings: Finding[]; error?: string; agent: string }>[] = [];
       const agentDefs = [
         { ...review.main, name: review.main.name ?? `${review.id}:main` },
         ...review.subagents.map((s, i) => ({ ...s, name: s.name ?? `${review.id}:sub${i}` })),
@@ -101,20 +101,25 @@ export async function run(): Promise<void> {
             lang: config.defaults.lang ?? "en",
             keys,
             maxDiffChars: config.defaults.max_diff_chars ?? 80000,
-          }).catch((e) => {
-            core.warning(`Agent ${a.name} failed: ${(e as Error).message}`);
-            return [] as Finding[];
           })
+            .then((findings) => ({ findings, agent: a.name ?? "agent" }))
+            .catch((e) => {
+              const msg = (e as Error).message;
+              core.warning(`Agent ${a.name} failed: ${msg}`);
+              return { findings: [] as Finding[], error: msg, agent: a.name ?? "agent" };
+            })
         );
       }
-      let findings = (await Promise.all(tasks)).flat();
+      const results = await Promise.all(tasks);
+      let findings = results.flatMap((r) => r.findings);
+      const agentErrors = results.filter((r) => r.error).map((r) => `- \`${r.agent}\`: ${r.error}`);
       if (review.verdict.deduplicate) findings = dedupeFindings(findings);
       findings.sort((a, b) =>
         ({ high: 0, medium: 1, suggestion: 2 } as const)[a.severity] -
         ({ high: 0, medium: 1, suggestion: 2 } as const)[b.severity]
       );
       const verdict = decideReviewVerdict(review.verdict.mode, review.verdict.min_severity, findings);
-      perReview.push({ id: review.id, verdict, findings });
+      perReview.push({ id: review.id, verdict, findings, errors: agentErrors });
       core.info(`Review ${review.id}: ${findings.length} findings -> ${verdict}`);
     }
 
@@ -133,9 +138,13 @@ export async function run(): Promise<void> {
       runUrl,
     });
     const hasAnyKey = Boolean(keys.anthropicApiKey || keys.openaiApiKey || keys.opencodeApiKey);
-    const sticky = hasAnyKey
-      ? stickyBase
-      : `${stickyBase}\n\n> ⚠️ No provider API keys configured — agents were skipped. Add \`ANTHROPIC_API_KEY\`, \`OPENAI_API_KEY\`, or \`OPENCODE_API_KEY\` as repo Actions secrets (only the ones your \`providers{}\` use).`;
+    const allErrors = perReview.flatMap((r) => r.errors);
+    let sticky = stickyBase;
+    if (!hasAnyKey) {
+      sticky += `\n\n> ⚠️ No provider API keys configured — agents were skipped. Add \`ANTHROPIC_API_KEY\`, \`OPENAI_API_KEY\`, or \`OPENCODE_API_KEY\` as repo Actions secrets (only the ones your \`providers{}\` use).`;
+    } else if (all.length === 0 && allErrors.length > 0) {
+      sticky += `\n\n<details><summary>⚠️ All agents failed — details</summary>\n\n${allErrors.join("\n")}\n\nCheck model IDs and base URLs against provider docs.</details>`;
+    }
 
     if (dryRun) {
       core.info(`DRY RUN verdict=${global}\n${sticky.slice(0, 2000)}`);

@@ -26,9 +26,9 @@ inputs:
     required: false
     default: ""
   opencode-base-url:
-    description: "OpenCode OpenAI-compatible base URL"
+    description: "OpenCode Zen OpenAI-compatible base URL"
     required: false
-    default: "https://api.opencode.ai/v1"
+    default: "https://opencode.ai/zen/v1"
   dry-run:
     description: "If true, log verdict without posting"
     required: false

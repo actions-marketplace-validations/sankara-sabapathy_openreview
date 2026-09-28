@@ -18,7 +18,7 @@ export function resolveKeysFromEnv(env: NodeJS.ProcessEnv): ResolvedKeys {
     opencodeBaseUrl:
       env["INPUT_OPENCODE-BASE-URL"] ||
       env["OPENCODE_BASE_URL"] ||
-      "https://api.opencode.ai/v1",
+      "https://opencode.ai/zen/v1",
     githubToken:
       env["INPUT_GITHUB-TOKEN"] || env["GITHUB_TOKEN"] || env["GH_TOKEN"] || "",
   };

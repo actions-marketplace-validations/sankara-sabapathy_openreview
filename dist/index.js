@@ -44547,7 +44547,7 @@ function resolveKeysFromEnv(env) {
         opencodeApiKey: env["INPUT_OPENCODE-API-KEY"] || env["OPENCODE_API_KEY"] || "",
         opencodeBaseUrl: env["INPUT_OPENCODE-BASE-URL"] ||
             env["OPENCODE_BASE_URL"] ||
-            "https://api.opencode.ai/v1",
+            "https://opencode.ai/zen/v1",
         githubToken: env["INPUT_GITHUB-TOKEN"] || env["GITHUB_TOKEN"] || env["GH_TOKEN"] || "",
     };
 }
@@ -44879,18 +44879,23 @@ async function run() {
                     lang: config.defaults.lang ?? "en",
                     keys,
                     maxDiffChars: config.defaults.max_diff_chars ?? 80000,
-                }).catch((e) => {
-                    core.warning(`Agent ${a.name} failed: ${e.message}`);
-                    return [];
+                })
+                    .then((findings) => ({ findings, agent: a.name ?? "agent" }))
+                    .catch((e) => {
+                    const msg = e.message;
+                    core.warning(`Agent ${a.name} failed: ${msg}`);
+                    return { findings: [], error: msg, agent: a.name ?? "agent" };
                 }));
             }
-            let findings = (await Promise.all(tasks)).flat();
+            const results = await Promise.all(tasks);
+            let findings = results.flatMap((r) => r.findings);
+            const agentErrors = results.filter((r) => r.error).map((r) => `- \`${r.agent}\`: ${r.error}`);
             if (review.verdict.deduplicate)
                 findings = dedupeFindings(findings);
             findings.sort((a, b) => ({ high: 0, medium: 1, suggestion: 2 }[a.severity] -
                 { high: 0, medium: 1, suggestion: 2 }[b.severity]));
             const verdict = decideReviewVerdict(review.verdict.mode, review.verdict.min_severity, findings);
-            perReview.push({ id: review.id, verdict, findings });
+            perReview.push({ id: review.id, verdict, findings, errors: agentErrors });
             core.info(`Review ${review.id}: ${findings.length} findings -> ${verdict}`);
         }
         const global = combineVerdicts(perReview.map((r) => r.verdict), config.global_verdict.strategy);
@@ -44904,9 +44909,14 @@ async function run() {
             runUrl,
         });
         const hasAnyKey = Boolean(keys.anthropicApiKey || keys.openaiApiKey || keys.opencodeApiKey);
-        const sticky = hasAnyKey
-            ? stickyBase
-            : `${stickyBase}\n\n> ⚠️ No provider API keys configured — agents were skipped. Add \`ANTHROPIC_API_KEY\`, \`OPENAI_API_KEY\`, or \`OPENCODE_API_KEY\` as repo Actions secrets (only the ones your \`providers{}\` use).`;
+        const allErrors = perReview.flatMap((r) => r.errors);
+        let sticky = stickyBase;
+        if (!hasAnyKey) {
+            sticky += `\n\n> ⚠️ No provider API keys configured — agents were skipped. Add \`ANTHROPIC_API_KEY\`, \`OPENAI_API_KEY\`, or \`OPENCODE_API_KEY\` as repo Actions secrets (only the ones your \`providers{}\` use).`;
+        }
+        else if (all.length === 0 && allErrors.length > 0) {
+            sticky += `\n\n<details><summary>⚠️ All agents failed — details</summary>\n\n${allErrors.join("\n")}\n\nCheck model IDs and base URLs against provider docs.</details>`;
+        }
         if (dryRun) {
             core.info(`DRY RUN verdict=${global}\n${sticky.slice(0, 2000)}`);
             return;
