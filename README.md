@@ -106,6 +106,13 @@ comment); other providers still run.
 Docusaurus v3 in [`website/`](./website), deployed to GitHub Pages on every push
 to `main`. See [website/README](./website/README.md).
 
+## Disclaimer
+
+OpenReview is MIT-licensed software provided as-is. You bring your own API keys,
+pay your providers directly, and own everything in your repositories: AI-generated
+findings can be wrong, so a human must review before merging. The maintainers accept
+no responsibility for provider charges, exposed secrets, or code merged on AI advice.
+
 ## License
 
 MIT. See [LICENSE](./LICENSE).

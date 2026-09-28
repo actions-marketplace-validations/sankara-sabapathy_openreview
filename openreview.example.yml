@@ -14,11 +14,11 @@ defaults:
 providers:
   claude:
     kind: anthropic
-    model: claude-sonnet-4-5
+    model: claude-sonnet-5
     key_from: secrets.ANTHROPIC_API_KEY
   codex:
     kind: openai
-    model: gpt-5-codex
+    model: gpt-5.3-codex
     key_from: secrets.OPENAI_API_KEY
   opencode:
     kind: opencode

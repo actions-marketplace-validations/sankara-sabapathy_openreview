@@ -26,7 +26,9 @@ const config = {
       title: "OpenReview",
       items: [{ to: "/", label: "Docs", position: "left" }],
     },
-    footer: { copyright: `MIT © ${new Date().getFullYear()} OpenReview` },
+    footer: {
+      copyright: `MIT © ${new Date().getFullYear()} OpenReview — provided as-is; you own your keys, bills, and merges.`,
+    },
   },
 };
 export default config;
