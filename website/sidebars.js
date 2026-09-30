@@ -18,6 +18,7 @@ const sidebars = {
         ],
       },
       "multi-review",
+      "self-hosted",
       "versioning",
       "troubleshooting",
     ],
