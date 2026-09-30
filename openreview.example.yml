@@ -32,6 +32,7 @@ providers:
     key_from: secrets.OPENCODE_API_KEY
     base_url: https://opencode.ai/zen/v1 # Go subscription: https://opencode.ai/zen/go/v1 (models: glm-5.3-flash, kimi-k2.7-code, ...)
     # retries: 2 # retry budget for empty/5xx/429/network (0-5, default 2)
+    # timeout_s: 110 # per-attempt HTTP timeout, seconds (default 110)
   # Claude subscription (Pro/Max/Team/Enterprise) via OAuth instead of API key:
   # mint with `claude setup-token` (1-year token, sk-ant-oat01-…), store as a
   # secret, and pass it through the workflow step's `env:`. The explicit auth
@@ -78,6 +79,11 @@ reviews:
   - id: general-quality
     if_paths: ["**"]
     strategy: majority
+    # Cross-file context (see website/docs/configuration): full changed files +
+    # call-site excerpts are automatic (bounded by max_context_chars); add more:
+    # context_files: ["src/types.ts", "db/schema.sql"]
+    # include_full_files: true
+    # max_context_chars: 20000
     main:
       provider: claude
       instructions: "Synthesize sub-agent findings. Strict on bugs and correctness, lenient on style. Deduplicate."

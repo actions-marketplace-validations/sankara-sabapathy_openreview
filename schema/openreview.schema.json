@@ -23,7 +23,9 @@
         "draft": { "type": "boolean" },
         "lang": { "type": "string" },
         "ignore": { "type": "array", "items": { "type": "string" } },
-        "max_diff_chars": { "type": "integer", "minimum": 1000 }
+        "max_diff_chars": { "type": "integer", "minimum": 1000 },
+        "max_context_chars": { "type": "integer", "minimum": 0 },
+        "include_full_files": { "type": "boolean" }
       }
     },
     "providers": {
@@ -49,6 +51,7 @@
           "endpoint_path": { "type": "string" },
           "json_mode": { "type": "boolean" },
           "retries": { "type": "integer", "minimum": 0, "maximum": 5 },
+          "timeout_s": { "type": "integer", "minimum": 10, "maximum": 600 },
           "extra_body": { "type": "object" }
         }
       }
@@ -65,6 +68,9 @@
           "strategy": { "enum": ["any", "all", "majority"] },
           "main": { "$ref": "#/definitions/agent" },
           "subagents": { "type": "array", "items": { "$ref": "#/definitions/agent" } },
+          "context_files": { "type": "array", "items": { "type": "string" } },
+          "include_full_files": { "type": "boolean" },
+          "max_context_chars": { "type": "integer", "minimum": 0 },
           "verdict": {
             "type": "object",
             "properties": {
