@@ -4,7 +4,8 @@ Get your first AI review in ~5 minutes.
 
 ## 1. Add the workflow
 
-Create `.github/workflows/openreview.yml` in your repo:
+Create `.github/workflows/ai-review.yml` in your repo (named to avoid confusion
+with the `.github/openreview.yml` config file):
 
 ```yaml
 name: OpenReview

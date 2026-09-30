@@ -25,7 +25,9 @@ minutes, your keys. You pay your LLM provider directly, no per-seat SaaS.
 1. Copy the workflow:
 
 ```yaml
-# .github/workflows/openreview.yml
+# .github/workflows/ai-review.yml
+# (named ai-review.yml — not openreview.yml — so it can't be confused with
+# the .github/openreview.yml config file)
 name: OpenReview
 on:
   pull_request:
