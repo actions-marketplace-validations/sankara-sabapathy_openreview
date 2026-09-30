@@ -47,3 +47,8 @@ requires for routing/prompt-caching. Only `chat/completions`-listed models work
 | `space-bunny-free`, `longcat-2.5-preview-free` | Unlimited (limited time) |
 
 Usage beyond limits blocks unless **Use balance** (Zen credits) is enabled in the console.
+
+> **Model quirk found by dogfood:** `kimi-k2.7-code` rejects any `temperature`
+> other than `1` (OpenReview defaults to `0.2`). Override per provider:
+> `extra_body: { temperature: 1 }`. If a new model 400s on a parameter, the PR's
+> error block names it — move that parameter into `extra_body`.
