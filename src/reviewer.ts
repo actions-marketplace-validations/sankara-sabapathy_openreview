@@ -86,6 +86,30 @@ function cmpSemver(a: Semver, b: Semver): number {
   return 0;
 }
 
+// Per-review provider ballots (issue #12). Each distinct provider used by a
+// review's agents casts one ballot: its own verdict over its own findings.
+// - any: most severe ballot wins (identical to the old pooled behavior).
+// - all: unanimous to escalate (minimum severity wins).
+// - majority: median ballot; even-count ties break toward more severe.
+export function combineBallots(
+  ballots: Verdict[],
+  strategy: "any" | "all" | "majority"
+): Verdict {
+  if (ballots.length === 0) return "approve";
+  if (ballots.length === 1) return ballots[0];
+  const rank = { approve: 0, comment: 1, request_changes: 2 } as const;
+  if (strategy === "all") {
+    if (ballots.every((v) => v === "request_changes")) return "request_changes";
+    if (ballots.every((v) => v !== "approve")) return "comment";
+    return "approve";
+  }
+  if (strategy === "majority") {
+    const sorted = [...ballots].sort((a, b) => rank[a] - rank[b]);
+    return sorted[Math.ceil((sorted.length - 1) / 2)];
+  }
+  return [...ballots].sort((a, b) => rank[b] - rank[a])[0];
+}
+
 // Supports ">=1.2.3", ">1.2.3", "=1.2.3", "1.2.3", "^1.2.3", "~1.2.3".
 export function satisfiesActionVersion(requires: string, running: string): boolean {
   const req = requires.trim();

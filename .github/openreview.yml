@@ -35,11 +35,11 @@ providers:
   # --- Commented examples: any provider works with protocol + base_url + key_from + model ---
   # claude:
   #   protocol: anthropic-messages
-  #   model: claude-sonnet-4-5
+  #   model: claude-sonnet-5
   #   key_from: secrets.ANTHROPIC_API_KEY
   # codex:
   #   protocol: openai-chat
-  #   model: gpt-5-codex
+  #   model: gpt-5.3-codex
   #   base_url: https://api.openai.com/v1
   #   key_from: secrets.OPENAI_API_KEY
   # groq:
@@ -59,7 +59,7 @@ reviews:
   # --- Active review: everything in this repo gets the general pass ---
   - id: general-quality
     if_paths: ["**"]
-    # strategy: any # accepted but currently ignored; see issue #12
+    strategy: any # any | all | majority: per-provider ballots; see website/docs/multi-review
     main:
       # name: defaults to "<review-id>:main"
       provider: opencode

@@ -44831,6 +44831,30 @@ function cmpSemver(a, b) {
     }
     return 0;
 }
+// Per-review provider ballots (issue #12). Each distinct provider used by a
+// review's agents casts one ballot: its own verdict over its own findings.
+// - any: most severe ballot wins (identical to the old pooled behavior).
+// - all: unanimous to escalate (minimum severity wins).
+// - majority: median ballot; even-count ties break toward more severe.
+function combineBallots(ballots, strategy) {
+    if (ballots.length === 0)
+        return "approve";
+    if (ballots.length === 1)
+        return ballots[0];
+    const rank = { approve: 0, comment: 1, request_changes: 2 };
+    if (strategy === "all") {
+        if (ballots.every((v) => v === "request_changes"))
+            return "request_changes";
+        if (ballots.every((v) => v !== "approve"))
+            return "comment";
+        return "approve";
+    }
+    if (strategy === "majority") {
+        const sorted = [...ballots].sort((a, b) => rank[a] - rank[b]);
+        return sorted[Math.ceil((sorted.length - 1) / 2)];
+    }
+    return [...ballots].sort((a, b) => rank[b] - rank[a])[0];
+}
 // Supports ">=1.2.3", ">1.2.3", "=1.2.3", "1.2.3", "^1.2.3", "~1.2.3".
 function satisfiesActionVersion(requires, running) {
     const req = requires.trim();
@@ -45037,7 +45061,22 @@ async function run() {
                 findings = dedupeFindings(findings);
             findings.sort((a, b) => ({ high: 0, medium: 1, suggestion: 2 }[a.severity] -
                 { high: 0, medium: 1, suggestion: 2 }[b.severity]));
-            const verdict = decideReviewVerdict(review.verdict.mode, review.verdict.min_severity, findings);
+            const verdict = (() => {
+                // One ballot per distinct provider (issue #12). `any` reproduces the
+                // old pooled behavior exactly; `all`/`majority` resolve disagreement.
+                const byProvider = new Map();
+                for (const f of findings) {
+                    const list = byProvider.get(f.provider) ?? [];
+                    list.push(f);
+                    byProvider.set(f.provider, list);
+                }
+                const ballots = [...byProvider.entries()].map(([name, fs]) => {
+                    const v = decideReviewVerdict(review.verdict.mode, review.verdict.min_severity, fs);
+                    core.info(`Review ${review.id}: ballot ${name} -> ${v} (${fs.length} findings)`);
+                    return v;
+                });
+                return combineBallots(ballots, review.strategy);
+            })();
             perReview.push({ id: review.id, verdict, findings, errors: agentErrors });
             core.info(`Review ${review.id}: ${findings.length} findings -> ${verdict}`);
         }

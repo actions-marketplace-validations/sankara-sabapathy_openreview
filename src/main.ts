@@ -7,7 +7,7 @@ import { parseConfig } from "./config.js";
 import { resolveKeysFromEnv, runAgent, type Finding } from "./providers.js";
 import {
   matchesAny, filterIgnored, dedupeFindings,
-  decideReviewVerdict, combineVerdicts, type Verdict,
+  decideReviewVerdict, combineVerdicts, combineBallots, type Verdict,
   satisfiesActionVersion, runningActionVersion,
 } from "./reviewer.js";
 import { renderStickyBody, upsertStickyComment, createInlineReview } from "./github.js";
@@ -132,7 +132,22 @@ export async function run(): Promise<void> {
         ({ high: 0, medium: 1, suggestion: 2 } as const)[a.severity] -
         ({ high: 0, medium: 1, suggestion: 2 } as const)[b.severity]
       );
-      const verdict = decideReviewVerdict(review.verdict.mode, review.verdict.min_severity, findings);
+      const verdict = (() => {
+        // One ballot per distinct provider (issue #12). `any` reproduces the
+        // old pooled behavior exactly; `all`/`majority` resolve disagreement.
+        const byProvider = new Map<string, typeof findings>();
+        for (const f of findings) {
+          const list = byProvider.get(f.provider) ?? [];
+          list.push(f);
+          byProvider.set(f.provider, list);
+        }
+        const ballots = [...byProvider.entries()].map(([name, fs]) => {
+          const v = decideReviewVerdict(review.verdict.mode, review.verdict.min_severity, fs);
+          core.info(`Review ${review.id}: ballot ${name} -> ${v} (${fs.length} findings)`);
+          return v;
+        });
+        return combineBallots(ballots, review.strategy);
+      })();
       perReview.push({ id: review.id, verdict, findings, errors: agentErrors });
       core.info(`Review ${review.id}: ${findings.length} findings -> ${verdict}`);
     }
