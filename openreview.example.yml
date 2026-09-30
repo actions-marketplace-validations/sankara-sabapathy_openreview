@@ -25,6 +25,16 @@ providers:
     model: big-pickle
     key_from: secrets.OPENCODE_API_KEY
     base_url: https://opencode.ai/zen/v1 # Go subscription: https://opencode.ai/zen/go/v1 (models: glm-5.3-flash, kimi-k2.7-code, ...)
+  # Claude subscription (Pro/Max/Team/Enterprise) via OAuth instead of API key:
+  # mint with `claude setup-token` (1-year token, sk-ant-oat01-…), store as a
+  # secret, and pass it through the workflow step's `env:`. The explicit auth
+  # block is honored literally (Bearer); without it, x-api-key is assumed.
+  # claude-subscription:
+  #   protocol: anthropic-messages
+  #   model: claude-sonnet-5
+  #   key_from: secrets.CLAUDE_CODE_OAUTH_TOKEN
+  #   auth: { header: Authorization, scheme: Bearer }
+  #   headers: { anthropic-beta: oauth-2025-04-20 }
   # Any OpenAI-compatible provider works with protocol + base_url + key_from + model:
   groq:
     protocol: openai-chat
