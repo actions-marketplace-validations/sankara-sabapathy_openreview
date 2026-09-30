@@ -1,4 +1,5 @@
 import type { ProviderConfig, ProviderProtocol } from "./config.js";
+import * as core from "@actions/core";
 
 export type ResolvedKeys = {
   anthropicApiKey: string;
@@ -235,9 +236,14 @@ export async function runAgent(opts: {
       extraBody: rp.extraBody,
     });
   }
+  const parsed = extractFindingsJson(raw);
+  if (!parsed) {
+    core.warning(
+      `Agent ${opts.agentName}: could not parse findings JSON; raw head: ${raw.slice(0, 300)}`
+    );
+    return [];
+  }
   try {
-    const cleaned = raw.replace(/^```json\s*/i, "").replace(/```$/i, "").trim();
-    const parsed = JSON.parse(cleaned) as { findings?: any[] };
     const out: Finding[] = [];
     for (const f of parsed.findings ?? []) {
       if (!f?.file || !f?.comment) continue;
@@ -255,7 +261,29 @@ export async function runAgent(opts: {
       });
     }
     return out;
-  } catch {
+  } catch (e) {
+    // Validation of individual findings failed — warn, don't silently drop everything.
+    core.warning(
+      `Agent ${opts.agentName}: findings validation failed (${(e as Error).message}); raw head: ${raw.slice(0, 200)}`
+    );
     return [];
   }
+}
+
+// Parse the findings JSON out of a model response. Tries strict parse first,
+// then falls back to the largest {...} substring (models often wrap JSON in
+// prose when response_format is ignored). Returns null on total failure.
+function extractFindingsJson(raw: string): { findings?: any[] } | null {
+  const cleaned = raw.replace(/^```(?:json)?\s*/i, "").replace(/```$/i, "").trim();
+  const candidates = [cleaned];
+  const greedy = cleaned.match(/\{[\s\S]*\}/);
+  if (greedy && greedy[0] !== cleaned) candidates.push(greedy[0]);
+  for (const c of candidates) {
+    try {
+      return JSON.parse(c) as { findings?: any[] };
+    } catch {
+      // try next candidate
+    }
+  }
+  return null;
 }
