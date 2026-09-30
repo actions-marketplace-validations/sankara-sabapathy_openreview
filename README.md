@@ -1,5 +1,9 @@
 # OpenReview AI
 
+[![Docs](https://img.shields.io/badge/docs-openreview-blue)](https://sankara-sabapathy.github.io/openreview/)
+[![Marketplace](https://img.shields.io/badge/marketplace-openreview_ai-green)](https://github.com/marketplace/actions/openreview-ai)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+
 Free, open-source, BYOK multi-provider multi-agent PR reviewer for GitHub.
 ([Marketplace listing](https://github.com/marketplace/actions/openreview-ai) ·
 [Docs site](https://sankara-sabapathy.github.io/openreview/))
@@ -78,11 +82,9 @@ reviews:
 Top-level keys: `version: 1` (schema version, required), optional
 `requires_action: ">=0.3.0"` (fails fast when the runner release is older than the
 config needs — the workflow `uses:` ref selects the release, the yaml only sets a
-floor), `defaults`, `providers{}`, `reviews[]`, `global_verdict`.
-
-Known gap: per-review `strategy` is accepted but currently ignored — verdicts come
-from `main` synthesis + `min_severity`. Tracked in
-[issue #12](https://github.com/sankara-sabapathy/openreview/issues/12).
+floor), `defaults`, `providers{}`, `reviews[]`, `global_verdict`. Per-review
+`strategy` (`any|all|majority`) resolves multi-provider disagreement by ballot —
+see [Multi-review](./multi-review).
 
 ## BYOK
 

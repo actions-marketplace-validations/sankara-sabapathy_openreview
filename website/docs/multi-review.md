@@ -23,6 +23,10 @@ global_verdict:
   strategy: any_blocking # one request_changes verdict decides the run
 ```
 
-- Verdicts come from `main` synthesis filtered by `min_severity`; there is no cross-provider voting inside a review. (The per-review `strategy` key is accepted but currently ignored — see [issue #12](https://github.com/sankara-sabapathy/openreview/issues/12).)
+- Each distinct provider used by a review's agents casts one **ballot**: its own
+  verdict over its own findings (`mode` + `min_severity`). `strategy` combines them:
+  `any` = most severe ballot wins, `all` = unanimous to escalate, `majority` =
+  median ballot (even-count ties break toward more severe). Single-provider reviews
+  behave identically under all three.
 - `global_verdict.strategy: any_blocking|majority` merges per-review verdicts.
 - Output: sticky comment (marker `openreview:sticky`), inline `pulls.createReview` (max 20), `verdict` output.
