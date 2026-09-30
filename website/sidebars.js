@@ -5,6 +5,7 @@ const sidebars = {
       "intro",
       "quickstart",
       "configuration",
+      "templates",
       {
         type: "category",
         label: "Providers",
@@ -18,6 +19,7 @@ const sidebars = {
         ],
       },
       "multi-review",
+      "self-hosted",
       "versioning",
       "troubleshooting",
     ],

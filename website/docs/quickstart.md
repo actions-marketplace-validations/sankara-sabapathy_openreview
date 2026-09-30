@@ -77,6 +77,9 @@ inline findings. Comment `/review` on the PR to re-run after pushes.
 No keys configured? The run still posts a comment telling you which secrets are
 missing — so a first green run already proves the plumbing.
 
+Running on your own machines? See [Self-hosted runners](./self-hosted) — one
+label change, plus the secrets rules for fork PRs.
+
 ## Disclaimer
 
 OpenReview is MIT software provided as-is: you own your keys, your provider bills,

@@ -8,6 +8,13 @@ version: 1
 # the release; this only fails fast when the runner is older than the config needs.
 requires_action: ">=0.3.0"
 
+# Template inheritance (see website/docs/templates). This repo stays fully
+# explicit as the canonical showcase, but any consumer can replace the whole
+# file below with:
+# extends: [openreview/general@0.7.0, openreview/security@0.7.0]
+# plus their own providers: block. Remote community templates pin a commit SHA:
+# extends: [github:acme-corp/review-standards/backend@sha:abc123...]
+
 defaults:
   on: [opened, synchronize, ready_for_review]
   command: "/review"
