@@ -43,6 +43,9 @@ export const ProviderConfig = z.object({
   // Retry budget for transient failures (empty content, 5xx, 429, network).
   // Total failure throws into the PR's agent-error block instead of silent empty.
   retries: z.number().int().min(0).max(5).default(2),
+  // Per-attempt HTTP timeout in seconds (default 110, under Cloudflare's 120s
+  // proxy cutoff). A hung gateway connection must fail fast, not block minutes.
+  timeout_s: z.number().int().min(10).max(600).default(110),
   // Send response_format json_object (openai-chat). Disable for providers that reject it.
   json_mode: z.boolean().default(true),
   // Extra JSON body fields merged into the request (provider-specific params).
@@ -71,6 +74,12 @@ export const ReviewConfig = z.object({
   if_paths: z.array(z.string()).default(["**"]),
   providers: z.array(z.string()).optional(), // informative; agents pick providers
   strategy: z.enum(["any", "all", "majority"]).default("any"),
+  // Extra full files to include as context (globs, repo-relative).
+  context_files: z.array(z.string()).default([]),
+  // Include full content of changed in-scope files (bounded by max_context_chars).
+  include_full_files: z.boolean().optional(),
+  // Per-review context budget override (defaults to defaults.max_context_chars).
+  max_context_chars: z.number().int().nonnegative().optional(),
   main: AgentConfig,
   subagents: z.array(AgentConfig).default([]),
   verdict: VerdictConfig.default({}),
@@ -94,6 +103,8 @@ export const OpenReviewConfig = z.object({
       lang: z.string().default("en"),
       ignore: z.array(z.string()).default([]),
       max_diff_chars: z.number().int().positive().default(80000),
+      max_context_chars: z.number().int().nonnegative().default(20000),
+      include_full_files: z.boolean().default(true),
     })
     .default({}),
   providers: z.record(z.string(), ProviderConfig),

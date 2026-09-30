@@ -44519,6 +44519,9 @@ const ProviderConfig = objectType({
     // Retry budget for transient failures (empty content, 5xx, 429, network).
     // Total failure throws into the PR's agent-error block instead of silent empty.
     retries: numberType().int().min(0).max(5).default(2),
+    // Per-attempt HTTP timeout in seconds (default 110, under Cloudflare's 120s
+    // proxy cutoff). A hung gateway connection must fail fast, not block minutes.
+    timeout_s: numberType().int().min(10).max(600).default(110),
     // Send response_format json_object (openai-chat). Disable for providers that reject it.
     json_mode: booleanType().default(true),
     // Extra JSON body fields merged into the request (provider-specific params).
@@ -44541,6 +44544,12 @@ const ReviewConfig = objectType({
     if_paths: arrayType(stringType()).default(["**"]),
     providers: arrayType(stringType()).optional(), // informative; agents pick providers
     strategy: enumType(["any", "all", "majority"]).default("any"),
+    // Extra full files to include as context (globs, repo-relative).
+    context_files: arrayType(stringType()).default([]),
+    // Include full content of changed in-scope files (bounded by max_context_chars).
+    include_full_files: booleanType().optional(),
+    // Per-review context budget override (defaults to defaults.max_context_chars).
+    max_context_chars: numberType().int().nonnegative().optional(),
     main: AgentConfig,
     subagents: arrayType(AgentConfig).default([]),
     verdict: VerdictConfig.default({}),
@@ -44561,6 +44570,8 @@ const OpenReviewConfig = objectType({
         lang: stringType().default("en"),
         ignore: arrayType(stringType()).default([]),
         max_diff_chars: numberType().int().positive().default(80000),
+        max_context_chars: numberType().int().nonnegative().default(20000),
+        include_full_files: booleanType().default(true),
     })
         .default({}),
     providers: recordType(stringType(), ProviderConfig),
@@ -44736,25 +44747,38 @@ function truncate(s, n) {
 }
 async function callAnthropic(opts) {
     const base = opts.baseUrl.replace(/\/$/, "");
-    const res = await fetch(`${base}${opts.endpointPath}`, {
-        method: "POST",
-        headers: opts.headers,
-        body: JSON.stringify({
-            model: opts.model,
-            max_tokens: 2000,
-            system: opts.system,
-            messages: [{ role: "user", content: opts.user }],
-            ...opts.extraBody,
-        }),
-    });
-    if (!res.ok)
-        throw new Error(`anthropic ${res.status}: ${await res.text()}`);
-    const j = (await res.json());
-    const text = (j.content ?? [])
-        .filter((b) => b.type === "text")
-        .map((b) => b.text)
-        .join("\n");
-    return text;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), opts.timeoutMs);
+    try {
+        const res = await fetch(`${base}${opts.endpointPath}`, {
+            method: "POST",
+            headers: opts.headers,
+            body: JSON.stringify({
+                model: opts.model,
+                max_tokens: 2000,
+                system: opts.system,
+                messages: [{ role: "user", content: opts.user }],
+                ...opts.extraBody,
+            }),
+            signal: ctrl.signal,
+        });
+        if (!res.ok)
+            throw new Error(`anthropic ${res.status}: ${await res.text()}`);
+        const j = (await res.json());
+        const text = (j.content ?? [])
+            .filter((b) => b.type === "text")
+            .map((b) => b.text)
+            .join("\n");
+        return text;
+    }
+    catch (e) {
+        if (e.name === "AbortError")
+            throw new Error(`timeout after ${opts.timeoutMs}ms`);
+        throw e;
+    }
+    finally {
+        clearTimeout(timer);
+    }
 }
 async function callOpenAICompatible(opts) {
     const base = opts.baseUrl.replace(/\/$/, "");
@@ -44770,15 +44794,28 @@ async function callOpenAICompatible(opts) {
     };
     if (opts.jsonMode)
         body.response_format = { type: "json_object" };
-    const res = await fetch(`${base}${opts.endpointPath}`, {
-        method: "POST",
-        headers: opts.headers,
-        body: JSON.stringify(body),
-    });
-    if (!res.ok)
-        throw new Error(`llm ${base} ${res.status}: ${await res.text()}`);
-    const j = (await res.json());
-    return j.choices?.[0]?.message?.content ?? '{"findings":[]}';
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), opts.timeoutMs);
+    try {
+        const res = await fetch(`${base}${opts.endpointPath}`, {
+            method: "POST",
+            headers: opts.headers,
+            body: JSON.stringify(body),
+            signal: ctrl.signal,
+        });
+        if (!res.ok)
+            throw new Error(`llm ${base} ${res.status}: ${await res.text()}`);
+        const j = (await res.json());
+        return j.choices?.[0]?.message?.content ?? '{"findings":[]}';
+    }
+    catch (e) {
+        if (e.name === "AbortError")
+            throw new Error(`timeout after ${opts.timeoutMs}ms`);
+        throw e;
+    }
+    finally {
+        clearTimeout(timer);
+    }
 }
 function kindDefaults(kind) {
     switch (kind) {
@@ -44849,18 +44886,25 @@ function resolveProvider(provider, keys, env, sessionId) {
 function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
-/** Retryable: empty responses, HTTP 429/5xx, transport failures. Never 4xx auth/shape errors. */
+/** Retryable: empty responses, timeouts, HTTP 429/5xx, transport failures. Never 4xx auth/shape errors. */
 function isRetryableError(message) {
-    return /empty (content|response)| 429[:\s]| 5\d\d[:\s]|fetch failed|timeout|ECONNRESET|ENOTFOUND|socket hang up/i.test(message);
+    return /empty (content|response)|timeout after| 429[:\s]| 5\d\d[:\s]|fetch failed|timeout|ECONNRESET|ENOTFOUND|socket hang up/i.test(message);
 }
 async function runAgent(opts) {
     const system = SYSTEM_WRAPPER(opts.lang, opts.instructions);
-    const user = `Review this unified diff (truncated):\n\n${truncate(opts.diff, opts.maxDiffChars)}`;
+    let user = `Review this unified diff (truncated):\n\n${truncate(opts.diff, opts.maxDiffChars)}`;
+    if (opts.contextBlock) {
+        user += `\n\n${opts.contextBlock}\nGround every finding in the diff above; use <context> only as cross-file evidence (callers, types, contracts). Never flag context-only code.`;
+    }
     const rp = resolveProvider(opts.provider, opts.keys, process.env, opts.sessionId);
     if (!rp.apiKey)
         return []; // missing BYOK key -> skip silently, caller warns
     // Retry budget (issue #30): transient empties/5xx must not silently approve.
+    // Per-attempt timeout bounds hung gateway connections (the 9-minute run was
+    // a single fetch hanging ~5 min with no timeout).
     const maxAttempts = 1 + Math.min(Math.max(opts.provider.retries ?? 2, 0), 5);
+    const timeoutMs = (opts.provider.timeout_s ?? 110) * 1000;
+    const started = Date.now();
     let raw = "";
     let lastError = "";
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -44875,6 +44919,7 @@ async function runAgent(opts) {
                     system,
                     user,
                     extraBody: rp.extraBody,
+                    timeoutMs,
                 });
             }
             else {
@@ -44888,6 +44933,7 @@ async function runAgent(opts) {
                     user,
                     jsonMode: rp.jsonMode,
                     extraBody: rp.extraBody,
+                    timeoutMs,
                 });
             }
             if (raw && raw.trim())
@@ -44907,6 +44953,7 @@ async function runAgent(opts) {
             break; // non-retryable (auth/shape) — fail fast
         }
     }
+    core.info(`Agent ${opts.agentName}: done in ${((Date.now() - started) / 1000).toFixed(1)}s`);
     if (!raw.trim()) {
         // Total failure surfaces into the PR's agent-error block (main.ts catch).
         throw new Error(`Agent ${opts.agentName} failed after ${maxAttempts} attempt(s): ${lastError}`);
@@ -45153,7 +45200,347 @@ async function createInlineReview(octokit, owner, repo, pullNumber, commitSha, v
     });
 }
 
+;// CONCATENATED MODULE: ./dist-src/context.js
+
+
+
+
+const SKIP_DIRS = new Set([
+    ".git",
+    "node_modules",
+    "dist",
+    "dist-src",
+    "website/build",
+    ".docusaurus",
+    "coverage",
+    ".next",
+    "vendor",
+    "__pycache__",
+]);
+const SKIP_EXT = new Set([
+    ".lock",
+    ".snap",
+    ".map",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".pdf",
+    ".zip",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".ico",
+]);
+function walkFiles(root, ignore, out = []) {
+    let entries;
+    try {
+        entries = (0,external_node_fs_namespaceObject.readdirSync)(root);
+    }
+    catch {
+        return out;
+    }
+    for (const e of entries) {
+        const full = external_node_path_namespaceObject.join(root, e);
+        // Never descend into or through symlinks: lstat the link itself, so a
+        // symlinked intermediate directory can never escape the repo.
+        try {
+            if ((0,external_node_fs_namespaceObject.lstatSync)(full).isSymbolicLink())
+                continue;
+        }
+        catch {
+            continue;
+        }
+        let st;
+        try {
+            st = (0,external_node_fs_namespaceObject.statSync)(full);
+        }
+        catch {
+            continue;
+        }
+        if (st.isDirectory()) {
+            if (SKIP_DIRS.has(e))
+                continue;
+            walkFiles(full, ignore, out);
+        }
+        else {
+            // Paths are repo-relative from the walk root (not process.cwd()).
+            const rel = external_node_path_namespaceObject.relative(root, full).replace(/\\/g, "/");
+            if (SKIP_EXT.has(external_node_path_namespaceObject.extname(e)))
+                continue;
+            if (ignore.length > 0 && matchesAny(rel, ignore))
+                continue;
+            try {
+                if ((0,external_node_fs_namespaceObject.statSync)(full).size > 200_000)
+                    continue; // skip huge files
+            }
+            catch {
+                continue;
+            }
+            out.push(rel);
+        }
+    }
+    return out;
+}
+function readCapped(root, rel, cap) {
+    const full = external_node_path_namespaceObject.resolve(root, rel);
+    // Containment on the REAL path (resolves symlinked intermediate dirs too, and
+    // the root itself — e.g. /tmp -> /private/tmp on macOS):
+    // never read outside the repo (config + file list are PR-controlled).
+    let realRoot;
+    try {
+        realRoot = (0,external_node_fs_namespaceObject.realpathSync)(external_node_path_namespaceObject.resolve(root));
+    }
+    catch {
+        return null;
+    }
+    let real;
+    try {
+        real = (0,external_node_fs_namespaceObject.realpathSync)(full);
+    }
+    catch {
+        return null;
+    }
+    const normRoot = realRoot + external_node_path_namespaceObject.sep;
+    if (real !== realRoot && !real.startsWith(normRoot))
+        return null;
+    try {
+        const content = (0,external_node_fs_namespaceObject.readFileSync)(real, "utf8");
+        return content.length > cap ? content.slice(0, cap) + "\n...[file truncated]" : content;
+    }
+    catch {
+        return null;
+    }
+}
+// Top-level defined names: export function|const|class|interface|type X,
+// def X / class X (python), ^func X (go), ^(public|private)? (class|function) X (php/java-ish).
+const DEF_RES = [
+    /export\s+(?:async\s+)?(?:function|const|let|class|interface|type|enum)\s+([A-Za-z_$][\w$]*)/g,
+    /^(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)/gm,
+    /^(?:export\s+)?(?:default\s+)?class\s+([A-Za-z_$][\w$]*)/gm,
+    /^def\s+([A-Za-z_]\w*)/gm,
+    /^class\s+([A-Za-z_]\w*)/gm,
+    /^func\s+(?:\([^)]*\)\s*)?([A-Za-z_]\w*)/gm,
+];
+function extractDefinedNames(content, limit = 20) {
+    const names = new Set();
+    for (const re of DEF_RES) {
+        re.lastIndex = 0;
+        let m;
+        while ((m = re.exec(content)) !== null && names.size < limit) {
+            if (m[1].length >= 3)
+                names.add(m[1]);
+        }
+    }
+    return [...names];
+}
+function isCommentLine(line) {
+    // Conservative: only unambiguous full-line comments. Prefixes like # -- %
+    // are deliberately NOT treated as comments (C preprocessor, --count, 100%).
+    // Missing a caller for precision is worse than an extra excerpt here, so
+    // Python # comments may still match — acceptable noise.
+    const t = line.trimStart();
+    return t.startsWith("//") || t.startsWith("/*") || t.startsWith("*");
+}
+function lineAt(content, index) {
+    const lines = content.split("\n");
+    let count = 0;
+    for (let i = 0; i < lines.length; i++) {
+        count += lines[i].length + 1;
+        if (count > index)
+            return i;
+    }
+    return -1;
+}
+/** Find up to `tries` code (non-comment) matches of word, returning char indices. */
+function findCodeMatches(content, word, tries = 6) {
+    const out = [];
+    const g = new RegExp(word.source, "g");
+    let m;
+    let guard = 0;
+    while ((m = g.exec(content)) !== null && out.length < tries && guard++ < 200) {
+        const line = lineAt(content, m.index);
+        if (line >= 0 && !isCommentLine(content.split("\n")[line]))
+            out.push(m.index);
+        if (m.index === g.lastIndex)
+            g.lastIndex++; // avoid zero-width stall
+    }
+    return out;
+}
+function excerptAround(content, index, radius = 5) {
+    const lines = content.split("\n");
+    let count = 0;
+    for (let i = 0; i < lines.length; i++) {
+        count += lines[i].length + 1;
+        if (count > index) {
+            const from = Math.max(0, i - radius);
+            const to = Math.min(lines.length, i + radius + 1);
+            return lines
+                .slice(from, to)
+                .map((l, k) => `${from + k + 1}: ${l}`)
+                .join("\n");
+        }
+    }
+    return "";
+}
+/**
+ * Build a <context> block: full changed files + extra globs + call-site
+ * excerpts for top-level symbols defined in changed files. Bounded by budget.
+ */
+function buildContextBlock(input) {
+    const budget = input.maxContextChars;
+    if (budget <= 0) {
+        const stats = "context: disabled (max_context_chars <= 0)";
+        core.info(stats);
+        return { block: "", stats };
+    }
+    const parts = [];
+    let used = 0;
+    // Account for "\n\n" separators + "<context>\n" / "\n</context>" wrapper (21 chars
+    // total) so the final prompt never exceeds the budget.
+    const WRAPPER_OVERHEAD = 21;
+    const push = (text) => {
+        const cost = text.length + 2; // part + separator
+        if (used + cost + WRAPPER_OVERHEAD > budget) {
+            // Truncate instead of dropping when a useful chunk would fit.
+            const room = budget - used - WRAPPER_OVERHEAD - 2 - 24;
+            if (room > 200) {
+                const cut = text.slice(0, room) + "\n...[part truncated]";
+                parts.push(cut);
+                used += cut.length + 2;
+                return true;
+            }
+            return false;
+        }
+        parts.push(text);
+        used += cost;
+        return true;
+    };
+    const pushed = new Set(); // files actually in the prompt (differs from read set)
+    let fullCount = 0;
+    let extraCount = 0;
+    let callerCount = 0;
+    const warnings = [];
+    // 1. Full content of changed in-scope files.
+    const changedContents = new Map();
+    if (input.includeFullFiles) {
+        for (const f of input.scopedFiles) {
+            const content = readCapped(input.repoRoot, f, 12000);
+            if (content === null)
+                continue;
+            changedContents.set(f, content);
+            if (push(`--- full file: ${f} ---\n${content}`)) {
+                fullCount++;
+                pushed.add(f);
+            }
+            else
+                break;
+        }
+    }
+    else {
+        for (const f of input.scopedFiles) {
+            const content = readCapped(input.repoRoot, f, 12000);
+            if (content !== null)
+                changedContents.set(f, content);
+        }
+    }
+    // Single repo walk reused by extras + callers (was up to 3 walks before).
+    const needWalk = input.contextFiles.length > 0 || changedContents.size > 0;
+    const all = needWalk ? walkFiles(input.repoRoot, input.ignore) : [];
+    // 2. Extra context_files: explicit paths read directly (never silently dropped
+    // by walk filters); globs resolved through the walk.
+    if (input.contextFiles.length > 0) {
+        const matched = new Set();
+        for (const pattern of input.contextFiles) {
+            const isGlob = /[*?[\]{}!]/.test(pattern);
+            if (!isGlob) {
+                const direct = readCapped(input.repoRoot, pattern, 8000);
+                if (direct !== null) {
+                    if (!pushed.has(pattern) && !matched.has(pattern)) {
+                        matched.add(pattern);
+                        if (push(`--- context file: ${pattern} ---\n${direct}`)) {
+                            extraCount++;
+                            pushed.add(pattern);
+                        }
+                    }
+                }
+                else {
+                    warnings.push(`context_files: '${pattern}' not found or unreadable`);
+                }
+                continue;
+            }
+            for (const f of all) {
+                if (matched.size >= 10)
+                    break;
+                if (matchesAny(f, [pattern]) && !pushed.has(f) && !matched.has(f)) {
+                    const content = readCapped(input.repoRoot, f, 8000);
+                    if (content === null)
+                        continue;
+                    matched.add(f);
+                    if (push(`--- context file: ${f} ---\n${content}`)) {
+                        extraCount++;
+                        pushed.add(f);
+                    }
+                    else
+                        break;
+                }
+            }
+        }
+    }
+    // 3. Call-site excerpts for defined symbols. Changed files are never caller
+    // candidates (their content is already in the prompt or the diff); each file
+    // is emitted at most once.
+    if (changedContents.size > 0) {
+        const candidates = all
+            .filter((f) => !changedContents.has(f) && !pushed.has(f))
+            .slice(0, 400);
+        const emitted = new Set();
+        const fileContents = new Map();
+        for (const content of changedContents.values()) {
+            for (const name of extractDefinedNames(content)) {
+                const word = new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`);
+                for (const other of candidates) {
+                    if (emitted.has(other))
+                        continue;
+                    let otherContent = fileContents.get(other);
+                    if (otherContent === undefined) {
+                        otherContent = readCapped(input.repoRoot, other, 60000) ?? "";
+                        fileContents.set(other, otherContent);
+                    }
+                    const hits = findCodeMatches(otherContent, word, 2);
+                    if (hits.length > 0) {
+                        const excerpt = excerptAround(otherContent, hits[0]);
+                        if (push(`--- callers of ${name} in ${other} ---\n${excerpt}`)) {
+                            callerCount++;
+                            emitted.add(other);
+                        }
+                        else
+                            break;
+                    }
+                    if (callerCount >= 12)
+                        break;
+                }
+                if (used >= budget || callerCount >= 12)
+                    break;
+            }
+            if (used >= budget || callerCount >= 12)
+                break;
+        }
+    }
+    let stats = `context: ${fullCount} full files, ${extraCount} extra files, ${callerCount} caller excerpts, ${used}/${budget} chars`;
+    if (warnings.length > 0) {
+        stats += `; warnings: ${warnings.join("; ")}`;
+        for (const w of warnings)
+            core.warning(`context: ${w}`);
+    }
+    core.info(stats);
+    if (parts.length === 0)
+        return { block: "", stats };
+    return { block: `<context>\n${parts.join("\n\n")}\n</context>`, stats };
+}
+
 ;// CONCATENATED MODULE: ./dist-src/main.js
+
 
 
 
@@ -45250,6 +45637,15 @@ async function run() {
             }
             // Build a scoped diff (best-effort: filter diff hunks by filename header)
             const scopedDiff = scopedFiles.length === inScope.length ? diff : diff; // keep full diff; agents see file names
+            // Cross-file context (issue #20): full files + call-site excerpts, budgeted.
+            const { block: contextBlock } = buildContextBlock({
+                repoRoot: process.cwd(),
+                scopedFiles,
+                contextFiles: review.context_files,
+                includeFullFiles: review.include_full_files ?? config.defaults.include_full_files ?? true,
+                maxContextChars: review.max_context_chars ?? config.defaults.max_context_chars ?? 20000,
+                ignore: config.defaults.ignore ?? [],
+            });
             const tasks = [];
             const agentDefs = [
                 { ...review.main, name: review.main.name ?? `${review.id}:main` },
@@ -45271,6 +45667,7 @@ async function run() {
                     keys,
                     maxDiffChars: config.defaults.max_diff_chars ?? 80000,
                     sessionId,
+                    contextBlock,
                 })
                     .then((findings) => ({ findings, agent: a.name ?? "agent" }))
                     .catch((e) => {
