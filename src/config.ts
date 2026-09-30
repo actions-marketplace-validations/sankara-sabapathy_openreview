@@ -29,7 +29,12 @@ export const ProviderConfig = z.object({
   // Env var holding the key: "secrets.MY_KEY" or "env.MY_KEY" -> $MY_KEY.
   // Falls back to legacy fixed inputs (ANTHROPIC_API_KEY / OPENAI_API_KEY / OPENCODE_API_KEY).
   key_from: z.string().optional(),
-  auth: AuthConfig.default({}),
+  // Absent auth means "protocol defaults" (x-api-key for anthropic-messages,
+  // Bearer Authorization otherwise). A present auth block is ALWAYS honored
+  // literally — this is what allows subscription OAuth (Bearer) under the
+  // anthropic protocol. Do not give this a zod default: presence detection
+  // is the feature.
+  auth: AuthConfig.optional(),
   // Extra headers merged into every request (e.g. custom gateway headers).
   headers: z.record(z.string()).default({}),
   // Endpoint path appended to base_url. Defaults: "/chat/completions" (openai-chat),

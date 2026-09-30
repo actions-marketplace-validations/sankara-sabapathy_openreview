@@ -33,6 +33,14 @@ providers:
     # extra_body: { temperature: 0.1 } # extra JSON body fields merged into requests
 
   # --- Commented examples: any provider works with protocol + base_url + key_from + model ---
+  # Claude subscription (Pro/Max/…): `claude setup-token` → secret → step env.
+  # The explicit auth block forces Bearer (without it, x-api-key is assumed).
+  # claude-subscription:
+  #   protocol: anthropic-messages
+  #   model: claude-sonnet-5
+  #   key_from: secrets.CLAUDE_CODE_OAUTH_TOKEN
+  #   auth: { header: Authorization, scheme: Bearer }
+  #   headers: { anthropic-beta: oauth-2025-04-20 }
   # claude:
   #   protocol: anthropic-messages
   #   model: claude-sonnet-5

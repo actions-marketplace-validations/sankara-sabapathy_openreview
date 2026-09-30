@@ -44505,7 +44505,12 @@ const ProviderConfig = objectType({
     // Env var holding the key: "secrets.MY_KEY" or "env.MY_KEY" -> $MY_KEY.
     // Falls back to legacy fixed inputs (ANTHROPIC_API_KEY / OPENAI_API_KEY / OPENCODE_API_KEY).
     key_from: stringType().optional(),
-    auth: AuthConfig.default({}),
+    // Absent auth means "protocol defaults" (x-api-key for anthropic-messages,
+    // Bearer Authorization otherwise). A present auth block is ALWAYS honored
+    // literally — this is what allows subscription OAuth (Bearer) under the
+    // anthropic protocol. Do not give this a zod default: presence detection
+    // is the feature.
+    auth: AuthConfig.optional(),
     // Extra headers merged into every request (e.g. custom gateway headers).
     headers: recordType(stringType()).default({}),
     // Endpoint path appended to base_url. Defaults: "/chat/completions" (openai-chat),
@@ -44669,16 +44674,17 @@ function resolveProvider(provider, keys, env, sessionId) {
         "x-opencode-session": sessionId,
         ...Object.fromEntries(Object.entries(provider.headers).map(([k, v]) => [k.toLowerCase(), v])),
     };
-    const authHeader = (provider.auth.header || "Authorization").toLowerCase();
-    const authCustomized = provider.auth.header !== "Authorization" || provider.auth.scheme !== "Bearer";
+    const authHeader = (provider.auth?.header || "Authorization").toLowerCase();
+    const authCustomized = provider.auth !== undefined;
     if (protocol === "anthropic-messages" && !authCustomized) {
         // Anthropic default: x-api-key carries the raw key.
         headers["x-api-key"] = apiKey;
     }
     else {
-        headers[authHeader] = provider.auth.scheme
-            ? `${provider.auth.scheme} ${apiKey}`
-            : apiKey;
+        // Literal auth: default Bearer Authorization, or whatever the user set
+        // (e.g. subscription OAuth under the anthropic protocol, Azure api-key).
+        const scheme = provider.auth?.scheme ?? "Bearer";
+        headers[authHeader] = scheme ? `${scheme} ${apiKey}` : apiKey;
     }
     if (protocol === "anthropic-messages" && !headers["anthropic-version"]) {
         headers["anthropic-version"] = "2023-06-01";

@@ -170,16 +170,16 @@ export function resolveProvider(
       Object.entries(provider.headers).map(([k, v]) => [k.toLowerCase(), v])
     ),
   };
-  const authHeader = (provider.auth.header || "Authorization").toLowerCase();
-  const authCustomized =
-    provider.auth.header !== "Authorization" || provider.auth.scheme !== "Bearer";
+  const authHeader = (provider.auth?.header || "Authorization").toLowerCase();
+  const authCustomized = provider.auth !== undefined;
   if (protocol === "anthropic-messages" && !authCustomized) {
     // Anthropic default: x-api-key carries the raw key.
     headers["x-api-key"] = apiKey;
   } else {
-    headers[authHeader] = provider.auth.scheme
-      ? `${provider.auth.scheme} ${apiKey}`
-      : apiKey;
+    // Literal auth: default Bearer Authorization, or whatever the user set
+    // (e.g. subscription OAuth under the anthropic protocol, Azure api-key).
+    const scheme = provider.auth?.scheme ?? "Bearer";
+    headers[authHeader] = scheme ? `${scheme} ${apiKey}` : apiKey;
   }
   if (protocol === "anthropic-messages" && !headers["anthropic-version"]) {
     headers["anthropic-version"] = "2023-06-01";
