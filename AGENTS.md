@@ -10,7 +10,7 @@ shipped as a **GitHub Action** (Node, `action.yml` → `dist/index.js`) + a Docu
 docs site (`website/`). Marketplace: `sankara-sabapathy/openreview`.
 Live docs: https://sankara-sabapathy.github.io/openreview/
 
-How it works: a consumer repo adds `.github/workflows/openreview.yml` (calls this
+How it works: a consumer repo adds `.github/workflows/ai-review.yml` (calls this
 action with provider API keys as secrets) + `.github/openreview.yml` (reviews config).
 On PR open/sync or a `/review` comment, the action fetches the diff via the GitHub
 API, fans out to `main` + `subagents` across any configured LLM providers, merges
@@ -35,7 +35,8 @@ verdicts, and posts a sticky comment + inline review.
 - `schema/openreview.schema.json` — JSON Schema mirror of `config.ts`.
 - `openreview.example.yml` — full commented example for consumers.
 - `.github/openreview.yml` — this repo's own dogfood config (see rule below).
-- `.github/workflows/` — `openreview.yml` (dogfood), `ci.yml` (typecheck/build/
+- `.github/workflows/` — `ai-review.yml` (dogfood trigger; named to not collide
+  with the `openreview.yml` config), `ci.yml` (typecheck/build/
   package/validate + dist-fresh check), `release.yml` (release-please + move `v0`
   tag), `docs.yml` (Pages deploy).
 - `website/` — Docusaurus v3 docs site, deployed to GitHub Pages from `main`.
