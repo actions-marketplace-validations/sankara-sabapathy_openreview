@@ -9,6 +9,7 @@ jobs:
   probe:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - name: Tiny-prompt baseline per model (timings only, no bodies/keys printed)
         env:
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
