@@ -93,7 +93,7 @@ see [Multi-review](./multi-review).
 Any provider with an OpenAI- or Anthropic-shaped HTTP API works via `protocol` +
 `base_url` + `key_from` + `model`. Provider-specific knobs: `auth:` (e.g. Azure's
 `{header: api-key, scheme: ""}`), `headers:`, `extra_body:`, `json_mode:`,
-`endpoint_path:`. See the [providers doc](https://sankara-sabapathy.github.io/openreview/providers).
+`endpoint_path:`. See the [providers doc](https://sankara-sabapathy.github.io/openreview/docs/providers).
 
 Missing key → that agent is skipped (warned in logs and, if all fail, in the PR
 comment); other providers still run.
