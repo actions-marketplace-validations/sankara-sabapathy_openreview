@@ -1,0 +1,53 @@
+name: Probe (temporary latency benchmark, do not merge)
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Tiny-prompt baseline per model (timings only, no bodies/keys printed)
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+        run: |
+          probe() {
+            local model="$1"; local extra="$2"; local label="$3"
+            body=$(python3 -c "import json,sys; print(json.dumps({'model':sys.argv[1],'messages':[{'role':'system','content':'You are a terse assistant.'},{'role':'user','content':'Say ok and nothing else.'}],'max_tokens':16,'temperature':1}))" "$model")
+            echo "--- $label ---"
+            curl -s -o /dev/null -w "http=%{http_code} connect=%{time_connect}s ttfb=%{time_starttransfer}s total=%{time_total}s dl=%{size_download}B\n" \
+              --max-time 300 \
+              -H "Content-Type: application/json" \
+              -H "Authorization: Bearer $OPENCODE_API_KEY" \
+              -H "User-Agent: OpenReview-probe/1.0" \
+              -d "$body" \
+              https://opencode.ai/zen/go/v1/chat/completions
+          }
+          probe deepseek-v4-flash "" "deepseek tiny"
+          probe kimi-k2.7-code "" "kimi tiny"
+          probe glm-5.3-flash "" "glm-flash tiny"
+      - name: Medium prompt on deepseek (review-like input size)
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+        run: |
+          python3 -c "print(open('src/providers.ts').read() * 3)" > /tmp/code.txt
+          wc -c /tmp/code.txt
+          body=$(python3 - <<'EOF'
+          import json
+          code = open('/tmp/code.txt').read()[:12000]
+          print(json.dumps({"model": "deepseek-v4-flash",
+            "messages": [{"role": "system", "content": "You are a senior code reviewer. Return ONLY valid JSON: {\"findings\":[]}."},
+                         {"role": "user", "content": "Review this diff:\n\n" + code}],
+            "max_tokens": 500, "temperature": 0.2, "response_format": {"type": "json_object"}}))
+          EOF
+          )
+          echo "--- deepseek medium (~12KB in, 500 out) ---"
+          curl -s -o /dev/null -w "http=%{http_code} connect=%{time_connect}s ttfb=%{time_starttransfer}s total=%{time_total}s dl=%{size_download}B\n" \
+            --max-time 420 \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $OPENCODE_API_KEY" \
+            -H "User-Agent: OpenReview-probe/1.0" \
+            -d "$body" \
+            https://opencode.ai/zen/go/v1/chat/completions
