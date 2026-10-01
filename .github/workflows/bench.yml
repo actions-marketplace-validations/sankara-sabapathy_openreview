@@ -14,22 +14,22 @@ jobs:
         env:
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
         run: |
-          call() { # $1=label $2=json-body $3=extra-headers
+          call() { # $1=label $2=json-body ; uses $EXTRA_HEADERS array
             echo "--- $1 ---"
-            # shellcheck disable=SC2086
             curl -s -o /dev/null -w "http=%{http_code} ttfb=%{time_starttransfer}s total=%{time_total}s\n" \
               --max-time 120 \
               -H "Content-Type: application/json" \
               -H "Authorization: Bearer $OPENCODE_API_KEY" \
-              $3 -d "$2" \
+              "${EXTRA_HEADERS[@]}" -d "$2" \
               https://opencode.ai/zen/go/v1/chat/completions
           }
           MIN='{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"Say ok."}]}'
           FULL=$(python3 -c "import json; print(json.dumps({'model':'deepseek-v4-flash','messages':[{'role':'system','content':'Be terse.'},{'role':'user','content':'Say ok.'}],'temperature':0.2,'max_tokens':2000,'response_format':{'type':'json_object'}}))")
-          call "A minimal, no session header" "$MIN" ""
-          call "B minimal + session header" "$MIN" "-H 'x-opencode-session: probe-1' -H 'User-Agent: OpenReview-probe/1.0'"
-          call "C full our-shape + session" "$FULL" "-H 'x-opencode-session: probe-2' -H 'User-Agent: OpenReview-probe/1.0'"
-          call "D full our-shape, no session" "$FULL" ""
+          EXTRA_HEADERS=()
+          call "A minimal, no session header" "$MIN"
+          EXTRA_HEADERS=(-H "x-opencode-session: probe-1" -H "User-Agent: OpenReview-probe/1.0")
+          call "B minimal + session header" "$MIN"
+          call "C full our-shape + session" "$FULL"
       - name: Medium prompt on deepseek (review-like input size)
         if: false
         env:
