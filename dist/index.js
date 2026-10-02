@@ -44576,6 +44576,13 @@ const OpenReviewConfig = objectType({
         lang: stringType().default("en"),
         ignore: arrayType(stringType()).default([]),
         max_diff_chars: numberType().int().positive().default(80000),
+        // Wall-clock budget for the whole run (issue #51). Once exhausted, no new
+        // agent call starts and remaining agents report `budget-exhausted`.
+        // Worst case was reviews x agents x (1+retries) x timeout_s (~42 min).
+        max_runtime_s: numberType().int().min(30).max(14400).default(1200),
+        // Max agents in flight per review. Unbounded fan-out rate-limits small
+        // providers and turns retries into a 429 storm.
+        max_concurrency: numberType().int().min(1).max(32).default(4),
         max_context_chars: numberType().int().nonnegative().default(20000),
         include_full_files: booleanType().default(true),
         // Noise defaults (issue #21). Severity stays owned by verdict.min_severity.
@@ -44992,6 +44999,25 @@ async function callAnthropic(opts) {
         clearTimeout(timer);
     }
 }
+/** Extract the assistant text from an openai-chat response (issue #26).
+ * Reasoning models (DeepSeek V4 flash, GLM, …) answer in
+ * `message.reasoning_content` and leave `message.content` empty, so reading
+ * `content` alone produced "" — and `??` never fires on an empty string — which
+ * looked like a provider failure and was retried 3x for nothing.
+ *
+ * PREFER `content`, and only fall back to the reasoning fields. Do NOT
+ * concatenate them: `reasoning_content` is the model's whole thinking trace
+ * (131k tokens observed on a live run), and prepending it to the answer makes
+ * `extractFindingsJson`'s brace-matching span the entire monologue, so a
+ * perfectly good review fails to parse. */
+function extractAssistantText(j) {
+    const msg = j?.choices?.[0]?.message ?? {};
+    if (typeof msg.content === "string" && msg.content.trim())
+        return msg.content;
+    return [msg.reasoning_content, msg.reasoning]
+        .filter((p) => typeof p === "string" && p.trim().length > 0)
+        .join("\n");
+}
 async function callOpenAICompatible(opts) {
     const base = opts.baseUrl.replace(/\/$/, "");
     const body = {
@@ -45024,7 +45050,7 @@ async function callOpenAICompatible(opts) {
         const usage = typeof u.prompt_tokens === "number" || typeof u.completion_tokens === "number"
             ? { in: u.prompt_tokens ?? 0, out: u.completion_tokens ?? 0 }
             : null;
-        return { text: j.choices?.[0]?.message?.content ?? '{"findings":[]}', usage };
+        return { text: extractAssistantText(j), usage };
     }
     catch (e) {
         if (e.name === "AbortError")
@@ -45122,16 +45148,40 @@ async function runAgent(opts) {
     // review, and the caller can name the missing secret (issue #46)
     if (!rp.apiKey)
         return { findings: [], usage: null, seconds: 0, outcome: "skipped-no-key" };
+    // No time left in the run's budget (issue #51): don't start a call we cannot
+    // finish. Reported as a non-voting outcome, never as a clean review.
+    if (opts.deadlineAt !== undefined && Date.now() >= opts.deadlineAt) {
+        logWarning(`Agent ${opts.agentName}: skipped, run budget exhausted.`);
+        return { findings: [], usage: null, seconds: 0, outcome: "budget-exhausted" };
+    }
     // Retry budget (issue #30): transient empties/5xx must not silently approve.
     // Per-attempt timeout bounds hung gateway connections (the 9-minute run was
     // a single fetch hanging ~5 min with no timeout).
     const maxAttempts = 1 + Math.min(Math.max(opts.provider.retries ?? 2, 0), 5);
-    const timeoutMs = (opts.provider.timeout_s ?? 420) * 1000;
+    // Per-attempt cap; recomputed per attempt below so it can only shrink as
+    // the run's deadline approaches (issue #51).
+    const perAttempt = (opts.provider.timeout_s ?? 420) * 1000;
     const started = Date.now();
     let raw = "";
     let usage = null;
     let lastError = "";
+    // An empty-but-successful response is usually deterministic (the model keeps
+    // answering in a field we don't read), so a third attempt just triples the
+    // wall-clock cost. Allow one retry, not `retries` (issue #51).
+    let emptyRetries = 0;
+    let attemptsMade = 0;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        // Re-check the budget before EVERY attempt. A retry is a new HTTP call: it
+        // must not start once the run budget is gone, or the run overruns
+        // max_runtime_s by up to maxAttempts x timeout_s.
+        if (opts.deadlineAt !== undefined && Date.now() >= opts.deadlineAt) {
+            logWarning(`Agent ${opts.agentName}: run budget exhausted before attempt ${attempt}.`);
+            break;
+        }
+        attemptsMade = attempt;
+        const timeoutMs = opts.deadlineAt === undefined
+            ? perAttempt
+            : Math.max(1_000, Math.min(perAttempt, opts.deadlineAt - Date.now()));
         try {
             let out;
             if (rp.protocol === "anthropic-messages") {
@@ -45175,8 +45225,21 @@ async function runAgent(opts) {
             usage = null;
         }
         if (attempt < maxAttempts && isRetryableError(lastError)) {
+            if (lastError.startsWith("empty content")) {
+                if (emptyRetries >= 1)
+                    break; // deterministic: one retry is enough
+                emptyRetries++;
+            }
+            // Don't sleep past the budget: the next iteration re-checks it anyway.
+            const backoffMs = opts.deadlineAt === undefined
+                ? 2000 * attempt
+                : Math.max(0, Math.min(2000 * attempt, opts.deadlineAt - Date.now()));
+            if (opts.deadlineAt !== undefined && Date.now() + backoffMs >= opts.deadlineAt) {
+                logWarning(`Agent ${opts.agentName}: no time left for a retry after attempt ${attempt}.`);
+                break;
+            }
             logWarning(`Agent ${opts.agentName}: attempt ${attempt}/${maxAttempts} failed (${lastError.slice(0, 160)}); retrying`);
-            await sleep(2000 * attempt);
+            await sleep(backoffMs);
         }
         else if (attempt < maxAttempts) {
             break; // non-retryable (auth/shape) — fail fast
@@ -45193,7 +45256,7 @@ async function runAgent(opts) {
         `prompt=${system.length + user.length} chars (diff ${opts.diff.length}, ctx ${(opts.contextBlock ?? "").length})`);
     if (!raw.trim()) {
         // Total failure surfaces into the PR's agent-error block (main.ts catch).
-        throw new Error(`Agent ${opts.agentName} failed after ${maxAttempts} attempt(s): ${lastError}`);
+        throw new Error(`Agent ${opts.agentName} failed after ${attemptsMade} attempt(s): ${lastError || "run budget exhausted"}`);
     }
     const parsed = extractFindingsJson(raw);
     if (!parsed) {
@@ -45225,24 +45288,118 @@ async function runAgent(opts) {
         return { findings: [], usage, seconds, outcome: "unparseable" };
     }
 }
-// Parse the findings JSON out of a model response. Tries strict parse first,
-// then falls back to the largest {...} substring (models often wrap JSON in
-// prose when response_format is ignored). Returns null on total failure.
+// Parse the findings JSON out of a model response. A strict parse first, then
+// a balanced-brace scan for the first object that parses AND carries a
+// `findings` key (issue #54). The old fallback was a GREEDY `/\{[\s\S]*\}/`,
+// which breaks the moment prose with braces follows the JSON — a live run lost
+// two complete reviews (131k reasoning tokens) to exactly that.
 function extractFindingsJson(raw) {
     const cleaned = raw.replace(/^```(?:json)?\s*/i, "").replace(/```$/i, "").trim();
-    const candidates = [cleaned];
-    const greedy = cleaned.match(/\{[\s\S]*\}/);
-    if (greedy && greedy[0] !== cleaned)
-        candidates.push(greedy[0]);
-    for (const c of candidates) {
-        try {
-            return JSON.parse(c);
-        }
-        catch {
-            // try next candidate
+    // 1. The whole thing is usually the JSON.
+    const direct = tryParse(cleaned);
+    const directFindings = pickFindings(direct);
+    if (directFindings)
+        return { findings: directFindings };
+    // 2. Scan balanced objects left to right and take the first that really
+    //    carries a findings array. Lazy on purpose: a 130k-token reasoning trace
+    //    holds thousands of `{...}` fragments from quoted code, and materializing
+    //    them all (let alone parsing each) is what made this fail on a live run.
+    for (const cand of balancedObjects(cleaned)) {
+        if (!cand.includes("findings"))
+            continue; // cheap pre-filter
+        const found = pickFindings(tryParse(cand));
+        if (found)
+            return { findings: found };
+    }
+    // 3. Tolerate a differently-shaped object rather than losing the response.
+    return direct;
+}
+/** A model's answer is not always `{"findings": [...]}` at the top level — it
+ * can be `{"analysis": "...", "result": {"findings": [...]}}`. Look a couple of
+ * levels down before giving up, so we don't skip past the outer balanced
+ * object and never reach the nested array. */
+function pickFindings(o, depth = 3) {
+    if (!o || typeof o !== "object")
+        return null;
+    if (Array.isArray(o.findings))
+        return o.findings;
+    if (depth <= 0)
+        return null;
+    for (const v of Object.values(o)) {
+        if (v && typeof v === "object") {
+            const found = pickFindings(v, depth - 1);
+            if (found)
+                return found;
         }
     }
     return null;
+}
+function tryParse(s) {
+    try {
+        const p = JSON.parse(s);
+        return p && typeof p === "object" ? p : null;
+    }
+    catch {
+        return null;
+    }
+}
+/** Yield each balanced `{...}` region, left to right, bounded.
+ * The cap is deliberately generous: the motivating case was a 131k-token
+ * reasoning trace (~500k chars) with the answer at the very end, so a cap
+ * below that reintroduces the exact failure this replaces. The scan is lazy and
+ * exits on the first `findings` object, so a large bound costs nothing in the
+ * common case. */
+function* balancedObjects(s, maxScan = 4_000_000) {
+    const limit = Math.min(s.length, maxScan);
+    let i = 0;
+    while (i < limit) {
+        if (s[i] !== "{") {
+            i++;
+            continue;
+        }
+        let depth = 0;
+        let inStr = false;
+        let esc = false;
+        let end = -1;
+        for (let j = i; j < limit; j++) {
+            const ch = s[j];
+            if (esc) {
+                esc = false;
+                continue;
+            }
+            if (ch === "\\") {
+                esc = true;
+                continue;
+            }
+            if (ch === '"') {
+                inStr = !inStr;
+                continue;
+            }
+            if (inStr)
+                continue;
+            if (ch === "{")
+                depth++;
+            else if (ch === "}") {
+                // A stray '}' in prose must not drive the depth negative, or every
+                // later brace is miscounted and the real object is never found.
+                if (depth === 0)
+                    continue;
+                depth--;
+                if (depth === 0) {
+                    end = j;
+                    break;
+                }
+            }
+        }
+        if (end === -1) {
+            // Unclosed '{' (truncated prose): resume after it rather than giving up,
+            // otherwise the actual findings object further along is never reached.
+            i++;
+            continue;
+        }
+        yield s.slice(i, end + 1);
+        i = end + 1; // nested objects are inside the candidate we just yielded
+    }
 }
 
 ;// CONCATENATED MODULE: ./dist-src/reviewer.js
@@ -45437,13 +45594,30 @@ function runningActionVersion(env) {
 }
 
 ;// CONCATENATED MODULE: ./dist-src/github.js
+
 const STICKY_MARKER = "<!-- openreview:sticky -->";
 function actionBase() {
     // Prefer the action's own coordinates so forks/renames keep working; the
     // hardcoded default matches this repo's published location.
     const repo = process.env.GITHUB_ACTION_REPOSITORY || "sankara-sabapathy/openreview";
-    const ref = process.env.GITHUB_ACTION_REF || "v1";
-    return { repo, ref };
+    const ref = process.env.GITHUB_ACTION_REF || "";
+    // With `uses: ./` (how PRs dogfood unreleased changes) GITHUB_ACTION_REF is the
+    // checkout ref — `refs/pull/62/merge` — which raw.githubusercontent cannot
+    // serve, so the logo would 404 in every comment. Prefer the PR's head branch,
+    // then any plain branch/tag, and fall back to the default branch.
+    //
+    // Only trust GITHUB_HEAD_REF when the head branch actually lives in THIS
+    // repo: on a fork PR it does not, and {base}/{head}/assets 404s — the exact
+    // failure this function exists to prevent.
+    const headRepo = github.context?.payload?.pull_request?.head?.repo?.full_name;
+    const head = typeof headRepo === "string" && headRepo.toLowerCase() === repo.toLowerCase()
+        ? process.env.GITHUB_HEAD_REF || ""
+        : "";
+    if (head && !head.includes("..") && !/[~^:\\]|\s/.test(head))
+        return { repo, ref: head };
+    if (/^[\w.\-/]+$/.test(ref) && !ref.startsWith("refs/"))
+        return { repo, ref };
+    return { repo, ref: "main" };
 }
 function logoUrl() {
     const { repo, ref } = actionBase();
@@ -45453,6 +45627,7 @@ const OUTCOME_LABEL = {
     ok: "✅ reviewed",
     "no-findings": "✅ no findings",
     "skipped-no-key": "⏭️ skipped (no key)",
+    "budget-exhausted": "⏱️ skipped (run budget)",
     unparseable: "⚠️ unusable response",
     error: "❌ failed",
 };
@@ -45987,6 +46162,26 @@ async function getPrDiff(octokit, owner, repo, pr) {
     const { data: pull } = await octokit.rest.pulls.get({ owner, repo, pull_number: pr });
     return { fileNames: names, diff: parts.join("\n\n"), headSha: pull.head.sha };
 }
+/** Run thunks with at most `limit` in flight, preserving result order.
+ * Takes thunks, NOT promises: an already-started promise is in flight before
+ * the pool can see it, so passing promises caps nothing. */
+async function runPooled(thunks, limit) {
+    if (thunks.length === 0)
+        return [];
+    const cap = Math.max(1, Math.min(limit, thunks.length));
+    const out = new Array(thunks.length);
+    let next = 0;
+    const worker = async () => {
+        for (;;) {
+            const i = next++;
+            if (i >= thunks.length)
+                return;
+            out[i] = await thunks[i]();
+        }
+    };
+    await Promise.all(Array.from({ length: cap }, worker));
+    return out;
+}
 async function run() {
     try {
         initLogger();
@@ -46032,6 +46227,18 @@ async function run() {
             logWarning(`Trigger denied: ${gate.reason}. Nothing was reviewed or posted.`);
             return;
         }
+        // Run-wide wall-clock budget (issue #51). Every agent call clamps its own
+        // timeout to what is left, and `runAgent` refuses to start once it is gone.
+        const maxRuntimeS = config.defaults.max_runtime_s ?? 1200;
+        const maxConcurrency = config.defaults.max_concurrency ?? 4;
+        const deadlineAt = Date.now() + maxRuntimeS * 1000;
+        logInfo(`Run budget: ${maxRuntimeS}s total, ${maxConcurrency} agent(s) in flight per review` +
+            (config.reviews.length > 1
+                ? `; projected worst case ~${Math.ceil((config.reviews.length *
+                    config.reviews.reduce((n, r) => n + 1 + r.subagents.length, 0) *
+                    ((config.reviews[0].main ? 3 : 0) + 1)) /
+                    60)} min without the budget kicking in`
+                : ""));
         // Stable session per workflow run (required by OpenCode Go/Zen routing).
         const sessionId = process.env.GITHUB_RUN_ID ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
         logInfo(`Reviewing PR #${prNumber} in ${owner}/${repo}`);
@@ -46061,6 +46268,8 @@ async function run() {
                 maxContextChars: review.max_context_chars ?? config.defaults.max_context_chars ?? 20000,
                 ignore: config.defaults.ignore ?? [],
             });
+            // Thunks, not promises: runAgent must not start until the pool allows it
+            // (an eager promise is already in flight, so the cap would be a no-op).
             const tasks = [];
             const agentDefs = [
                 { ...review.main, name: review.main.name ?? `${review.id}:main` },
@@ -46075,7 +46284,7 @@ async function run() {
                     logWarning(`Review ${review.id}: unknown provider '${a.provider}', skipped agent ${a.name}.`);
                     continue;
                 }
-                tasks.push(runAgent({
+                tasks.push(() => runAgent({
                     agentName: a.name ?? "agent",
                     providerName: a.provider,
                     provider,
@@ -46086,6 +46295,7 @@ async function run() {
                     maxDiffChars: config.defaults.max_diff_chars ?? 80000,
                     sessionId,
                     contextBlock,
+                    deadlineAt,
                 })
                     .then((result) => ({
                     findings: result.findings,
@@ -46109,7 +46319,10 @@ async function run() {
                     };
                 }));
             }
-            const results = await Promise.all(tasks);
+            // Bounded fan-out (issue #51): run at most `max_concurrency` agents at a
+            // time instead of bursting every agent at the provider at once. The
+            // thunk is what makes the cap real — see runPooled.
+            const results = await runPooled(tasks, maxConcurrency);
             let findings = results.flatMap((r) => r.findings);
             const agentErrors = results.filter((r) => r.error).map((r) => `- \`${r.agent}\`: ${r.error}`);
             if (review.verdict.deduplicate)

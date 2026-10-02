@@ -6,8 +6,23 @@ function actionBase(): { repo: string; ref: string } {
   // Prefer the action's own coordinates so forks/renames keep working; the
   // hardcoded default matches this repo's published location.
   const repo = process.env.GITHUB_ACTION_REPOSITORY || "sankara-sabapathy/openreview";
-  const ref = process.env.GITHUB_ACTION_REF || "v1";
-  return { repo, ref };
+  const ref = process.env.GITHUB_ACTION_REF || "";
+  // With `uses: ./` (how PRs dogfood unreleased changes) GITHUB_ACTION_REF is the
+  // checkout ref — `refs/pull/62/merge` — which raw.githubusercontent cannot
+  // serve, so the logo would 404 in every comment. Prefer the PR's head branch,
+  // then any plain branch/tag, and fall back to the default branch.
+  //
+  // Only trust GITHUB_HEAD_REF when the head branch actually lives in THIS
+  // repo: on a fork PR it does not, and {base}/{head}/assets 404s — the exact
+  // failure this function exists to prevent.
+  const headRepo = (github.context?.payload as any)?.pull_request?.head?.repo?.full_name;
+  const head =
+    typeof headRepo === "string" && headRepo.toLowerCase() === repo.toLowerCase()
+      ? process.env.GITHUB_HEAD_REF || ""
+      : "";
+  if (head && !head.includes("..") && !/[~^:\\]|\s/.test(head)) return { repo, ref: head };
+  if (/^[\w.\-/]+$/.test(ref) && !ref.startsWith("refs/")) return { repo, ref };
+  return { repo, ref: "main" };
 }
 
 export function logoUrl(): string {
@@ -21,6 +36,7 @@ const OUTCOME_LABEL: Record<string, string> = {
   ok: "✅ reviewed",
   "no-findings": "✅ no findings",
   "skipped-no-key": "⏭️ skipped (no key)",
+  "budget-exhausted": "⏱️ skipped (run budget)",
   unparseable: "⚠️ unusable response",
   error: "❌ failed",
 };

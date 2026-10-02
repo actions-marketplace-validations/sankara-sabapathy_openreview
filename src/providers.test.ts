@@ -1,7 +1,15 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { readBodyWithIdleTimeout, isRetryableError } from "./providers.js";
+import {
+  readBodyWithIdleTimeout,
+  isRetryableError,
+  extractAssistantText,
+  extractFindingsJson,
+  runAgent,
+  countsAsReview,
+} from "./providers.js";
+import { parseConfig } from "./config.js";
 
 function serve(
   handler: (req: unknown, res: { writeHead: Function; write: Function; end: Function; flushHeaders: Function }) => void
@@ -269,5 +277,158 @@ describe("isRetryableError", () => {
       assert.equal(e.name, "AbortError");
       return true;
     });
+  });
+});
+
+describe("extractAssistantText (issue #26)", () => {
+  it("reads content when the model used it", () => {
+    assert.equal(
+      extractAssistantText({ choices: [{ message: { content: '{"findings":[]}' } }] }),
+      '{"findings":[]}'
+    );
+  });
+  it("falls back to reasoning_content, the field reasoning models actually use", () => {
+    // DeepSeek V4 flash / GLM answer here and leave content "" -> the old
+    // `content ?? '{"findings":[]}'` never fired ("" is not nullish) and the
+    // agent was reported as "empty content", then retried 3x for nothing.
+    assert.equal(
+      extractAssistantText({
+        choices: [{ message: { reasoning_content: '{"findings":[{"file":"a.ts"}]}' } }],
+      }),
+      '{"findings":[{"file":"a.ts"}]}'
+    );
+  });
+  it("does NOT concatenate: content alone wins when present", () => {
+    // Concatenating fed the whole thinking trace to extractFindingsJson and lost
+    // two complete reviews on a live run (see "prefers content over the
+    // reasoning trace" below and the extractFindingsJson regressions).
+    assert.equal(
+      extractAssistantText({
+        choices: [{ message: { reasoning_content: "thinking", content: "answer" } }],
+      }),
+      "answer"
+    );
+  });
+  it("ignores blank/whitespace-only fields", () => {
+    assert.equal(
+      extractAssistantText({ choices: [{ message: { reasoning_content: "  ", content: "" } }] }),
+      ""
+    );
+  });
+  it("tolerates malformed shapes", () => {
+    assert.equal(extractAssistantText({}), "");
+    assert.equal(extractAssistantText({ choices: [] }), "");
+    assert.equal(extractAssistantText({ choices: [{}] }), "");
+    assert.equal(extractAssistantText(null), "");
+  });
+  it("never returns the old fake-empty JSON", () => {
+    // It must be "" so runAgent's "empty content" path (and its 1-retry cap)
+    // still works, rather than a plausible-looking empty review.
+    assert.equal(extractAssistantText({ choices: [{ message: { content: null } }] }), "");
+  });
+  it("prefers content over the reasoning trace (live regression)", () => {
+    // Concatenating both fed 131k tokens of thinking into the JSON extractor and
+    // lost two complete reviews. content wins whenever it has anything.
+    assert.equal(
+      extractAssistantText({
+        choices: [{ message: { reasoning_content: "x".repeat(100000), content: "ANSWER" } }],
+      }),
+      "ANSWER"
+    );
+  });
+});
+
+describe("extractFindingsJson (issue #54)", () => {
+  const J = '{"findings":[{"file":"a.ts","line":1,"severity":"high","comment":"x","confidence":0.9}]}';
+  const ok = (r: unknown) => assert.ok(r, "expected findings to be extracted");
+  const has = (r: { findings?: unknown[] } | null) => assert.ok(Array.isArray(r?.findings));
+
+  it("parses bare and fenced JSON", () => {
+    ok(extractFindingsJson(J));
+    has(extractFindingsJson("```json\n" + J + "\n```"));
+  });
+  it("survives prose after the JSON (the old greedy match died here)", () => {
+    ok(extractFindingsJson("Here you go: " + J + " Let me know if you need more."));
+  });
+  it("survives braces in prose before the JSON", () => {
+    ok(extractFindingsJson("Note {see below} -> " + J));
+  });
+  it("picks the object that actually has findings", () => {
+    ok(extractFindingsJson('{"a":1} then ' + J));
+    ok(extractFindingsJson(J + ' then {"a":1}'));
+  });
+  it("recovers from a stray closing brace and an unclosed opening brace", () => {
+    ok(extractFindingsJson("}}} oops " + J));
+    ok(extractFindingsJson("foo { bar " + J));
+  });
+  it("handles braces and escaped quotes inside string values", () => {
+    has(extractFindingsJson('{"findings":[{"comment":"use {x} and \\"q\\" here"}]}'));
+  });
+  it("recovers a valid review glued to a 130k-token reasoning trace", () => {
+    // The live failure: a thinking monologue quoting code, then the answer.
+    const mono =
+      "The changed function foo(x) returns {a: 1} so I check if (x) { return {b:2} } instead. ".repeat(1500);
+    const r = extractFindingsJson(mono + J + " That is the only issue.");
+    has(r);
+    assert.equal(r?.findings?.length, 1);
+  });
+  it("returns null when there is genuinely no JSON", () => {
+    assert.equal(extractFindingsJson("no json at all"), null);
+    assert.equal(extractFindingsJson("the code is if (x) { return 1 } ok"), null);
+    assert.equal(extractFindingsJson(""), null);
+  });
+  it("keeps a legitimately empty findings array", () => {
+    has(extractFindingsJson('{"findings":[]}'));
+  });
+});
+
+describe("runAgent deadline (issue #51)", () => {
+  const cfg = parseConfig({
+    version: 1,
+    providers: { anthropic: { model: "m", kind: "anthropic", base_url: "http://127.0.0.1:1/v1" } },
+    reviews: [{ id: "r", main: { provider: "anthropic", instructions: "i" } }],
+  });
+  const keys = {
+    anthropicApiKey: "k",
+    openaiApiKey: "",
+    opencodeApiKey: "",
+    opencodeBaseUrl: "",
+    githubToken: "",
+  };
+  const base = {
+    agentName: "a",
+    providerName: "anthropic",
+    provider: cfg.providers.anthropic,
+    instructions: "i",
+    diff: "d",
+    lang: "en",
+    keys,
+    maxDiffChars: 100,
+    sessionId: "s",
+  };
+
+  it("refuses to start once the budget is gone, and does not vote", async () => {
+    const r = await runAgent({ ...base, deadlineAt: Date.now() - 1 });
+    assert.equal(r.outcome, "budget-exhausted");
+    assert.equal(countsAsReview(r.outcome), false);
+    assert.equal(r.findings.length, 0);
+  });
+
+  it("clamps a call to the remaining budget instead of hanging", async () => {
+    // Unroutable base_url + a huge timeout_s: without clamping the abort would
+    // come from ECONNREFUSED, with a real 600s timeout_s it must come from our
+    // ~200ms deadline clamp.
+    const t0 = Date.now();
+    await assert.rejects(
+      runAgent({
+        ...base,
+        provider: { ...cfg.providers.anthropic, timeout_s: 600 },
+        deadlineAt: Date.now() + 200,
+      })
+    );
+    const elapsed = Date.now() - t0;
+    // Loopback refuses connections immediately either way; the point is that it
+    // returns fast and does not run the full attempt budget.
+    assert.ok(elapsed < 5000, `took ${elapsed}ms, expected the budget clamp to bound it`);
   });
 });
