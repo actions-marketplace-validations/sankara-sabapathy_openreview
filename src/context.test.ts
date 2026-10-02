@@ -145,4 +145,66 @@ describe("misc", () => {
     assert.ok(isRetryableError("llm https://x 503: down"));
     assert.ok(!isRetryableError("llm https://x 401: bad key"));
   });
+  it("formatTokens compacts", async () => {
+    const { formatTokens } = await import("./providers.js");
+    assert.equal(formatTokens(999), "999");
+    assert.equal(formatTokens(12400), "12.4k");
+  });
+});
+
+describe("noise controls", () => {
+  it("presets resolve, explicit knobs win", async () => {
+    const { resolveNoise } = await import("./reviewer.js");
+    assert.deepEqual(resolveNoise({ profile: "quiet" }), { min_confidence: 0.85, max_findings: 3 });
+    assert.deepEqual(resolveNoise({}), { min_confidence: 0, max_findings: 50 });
+    assert.deepEqual(resolveNoise({ profile: "quiet", max_findings: 10 }), {
+      min_confidence: 0.85,
+      max_findings: 10,
+    });
+  });
+  it("floor + cap + severity/confidence ordering", async () => {
+    const { applyNoiseControls } = await import("./reviewer.js");
+    type F = { severity: string; confidence: number };
+    const H = (c: number): F => ({ severity: "high", confidence: c });
+    const M = (c: number): F => ({ severity: "medium", confidence: c });
+    const S = (c: number): F => ({ severity: "suggestion", confidence: c });
+    const r = applyNoiseControls([S(0.9), H(0.5), M(0.95), H(0.9), S(0.2)], {
+      min_confidence: 0.6,
+      max_findings: 3,
+    });
+    assert.deepEqual(
+      r.visible.map((f) => `${f.severity}:${f.confidence}`),
+      ["high:0.9", "medium:0.95", "suggestion:0.9"]
+    );
+    assert.equal(r.dropped, 2);
+  });
+});
+
+describe("logger", () => {
+  it("redacts key material from headers", async () => {
+    const { redactHeaders } = await import("./logger.js");
+    const out = redactHeaders({
+      authorization: "Bearer sk-ant-secret",
+      "x-api-key": "sk-ant-secret",
+      "X-Api-Key": "other-secret",
+      "api-key": "azure-secret",
+      "content-type": "application/json",
+    });
+    assert.equal(out["authorization"], "Bearer ***");
+    assert.equal(out["x-api-key"], "***");
+    assert.equal(out["X-Api-Key"], "***");
+    assert.equal(out["api-key"], "***");
+    assert.equal(out["content-type"], "application/json");
+    assert.ok(!JSON.stringify(out).includes("secret"));
+  });
+  it("masks every token in multi-token values", async () => {
+    const { redactHeaders } = await import("./logger.js");
+    const out = redactHeaders({ authorization: "Bearer abc123 extra" });
+    assert.equal(out["authorization"], "Bearer ***");
+    assert.ok(!out["authorization"].includes("abc123"));
+  });
+  it("marks unset keys", async () => {
+    const { redactHeaders } = await import("./logger.js");
+    assert.equal(redactHeaders({ authorization: "" })["authorization"], "(not set)");
+  });
 });

@@ -43,9 +43,10 @@ export const ProviderConfig = z.object({
   // Retry budget for transient failures (empty content, 5xx, 429, network).
   // Total failure throws into the PR's agent-error block instead of silent empty.
   retries: z.number().int().min(0).max(5).default(2),
-  // Per-attempt HTTP timeout in seconds (default 110, under Cloudflare's 120s
-  // proxy cutoff). A hung gateway connection must fail fast, not block minutes.
-  timeout_s: z.number().int().min(10).max(600).default(110),
+  // Per-attempt HTTP timeout in seconds (default 420, max 600). This is a TOTAL
+  // cap; an always-on 90s idle watchdog kills dead hangs fast while slow but
+  // streaming responses survive to the cap. Worst case ≈ attempts × timeout_s.
+  timeout_s: z.number().int().min(10).max(600).default(420),
   // Send response_format json_object (openai-chat). Disable for providers that reject it.
   json_mode: z.boolean().default(true),
   // Extra JSON body fields merged into the request (provider-specific params).
@@ -80,6 +81,10 @@ export const ReviewConfig = z.object({
   include_full_files: z.boolean().optional(),
   // Per-review context budget override (defaults to defaults.max_context_chars).
   max_context_chars: z.number().int().nonnegative().optional(),
+  // Noise controls (issue #21): profile preset + explicit overrides (win).
+  profile: z.enum(["quiet", "balanced", "assertive"]).optional(),
+  min_confidence: z.number().min(0).max(1).optional(),
+  max_findings: z.number().int().positive().optional(),
   main: AgentConfig,
   subagents: z.array(AgentConfig).default([]),
   verdict: VerdictConfig.default({}),
@@ -105,6 +110,10 @@ export const OpenReviewConfig = z.object({
       max_diff_chars: z.number().int().positive().default(80000),
       max_context_chars: z.number().int().nonnegative().default(20000),
       include_full_files: z.boolean().default(true),
+      // Noise defaults (issue #21). Severity stays owned by verdict.min_severity.
+      profile: z.enum(["quiet", "balanced", "assertive"]).default("balanced"),
+      min_confidence: z.number().min(0).max(1).optional(),
+      max_findings: z.number().int().positive().optional(),
     })
     .default({}),
   providers: z.record(z.string(), ProviderConfig),

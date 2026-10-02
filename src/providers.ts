@@ -1,5 +1,6 @@
 import type { ProviderConfig, ProviderProtocol } from "./config.js";
 import * as core from "@actions/core";
+import { logInfo, logWarning, logDebug, redactHeaders } from "./logger.js";
 
 export type ResolvedKeys = {
   anthropicApiKey: string;
@@ -43,6 +44,60 @@ function truncate(s: string, n: number): string {
   return s.length > n ? s.slice(0, n) + "\n...[truncated]" : s;
 }
 
+/** Read a response body with an idle watchdog: any 90s window without a single
+ * byte kills the request. Slow-but-streaming gateways survive; dead hangs die
+ * fast. Total cap is enforced separately by the caller's AbortController. */
+async function readBodyWithIdleTimeout(
+  res: Response,
+  idleMs: number,
+  label: string
+): Promise<string> {
+  const body = res.body;
+  if (!body) return res.text();
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let received = 0;
+  const fail = () => {
+    try {
+      reader.cancel();
+    } catch {
+      // ignore
+    }
+  };
+  try {
+    for (;;) {
+      const timer = setTimeout(fail, idleMs);
+      let read;
+      try {
+        read = await reader.read();
+      } finally {
+        clearTimeout(timer);
+      }
+      if (read.done) break;
+      received += read.value.byteLength;
+      chunks.push(read.value);
+    }
+  } catch (e) {
+    throw new Error(`${label}: idle timeout (no bytes for ${idleMs / 1000}s, got ${received} so far)`);
+  }
+  const buf = Buffer.concat(chunks.map((c) => Buffer.from(c)));
+  return buf.toString("utf8");
+}
+
+export type Usage = { in: number; out: number } | null;
+
+export type AgentResult = {
+  findings: Finding[];
+  usage: Usage;
+  seconds: number;
+};
+
+/** Compact token counts: 12345 -> "12.3k". */
+export function formatTokens(n: number): string {
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
+  return `${n}`;
+}
+
 async function callAnthropic(opts: {
   apiKey: string;
   baseUrl: string;
@@ -53,7 +108,7 @@ async function callAnthropic(opts: {
   user: string;
   extraBody: Record<string, unknown>;
   timeoutMs: number;
-}): Promise<string> {
+}): Promise<{ text: string; usage: Usage }> {
   const base = opts.baseUrl.replace(/\/$/, "");
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), opts.timeoutMs);
@@ -70,13 +125,20 @@ async function callAnthropic(opts: {
       }),
       signal: ctrl.signal,
     });
-    if (!res.ok) throw new Error(`anthropic ${res.status}: ${await res.text()}`);
-    const j = (await res.json()) as any;
-    const text = (j.content ?? [])
+    // Idle 90s: streaming (slow) responses survive, dead hangs die fast.
+    const text = await readBodyWithIdleTimeout(res, 90000, "anthropic");
+    if (!res.ok) throw new Error(`anthropic ${res.status}: ${text}`);
+    const j = JSON.parse(text) as any;
+    const out = (j.content ?? [])
       .filter((b: any) => b.type === "text")
       .map((b: any) => b.text)
       .join("\n");
-    return text;
+    const u = j.usage ?? {};
+    const usage: Usage =
+      typeof u.input_tokens === "number" || typeof u.output_tokens === "number"
+        ? { in: u.input_tokens ?? 0, out: u.output_tokens ?? 0 }
+        : null;
+    return { text: out, usage };
   } catch (e) {
     if ((e as Error).name === "AbortError")
       throw new Error(`timeout after ${opts.timeoutMs}ms`);
@@ -97,7 +159,7 @@ async function callOpenAICompatible(opts: {
   jsonMode: boolean;
   extraBody: Record<string, unknown>;
   timeoutMs: number;
-}): Promise<string> {
+}): Promise<{ text: string; usage: Usage }> {
   const base = opts.baseUrl.replace(/\/$/, "");
   const body: Record<string, unknown> = {
     model: opts.model,
@@ -119,9 +181,16 @@ async function callOpenAICompatible(opts: {
       body: JSON.stringify(body),
       signal: ctrl.signal,
     });
-    if (!res.ok) throw new Error(`llm ${base} ${res.status}: ${await res.text()}`);
-    const j = (await res.json()) as any;
-    return j.choices?.[0]?.message?.content ?? '{"findings":[]}';
+    // Idle 90s: streaming (slow) responses survive, dead hangs die fast.
+    const text = await readBodyWithIdleTimeout(res, 90000, "llm");
+    if (!res.ok) throw new Error(`llm ${base} ${res.status}: ${text}`);
+    const j = JSON.parse(text) as any;
+    const u = j.usage ?? {};
+    const usage: Usage =
+      typeof u.prompt_tokens === "number" || typeof u.completion_tokens === "number"
+        ? { in: u.prompt_tokens ?? 0, out: u.completion_tokens ?? 0 }
+        : null;
+    return { text: j.choices?.[0]?.message?.content ?? '{"findings":[]}', usage };
   } catch (e) {
     if ((e as Error).name === "AbortError")
       throw new Error(`timeout after ${opts.timeoutMs}ms`);
@@ -241,27 +310,30 @@ export async function runAgent(opts: {
   maxDiffChars: number;
   sessionId: string;
   contextBlock?: string;
-}): Promise<Finding[]> {
+}): Promise<AgentResult> {
   const system = SYSTEM_WRAPPER(opts.lang, opts.instructions);
   let user = `Review this unified diff (truncated):\n\n${truncate(opts.diff, opts.maxDiffChars)}`;
   if (opts.contextBlock) {
     user += `\n\n${opts.contextBlock}\nGround every finding in the diff above; use <context> only as cross-file evidence (callers, types, contracts). Never flag context-only code.`;
   }
   const rp = resolveProvider(opts.provider, opts.keys, process.env as any, opts.sessionId);
-  if (!rp.apiKey) return []; // missing BYOK key -> skip silently, caller warns
+  // missing BYOK key -> skip silently, caller warns
+  if (!rp.apiKey) return { findings: [], usage: null, seconds: 0 };
 
   // Retry budget (issue #30): transient empties/5xx must not silently approve.
   // Per-attempt timeout bounds hung gateway connections (the 9-minute run was
   // a single fetch hanging ~5 min with no timeout).
   const maxAttempts = 1 + Math.min(Math.max(opts.provider.retries ?? 2, 0), 5);
-  const timeoutMs = (opts.provider.timeout_s ?? 110) * 1000;
+  const timeoutMs = (opts.provider.timeout_s ?? 420) * 1000;
   const started = Date.now();
   let raw = "";
+  let usage: Usage = null;
   let lastError = "";
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
+      let out;
       if (rp.protocol === "anthropic-messages") {
-        raw = await callAnthropic({
+        out = await callAnthropic({
           apiKey: rp.apiKey,
           baseUrl: rp.baseUrl,
           endpointPath: rp.endpointPath,
@@ -273,7 +345,7 @@ export async function runAgent(opts: {
           timeoutMs,
         });
       } else {
-        raw = await callOpenAICompatible({
+        out = await callOpenAICompatible({
           apiKey: rp.apiKey,
           baseUrl: rp.baseUrl,
           endpointPath: rp.endpointPath,
@@ -286,15 +358,19 @@ export async function runAgent(opts: {
           timeoutMs,
         });
       }
+      raw = out.text;
+      usage = out.usage;
       if (raw && raw.trim()) break; // success
       lastError = `empty content from ${opts.provider.model}`;
       raw = "";
+      usage = null;
     } catch (e) {
       lastError = (e as Error).message;
       raw = "";
+      usage = null;
     }
     if (attempt < maxAttempts && isRetryableError(lastError)) {
-      core.warning(
+      logWarning(
         `Agent ${opts.agentName}: attempt ${attempt}/${maxAttempts} failed (${lastError.slice(0, 160)}); retrying`
       );
       await sleep(2000 * attempt);
@@ -302,8 +378,16 @@ export async function runAgent(opts: {
       break; // non-retryable (auth/shape) — fail fast
     }
   }
-  core.info(
-    `Agent ${opts.agentName}: done in ${((Date.now() - started) / 1000).toFixed(1)}s`
+  const seconds = (Date.now() - started) / 1000;
+  const usageStr = usage
+    ? `, ${formatTokens(usage.in)} in / ${formatTokens(usage.out)} out` +
+      (usage.out > 0 && seconds > 0 ? `, ${(usage.out / seconds).toFixed(1)} tok/s` : "")
+    : "";
+  logInfo(`Agent ${opts.agentName}: done in ${seconds.toFixed(1)}s${usageStr}`);
+  logDebug(
+    `Agent ${opts.agentName}: ${rp.protocol} ${rp.baseUrl}${rp.endpointPath} model=${opts.provider.model} ` +
+      `headers=${JSON.stringify(redactHeaders(rp.headers))} ` +
+      `prompt=${system.length + user.length} chars (diff ${opts.diff.length}, ctx ${(opts.contextBlock ?? "").length})`
   );
   if (!raw.trim()) {
     // Total failure surfaces into the PR's agent-error block (main.ts catch).
@@ -311,10 +395,10 @@ export async function runAgent(opts: {
   }
   const parsed = extractFindingsJson(raw);
   if (!parsed) {
-    core.warning(
+    logWarning(
       `Agent ${opts.agentName}: could not parse findings JSON; raw head: ${raw.slice(0, 300)}`
     );
-    return [];
+    return { findings: [], usage, seconds };
   }
   try {
     const out: Finding[] = [];
@@ -333,13 +417,13 @@ export async function runAgent(opts: {
         provider: opts.providerName,
       });
     }
-    return out;
+    return { findings: out, usage, seconds };
   } catch (e) {
     // Validation of individual findings failed — warn, don't silently drop everything.
-    core.warning(
+    logWarning(
       `Agent ${opts.agentName}: findings validation failed (${(e as Error).message}); raw head: ${raw.slice(0, 200)}`
     );
-    return [];
+    return { findings: [], usage, seconds };
   }
 }
 

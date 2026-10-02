@@ -30,7 +30,7 @@ providers:
     # json_mode: false                     # drop response_format for strict APIs
     # extra_body: { temperature: 0.1 }     # merged into request JSON
     # retries: 2                           # retry budget for empty/5xx/429/network (0-5)
-    # timeout_s: 110                       # per-attempt HTTP timeout, seconds
+    # timeout_s: 420                       # per-attempt TOTAL cap, seconds (idle watchdog: 90s)
 
 reviews:
   - id: general-quality
@@ -64,6 +64,29 @@ reviews:
     include_full_files: true   # or false for diff-only reviews
     max_context_chars: 20000   # per-review budget override
 ```
+
+## Noise controls (profiles)
+
+`profile` presets how much the bot says; explicit `min_confidence` /
+`max_findings` override the preset. Set per review or under `defaults`.
+
+```yaml
+reviews:
+  - id: general-quality
+    profile: balanced # quiet | balanced | assertive
+    min_confidence: 0.6 # explicit knobs override the profile preset
+    max_findings: 10
+```
+
+| Profile | `min_confidence` | `max_findings` | Effect |
+|---|---|---|---|
+| `quiet` | 0.85 | 3 | high-confidence top-3 only |
+| `balanced` (default) | 0 | 50 | historical behavior (no effective filtering) |
+| `assertive` | 0 | 100 | everything the model returns |
+
+Severity stays owned by `verdict.min_severity`; profiles only add confidence +
+cap. Filtering applies before verdict/ballots, and dropped counts are logged —
+one pipeline, no divergence between what's posted and what's decided.
 
 global_verdict: # merges per-review verdicts
   strategy: any_blocking # any_blocking | max_severity | majority

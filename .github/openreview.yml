@@ -40,7 +40,7 @@ providers:
     # json_mode: true # set false for providers rejecting response_format
     # extra_body: { temperature: 0.1 } # extra JSON body fields merged into requests
     # retries: 2 # attempts after the first for empty/5xx/429/network (0-5)
-    # timeout_s: 110 # per-attempt HTTP timeout in seconds (10-600)
+    # timeout_s: 420 # per-attempt TOTAL cap in seconds (10-600); 90s idle watchdog always on
 
   # --- Commented examples: any provider works with protocol + base_url + key_from + model ---
   # Claude subscription (Pro/Max/…): `claude setup-token` → secret → step env.
@@ -78,6 +78,12 @@ reviews:
   - id: general-quality
     if_paths: ["**"]
     strategy: any # any | all | majority: per-provider ballots; see website/docs/multi-review
+    # Noise controls (issue #21): profile preset + explicit overrides (win).
+    # quiet: high-confidence top-3 · balanced (default): passthrough ·
+    # assertive: everything up to 100.
+    # profile: balanced
+    # min_confidence: 0.6
+    # max_findings: 10
     # Cross-file context: full changed files + call-site excerpts automatic
     # (bounded by max_context_chars below); add explicit files when needed:
     # context_files: ["src/config.ts"]
