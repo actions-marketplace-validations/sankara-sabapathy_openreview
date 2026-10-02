@@ -3,8 +3,13 @@
  * Is this model a reasoning (thinking) model?
  *
  * Run:  node scripts/model-probe.mjs [model ...]
- * Key:  OPENCODE_API_KEY env, else the OpenCode Go credential in
- *       ~/.local/share/opencode/opencode.db (never printed).
+ * Key:  OPENCODE_API_KEY — and only that. This script deliberately does NOT
+ *       reach into other tools' credential stores (e.g. OpenCode's
+ *       ~/.local/share/opencode/opencode.db). Quietly reading a credential
+ *       you never handed over — even just to spend a little of your own quota
+ *       on your behalf — is not the script's call to make. If you want the
+ *       probe to use your OpenCode key, pass it yourself:
+ *         OPENCODE_API_KEY=$(...) npm run probe:model
  *
  * Why you need this: a reasoning model bills its thinking into
  * `completion_tokens` and may answer with an EMPTY `content` field. That is
@@ -16,37 +21,12 @@
  *   2. completion_tokens >> visible characters      -> thinking tokens billed
  *   3. finish_reason === "length" with empty content -> thinking ate the budget
  */
-import { execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+
 
 const BASE = process.env.OPENCODE_BASE_URL || "https://opencode.ai/zen/go/v1";
 
 function key() {
-  if (process.env.OPENCODE_API_KEY) return process.env.OPENCODE_API_KEY;
-  const db = join(homedir(), ".local/share/opencode/opencode.db");
-  if (existsSync(db)) {
-    try {
-      const out = execFileSync("sqlite3", [db, "select value from credential where id like 'cred_%';"], {
-        encoding: "utf8",
-      });
-      const v = out.trim().split("\n")[0];
-      if (!v) return "";
-      // The stored value is a JSON blob like {"type":…,"key":"…"}; take the
-      // first non-empty string field. Never printed.
-      try {
-        const obj = JSON.parse(v);
-        const found = Object.values(obj).find((x) => typeof x === "string" && x.length > 8);
-        return found ?? "";
-      } catch {
-        return v;
-      }
-    } catch {
-      /* sqlite3 missing or db locked — fall through */
-    }
-  }
-  return "";
+  return process.env.OPENCODE_API_KEY?.trim() || "";
 }
 
 async function probe(model, apiKey) {
@@ -104,7 +84,7 @@ async function probe(model, apiKey) {
 
 const apiKey = key();
 if (!apiKey) {
-  console.error("No API key: set OPENCODE_API_KEY, or connect OpenCode Go locally.");
+  console.error("No API key set. Export it yourself to run the probe:\n\n  OPENCODE_API_KEY=sk-... npm run probe:model\n\nThis script will not read any other tool's credential store.");
   process.exit(1);
 }
 
