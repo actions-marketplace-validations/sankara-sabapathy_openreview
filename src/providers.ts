@@ -44,24 +44,79 @@ function truncate(s: string, n: number): string {
   return s.length > n ? s.slice(0, n) + "\n...[truncated]" : s;
 }
 
-/** Read a response body with an idle watchdog: any 90s window without a single
- * byte kills the request. Slow-but-streaming gateways survive; dead hangs die
- * fast. Total cap is enforced separately by the caller's AbortController. */
-async function readBodyWithIdleTimeout(
+/** Watchdog failure, typed so callers never match on message text. */
+export class BodyWatchdogError extends Error {
+  constructor(message: string, readonly kind: "idle" | "trickle") {
+    super(message);
+    this.name = "BodyWatchdogError";
+  }
+}
+
+/** Read a response body with two watchdogs (issue #41):
+ * - idle: any `idleMs` window without a single byte kills the request;
+ * - throughput: any window of `windowMs` that delivered fewer than
+ *   `minWindowBytes` kills it (trickling streams that defeat the idle check).
+ *   Tumbling, not rolling: the window resets on the first read after a healthy
+ *   one, so a burst is credited to the window it lands in.
+ * Slow-but-producing gateways survive both; dead hangs and trickles die fast.
+ * Total cap is enforced separately by the caller's AbortController. Exported
+ * for unit tests (feed it a real Response from a local trickle server).
+ *
+ * `trickleGraceMs` is the second-chance delay after a window trips: a gateway
+ * that flushes headers early makes the guard run on the FIRST (and often only)
+ * chunk, so a small-but-complete body — `{"findings":[]}` is 16 bytes — trips it
+ * too. Completion always wins: we only stay fatal while the stream is still open
+ * and still trickling past the grace window. */
+export async function readBodyWithIdleTimeout(
   res: Response,
   idleMs: number,
-  label: string
+  label: string,
+  windowMs = 60000,
+  minWindowBytes = 1024,
+  trickleGraceMs = Math.min(windowMs, Math.floor(idleMs / 2))
 ): Promise<string> {
   const body = res.body;
   if (!body) return res.text();
   const reader = body.getReader();
   const chunks: Uint8Array[] = [];
   let received = 0;
+  let windowStart = Date.now();
+  let windowBytes = 0;
+  let trickleSince: number | null = null; // window tripped, awaiting grace
+  let idleFired = false;
   const fail = () => {
+    // NOTE: cancel() resolves (not rejects) the pending read as done:true,
+    // so record the flag and raise the idle error explicitly below.
+    idleFired = true;
+    cancelReader();
+  };
+  // cancel() resolves on a healthy stream but REJECTS on an errored one, so it
+  // needs a handler on the returned promise — a try/catch around the call is
+  // not enough and leaks an unhandled rejection.
+  const cancelReader = () => {
     try {
-      reader.cancel();
+      void reader.cancel().catch(() => {});
     } catch {
       // ignore
+    }
+  };
+  const checkWindow = (now: number) => {
+    if (now - windowStart < windowMs) return;
+    if (windowBytes >= minWindowBytes) {
+      windowStart = now;
+      windowBytes = 0;
+      trickleSince = null; // healthy window: forgive any earlier trip
+      return;
+    }
+    if (trickleSince === null) {
+      trickleSince = now; // first trip: give the stream a grace window to finish
+      return;
+    }
+    if (now - trickleSince >= trickleGraceMs) {
+      throw new BodyWatchdogError(
+        `${label}: trickle timeout (only ${windowBytes}B in the last ${windowMs / 1000}s, ${received}B total)`,
+        "trickle"
+      );
     }
   };
   try {
@@ -73,12 +128,31 @@ async function readBodyWithIdleTimeout(
       } finally {
         clearTimeout(timer);
       }
-      if (read.done) break;
+      if (idleFired) {
+        throw new BodyWatchdogError(
+          `${label}: idle timeout (no bytes for ${idleMs / 1000}s, got ${received} so far)`,
+          "idle"
+        );
+      }
+      if (read.done) break; // completion beats any pending trickle trip
       received += read.value.byteLength;
+      windowBytes += read.value.byteLength;
+      checkWindow(Date.now());
       chunks.push(read.value);
     }
   } catch (e) {
-    throw new Error(`${label}: idle timeout (no bytes for ${idleMs / 1000}s, got ${received} so far)`);
+    // Release the socket on EVERY error path. The trickle throw never went
+    // through the idle watchdog's cancel(), and would otherwise hold the
+    // connection until the caller's total cap aborts — up to timeout_s later,
+    // once per retry.
+    cancelReader();
+    if (e instanceof BodyWatchdogError) throw e;
+    const err = e as Error | undefined;
+    // The caller's total-cap AbortController lands here. Rethrow untouched so
+    // it keeps its AbortError name and becomes "timeout after <n>ms" upstream —
+    // reporting it as an idle timeout hides the real cause.
+    if (err?.name === "AbortError") throw err;
+    throw new Error(`${label}: body read failed: ${err?.message ?? String(e)}`);
   }
   const buf = Buffer.concat(chunks.map((c) => Buffer.from(c)));
   return buf.toString("utf8");
@@ -292,9 +366,12 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** Retryable: empty responses, timeouts, HTTP 429/5xx, transport failures. Never 4xx auth/shape errors. */
+/** Retryable: empty responses, timeouts (idle/trickle/total), HTTP 429/5xx,
+ * transport failures. Never 4xx auth/shape errors.
+ * Note: undici fires its own ~300s body timeout first, so our total cap only
+ * matters below that; the idle + trickle guards are the real protection. */
 export function isRetryableError(message: string): boolean {
-  return /empty (content|response)|timeout after| 429[:\s]| 5\d\d[:\s]|fetch failed|timeout|ECONNRESET|ENOTFOUND|socket hang up/i.test(
+  return /empty (content|response)|timeout after|idle timeout|trickle timeout| 429[:\s]| 5\d\d[:\s]|fetch failed|timeout|ECONNRESET|ENOTFOUND|socket hang up/i.test(
     message
   );
 }
