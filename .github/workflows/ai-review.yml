@@ -12,11 +12,21 @@ permissions:
 
 jobs:
   review:
-    if: >
+    # issue_comment runs in the BASE repo, so the secrets are live. Gate the
+    # sender on write access (author_association) so no random commenter can
+    # spend the maintainer's provider budget.
+    # The command match stays a cheap pre-filter: `trim()` does not exist in
+    # the Actions expression language, and the action itself enforces the EXACT
+    # command (defaults.command) plus this same association check.
+    if: >-
       github.event_name == 'pull_request' ||
       (github.event_name == 'issue_comment' &&
-       github.event.issue.pull_request &&
-       contains(github.event.comment.body, '/review'))
+      github.event.issue.pull_request &&
+      github.event.sender.type != 'Bot' &&
+      (github.event.comment.author_association == 'OWNER' ||
+      github.event.comment.author_association == 'MEMBER' ||
+      github.event.comment.author_association == 'COLLABORATOR') &&
+      contains(github.event.comment.body, '/review'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

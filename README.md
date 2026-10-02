@@ -38,9 +38,26 @@ permissions:
   pull-requests: write
   issues: write
   contents: read
+# One review per PR at a time.
+concurrency:
+  group: openreview-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}
+  cancel-in-progress: false
 jobs:
   review:
-    if: github.event_name == 'pull_request' || (github.event.issue.pull_request && contains(github.event.comment.body, '/review'))
+    # issue_comment runs in the BASE repo, so your secrets are live. Gate the
+    # sender on write access so no random commenter can spend your provider
+    # budget. The command match is a cheap pre-filter: `trim()` does not exist
+    # in the Actions expression language, and the action itself enforces the
+    # EXACT command (defaults.command) plus this same association check.
+    if: >-
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request &&
+      github.event.sender.type != 'Bot' &&
+      (github.event.comment.author_association == 'OWNER' ||
+      github.event.comment.author_association == 'MEMBER' ||
+      github.event.comment.author_association == 'COLLABORATOR') &&
+      contains(github.event.comment.body, '/review'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
