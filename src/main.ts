@@ -15,7 +15,7 @@ import {
 } from "./providers.js";
 import {
   matchesAny, filterIgnored, dedupeFindings, decideReviewVerdict, combineVerdicts, combineBallots,
-  applyDegradedFloor, resolveNoise, applyNoiseControls, type Verdict,
+  applyDegradedFloor, resolveNoise, applyNoiseControls, splitDiff, scopeDiff, type Verdict,
   satisfiesActionVersion, runningActionVersion,
 } from "./reviewer.js";
 import { renderStickyBody, upsertStickyComment, createInlineReview, type RunStatus } from "./github.js";
@@ -164,6 +164,10 @@ export async function run(): Promise<void> {
       logInfo("Empty diff or all files ignored.");
       return;
     }
+    // Parse the multi-file diff once; every review scopes from this (#47).
+    const parsedDiff = splitDiff(diff);
+    if (parsedDiff.length === 0)
+      logWarning(`Diff parser found no per-file patches for ${fileNames.length} changed file(s).`);
 
     type AgentRun = {
       agent: string;
@@ -188,8 +192,15 @@ export async function run(): Promise<void> {
         logInfo(`Review ${review.id}: no matching paths, skipped.`);
         continue;
       }
-      // Build a scoped diff (best-effort: filter diff hunks by filename header)
-      const scopedDiff = scopedFiles.length === inScope.length ? diff : diff; // keep full diff; agents see file names
+      // Scoped diff (issue #47). `if_paths` used to decide only *whether* a
+      // review ran — agents always got the whole PR diff, so a src/-only review
+      // still paid for (and could comment on) website/ and dist/. Parsed once per
+      // run, reused by every review and agent.
+      const scopedDiff = scopeDiff(scopedFiles, parsedDiff, inScope.length);
+      logDebug(
+        `Review ${review.id}: ${scopedFiles.length}/${inScope.length} in-scope file(s) sent ` +
+          `(${scopedDiff.length} chars)`
+      );
       // Cross-file context (issue #20): full files + call-site excerpts, budgeted.
       const { block: contextBlock } = buildContextBlock({
         repoRoot: process.cwd(),

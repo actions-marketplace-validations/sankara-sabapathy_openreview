@@ -45446,6 +45446,71 @@ function filterIgnored(files, ignore) {
         return files;
     return files.filter((f) => !ignore.some((p) => matchGlob(f, p)));
 }
+/**
+ * Split a multi-file unified diff into per-file patches (issue #47).
+ * GitHub hands us one blob built as
+ *   --- a/<file>\n+++ b/<file>\n<patch>
+ * so the `+++ b/` header is the reliable boundary: every line inside a patch
+ * body starts with ' ', '+' or '-', so no body line can itself start with
+ * `+++ b/` — an added line reading `+++ b/x` is written `++++ b/x` and a
+ * context line carries a leading space.
+ *
+ * A file whose content legitimately contains that sequence cannot be
+ * represented — no caller builds such a diff, so this is a documented
+ * limitation rather than a guess.
+ */
+function splitDiff(diff) {
+    const out = [];
+    let cur = null;
+    let curBody = [];
+    const flush = () => {
+        if (cur && curBody.length) {
+            const body = curBody.join("\n");
+            // Patch lines only (skip the ---/+++ headers we consumed).
+            if (body.startsWith("@@") || body.startsWith("+") || body.startsWith("-")) {
+                out.push({ file: cur.file, patch: body });
+            }
+        }
+        cur = null;
+        curBody = [];
+    };
+    for (const line of diff.split("\n")) {
+        if (line.startsWith("+++ b/")) {
+            flush();
+            cur = { file: line.slice(6), patch: "" };
+            continue;
+        }
+        if (cur && !line.startsWith("--- a/"))
+            curBody.push(line);
+    }
+    flush();
+    return out;
+}
+/**
+ * The diff restricted to `files`, with an honest manifest header.
+ *
+ * `if_paths` used to only decide *whether* a review ran: agents always received
+ * the entire PR diff, so a review scoped to `src/**` still saw (and paid for,
+ * and could comment on) the website/ and dist/ changes (issue #47).
+ */
+function scopeDiff(files, parsed, totalInScope) {
+    const wanted = new Set(files);
+    const picked = parsed.filter((p) => wanted.has(p.file));
+    const body = picked.map((p) => `--- a/${p.file}\n+++ b/${p.file}\n${p.patch}`).join("\n\n");
+    if (totalInScope <= 0 || picked.length === totalInScope)
+        return body;
+    const omitted = totalInScope - picked.length;
+    if (picked.length === 0) {
+        // Should not happen when fileNames and the diff come from the same call, so
+        // say so plainly instead of telling the model to judge an empty prompt.
+        return (`# OpenReview scope note: NO patch text is available for the ${totalInScope} in-scope ` +
+            `changed file(s) this review matched (${files.slice(0, 5).join(", ")}${files.length > 5 ? ", …" : ""}). ` +
+            `They may be binary or too large for GitHub to render. Report no findings rather than guessing.`);
+    }
+    return (`${body}\n\n# OpenReview scope note: ${picked.length} of ${totalInScope} in-scope changed ` +
+        `file(s) are included, matched against if_paths. ${omitted} omitted. Judge only the ` +
+        `files above.`);
+}
 function dedupeFindings(findings) {
     const seen = new Set();
     const out = [];
@@ -46250,6 +46315,10 @@ async function run() {
             logInfo("Empty diff or all files ignored.");
             return;
         }
+        // Parse the multi-file diff once; every review scopes from this (#47).
+        const parsedDiff = splitDiff(diff);
+        if (parsedDiff.length === 0)
+            logWarning(`Diff parser found no per-file patches for ${fileNames.length} changed file(s).`);
         const perReview = [];
         for (const review of config.reviews) {
             const scopedFiles = inScope.filter((f) => matchesAny(f, review.if_paths));
@@ -46257,8 +46326,13 @@ async function run() {
                 logInfo(`Review ${review.id}: no matching paths, skipped.`);
                 continue;
             }
-            // Build a scoped diff (best-effort: filter diff hunks by filename header)
-            const scopedDiff = scopedFiles.length === inScope.length ? diff : diff; // keep full diff; agents see file names
+            // Scoped diff (issue #47). `if_paths` used to decide only *whether* a
+            // review ran — agents always got the whole PR diff, so a src/-only review
+            // still paid for (and could comment on) website/ and dist/. Parsed once per
+            // run, reused by every review and agent.
+            const scopedDiff = scopeDiff(scopedFiles, parsedDiff, inScope.length);
+            logDebug(`Review ${review.id}: ${scopedFiles.length}/${inScope.length} in-scope file(s) sent ` +
+                `(${scopedDiff.length} chars)`);
             // Cross-file context (issue #20): full files + call-site excerpts, budgeted.
             const { block: contextBlock } = buildContextBlock({
                 repoRoot: process.cwd(),
