@@ -141,4 +141,19 @@ describe("summarizeUsage (issue #52)", () => {
     ]);
     assert.equal(modelsLine, "m 100/0");
   });
+
+  it("reports unknown usage as ?/?, never 0/0 (dogfood on #72)", () => {
+    const { modelsLine, agentsLine } = summarizeUsage([
+      { agent: "a", model: "m", usage: null, seconds: 12, attempts: 1, startedAt: 0, endedAt: 12000 },
+    ]);
+    assert.equal(modelsLine, "m ?/?");
+    assert.equal(agentsLine, "a ?/? · 12s · 1 attempt");
+  });
+
+  it("omits the pace badge on sub-second windows (dogfood on #72)", () => {
+    const { modelsLine } = summarizeUsage([
+      { agent: "a", model: "m", usage: { in: 10, out: 50 }, seconds: 0.01, attempts: 1, startedAt: 1000, endedAt: 1000 },
+    ]);
+    assert.equal(modelsLine, "m 10/50");
+  });
 });

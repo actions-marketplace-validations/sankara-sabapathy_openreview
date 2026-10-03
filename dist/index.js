@@ -46365,29 +46365,38 @@ async function getPrDiff(octokit, owner, repo, pr, payloadHeadSha) {
  * Footer lines for the sticky (issue #52). Models line groups true spend by
  * model with wall-clock throughput; agents line shows each agent's own spend
  * so retried and failed attempts stay visible instead of vanishing.
+ * Unknown usage (provider omitted it) renders as ?/?, never 0/0.
  */
 function summarizeUsage(records) {
     const byModel = new Map();
     for (const u of records) {
-        const e = byModel.get(u.model) ?? { In: 0, Out: 0, start: u.startedAt, end: u.endedAt };
-        e.In += u.usage.in;
-        e.Out += u.usage.out;
+        const e = byModel.get(u.model) ?? { In: 0, Out: 0, known: false, start: u.startedAt, end: u.endedAt };
+        if (u.usage) {
+            e.In += u.usage.in;
+            e.Out += u.usage.out;
+            e.known = true;
+        }
         e.start = Math.min(e.start, u.startedAt);
         e.end = Math.max(e.end, u.endedAt);
         byModel.set(u.model, e);
     }
     const modelsLine = [...byModel.entries()]
         .map(([m, e]) => {
-        const elapsed = Math.max((e.end - e.start) / 1000, 0.001);
+        if (!e.known)
+            return `${m} ?/?`;
+        // No pace badge on sub-second windows: a 1ms floor turns any output
+        // into an absurd rate (dogfood on #72). Fast runs just show totals.
+        const elapsed = (e.end - e.start) / 1000;
         return (`${m} ${formatTokens(e.In)}/${formatTokens(e.Out)}` +
-            (e.Out > 0 ? ` ${(e.Out / elapsed).toFixed(0)}t/s` : ""));
+            (e.Out > 0 && elapsed >= 1 ? ` ${(e.Out / elapsed).toFixed(0)}t/s` : ""));
     })
         .join(" · ");
     const agentsLine = records
         .map((u) => {
-        const pace = u.usage.out > 0 && u.seconds > 0 ? ` · ${(u.usage.out / u.seconds).toFixed(0)}t/s` : "";
+        const spend = u.usage ? `${formatTokens(u.usage.in)}/${formatTokens(u.usage.out)}` : "?/?";
+        const pace = u.usage && u.usage.out > 0 && u.seconds > 0 ? ` · ${(u.usage.out / u.seconds).toFixed(0)}t/s` : "";
         const tries = u.attempts === 1 ? "1 attempt" : `${u.attempts} attempts`;
-        return `${u.agent} ${formatTokens(u.usage.in)}/${formatTokens(u.usage.out)}${pace} · ${u.seconds.toFixed(0)}s · ${tries}`;
+        return `${u.agent} ${spend}${pace} · ${u.seconds.toFixed(0)}s · ${tries}`;
     })
         .join("; ");
     return { modelsLine, agentsLine };
@@ -46647,7 +46656,7 @@ async function run() {
                     .map((r) => ({
                     agent: r.agent,
                     model: config.providers[r.providerName]?.model ?? r.providerName,
-                    usage: r.usage ?? { in: 0, out: 0 },
+                    usage: r.usage,
                     seconds: r.seconds,
                     attempts: r.attempts,
                     startedAt: r.startedAt,
