@@ -29,6 +29,12 @@ defaults:
   # Agents in flight per review (1-32, default 4). Unbounded fan-out rate-limits
   # small providers and turns a retry wave into a 429 storm.
   max_concurrency: 4
+  # Cross-file context budget + noise defaults (commented = defaults shown).
+  # max_context_chars: 20000
+  # include_full_files: true
+  # profile: balanced # quiet | balanced | assertive
+  # min_confidence: 0.6
+  # max_findings: 10
 
 providers:
   # --- Active: OpenCode Go, free tier ---
@@ -66,6 +72,37 @@ providers:
     # retries: 2 # attempts after the first for empty/5xx/429/network (0-5)
     # timeout_s: 420 # per-attempt TOTAL cap in seconds (10-600); 90s idle + 60s/1KB trickle guards always on
 
+  # --- Commented examples: any provider works with protocol + base_url + key_from + model ---
+  # Claude subscription (Pro/Max/…): `claude setup-token` → secret → step env.
+  # The explicit auth block forces Bearer (without it, x-api-key is assumed).
+  # claude-subscription:
+  #   protocol: anthropic-messages
+  #   model: claude-sonnet-5
+  #   key_from: secrets.CLAUDE_CODE_OAUTH_TOKEN
+  #   auth: { header: Authorization, scheme: Bearer }
+  #   headers: { anthropic-beta: oauth-2025-04-20 }
+  # claude:
+  #   protocol: anthropic-messages
+  #   model: claude-sonnet-5
+  #   key_from: secrets.ANTHROPIC_API_KEY
+  # codex:
+  #   protocol: openai-chat
+  #   model: gpt-5.3-codex
+  #   base_url: https://api.openai.com/v1
+  #   key_from: secrets.OPENAI_API_KEY
+  # groq:
+  #   protocol: openai-chat
+  #   model: llama-3.3-70b-versatile
+  #   base_url: https://api.groq.com/openai/v1
+  #   key_from: secrets.GROQ_API_KEY
+  #   json_mode: false
+  # azure:
+  #   protocol: openai-chat
+  #   model: my-deployment
+  #   base_url: https://RESOURCE.openai.azure.com/openai/deployments/my-deployment
+  #   key_from: secrets.AZURE_OPENAI_KEY
+  #   auth: { header: api-key, scheme: "" }
+
 reviews:
   # --- Active review: everything in this repo gets the general pass ---
   - id: general-quality
@@ -97,10 +134,20 @@ reviews:
       post_inline: true
       deduplicate: true
 
-  # Only the model this repo actually uses is configured above. Every provider
-# field is still shown (commented) so this file stays a valid reference; the full
-# matrix of providers/models — Claude, Codex, Groq, Azure, the OpenCode Go and
-# Zen tiers — lives in openreview.example.yml and website/docs/providers/.
+  # --- Commented example: scoped strict review with a blocking verdict ---
+  # - id: security-strict
+  #   if_paths: ["auth/**", "api/**", "payments/**", "src/**"]
+  #   main:
+  #     provider: codex
+  #     instructions: "Staff security reviewer. OWASP, authz, injection, secrets. High-confidence findings only."
+  #   subagents:
+  #     - name: secrets-scan
+  #       provider: opencode
+  #       instructions: "Find leaked secrets, hardcoded credentials, overly broad permissions."
+  #   verdict:
+  #     mode: request_changes
+  #     min_severity: high
+  #     post_inline: true
 
 global_verdict:
   strategy: any_blocking # any_blocking | max_severity | majority

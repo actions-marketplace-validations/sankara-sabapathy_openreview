@@ -35,7 +35,7 @@ requires for routing/prompt-caching. Only `chat/completions`-listed models work
 
 | Model ID | Monthly included usage |
 |---|---|
-> `space-bunny-free`, `longcat-2.5-preview-free` | **Free / unlimited (limited time)** — only `space-bunny-free` is review-capable, see below |
+| `space-bunny-free`, `longcat-2.5-preview-free` | **Free / unlimited (limited time)** — only `space-bunny-free` is review-capable, see below |
 | `glm-5.3-flash` | $60 — good all-round reviewer |
 | `kimi-k2.7-code` | $60 — coding specialist, good subagent/main |
 | `kimi-k2.6`, `kimi-k3` | $60 |
