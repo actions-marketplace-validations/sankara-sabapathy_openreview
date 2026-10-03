@@ -131,13 +131,15 @@ export type AgentSpend = {
  * Unknown usage (provider omitted it) renders as ?/?, never 0/0.
  */
 export function summarizeUsage(records: AgentSpend[]): { modelsLine: string; agentsLine: string } {
-  const byModel = new Map<string, { In: number; Out: number; known: boolean; start: number; end: number }>();
+  const byModel = new Map<string, { In: number; Out: number; known: boolean; unknown: boolean; start: number; end: number }>();
   for (const u of records) {
-    const e = byModel.get(u.model) ?? { In: 0, Out: 0, known: false, start: u.startedAt, end: u.endedAt };
+    const e = byModel.get(u.model) ?? { In: 0, Out: 0, known: false, unknown: false, start: u.startedAt, end: u.endedAt };
     if (u.usage) {
       e.In += u.usage.in;
       e.Out += u.usage.out;
       e.known = true;
+    } else {
+      e.unknown = true;
     }
     e.start = Math.min(e.start, u.startedAt);
     e.end = Math.max(e.end, u.endedAt);
@@ -146,11 +148,15 @@ export function summarizeUsage(records: AgentSpend[]): { modelsLine: string; age
   const modelsLine = [...byModel.entries()]
     .map(([m, e]) => {
       if (!e.known) return `${m} ?/?`;
+      // A "+" marks a partial sum: some agents on this model omitted usage,
+      // so the total covers only the known records (dogfood on #72). The
+      // agents line names the ?/? agents.
+      const partial = e.unknown ? "+" : "";
       // No pace badge on sub-second windows: a 1ms floor turns any output
       // into an absurd rate (dogfood on #72). Fast runs just show totals.
       const elapsed = (e.end - e.start) / 1000;
       return (
-        `${m} ${formatTokens(e.In)}/${formatTokens(e.Out)}` +
+        `${m} ${formatTokens(e.In)}/${formatTokens(e.Out)}${partial}` +
         (e.Out > 0 && elapsed >= 1 ? ` ${(e.Out / elapsed).toFixed(0)}t/s` : "")
       );
     })
@@ -375,11 +381,13 @@ export async function run(): Promise<void> {
               // A failed agent still spent tokens on its attempts (issue #52):
               // AgentFailedError carries the totals so the footer can account
               // for them instead of the agent vanishing as "no usage".
+              // usageTotal stays null when nothing reported usage — unknown,
+              // never zero — so the footer renders ?/? (dogfood on #72).
               const failed = e instanceof AgentFailedError ? e : null;
               const now = Date.now();
               return {
                 findings: [] as Finding[],
-                usage: failed ? { ...failed.usageTotal } : null,
+                usage: failed?.usageTotal ? { ...failed.usageTotal } : null,
                 seconds: failed?.seconds ?? 0,
                 attempts: failed?.attempts ?? 1,
                 startedAt: failed?.startedAt ?? now,

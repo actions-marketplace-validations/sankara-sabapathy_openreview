@@ -212,12 +212,13 @@ export type AgentResult = {
 
 /** Thrown when an agent exhausts its attempts without a usable result. Carries
  * what was spent so the caller can still account for it (issue #52) instead of
- * the agent vanishing from the usage footer as "no usage". */
+ * the agent vanishing from the usage footer as "no usage". usageTotal is null
+ * when no attempt reported usage — unknown spend, never zero. */
 export class AgentFailedError extends Error {
   constructor(
     message: string,
     readonly attempts: number,
-    readonly usageTotal: { in: number; out: number },
+    readonly usageTotal: { in: number; out: number } | null,
     readonly seconds: number,
     readonly startedAt: number,
     readonly endedAt: number
@@ -666,7 +667,7 @@ export async function runAgent(opts: {
       `Agent ${opts.agentName} failed after ${attemptsMade} attempt(s): ${lastError || "run budget exhausted"}` +
         (lastShape ? ` [response ${lastShape}]` : ""),
       attemptsMade,
-      { ...spent },
+      spentAny ? { ...spent } : null,
       seconds,
       startedAt,
       endedAt

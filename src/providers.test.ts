@@ -555,4 +555,12 @@ describe("usage accounting (issue #52)", () => {
     assert.ok(err.endedAt >= err.startedAt);
     assert.ok(err.seconds >= 0);
   });
+
+  it("a failure with no reported usage carries null, not zero (dogfood on #72)", async () => {
+    const err = await withFetch(async () => new Response("boom", { status: 500 }), () =>
+      runAgent(base).then(() => null, (e) => e)
+    );
+    assert.ok(err instanceof AgentFailedError);
+    assert.equal(err.usageTotal, null);
+  });
 });

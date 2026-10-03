@@ -44970,7 +44970,8 @@ function countsAsReview(o) {
 }
 /** Thrown when an agent exhausts its attempts without a usable result. Carries
  * what was spent so the caller can still account for it (issue #52) instead of
- * the agent vanishing from the usage footer as "no usage". */
+ * the agent vanishing from the usage footer as "no usage". usageTotal is null
+ * when no attempt reported usage — unknown spend, never zero. */
 class AgentFailedError extends Error {
     attempts;
     usageTotal;
@@ -45369,7 +45370,7 @@ async function runAgent(opts) {
         // undiagnosable from the outside without this. The spend rides along on
         // the error so the footer can still account for it (issue #52).
         throw new AgentFailedError(`Agent ${opts.agentName} failed after ${attemptsMade} attempt(s): ${lastError || "run budget exhausted"}` +
-            (lastShape ? ` [response ${lastShape}]` : ""), attemptsMade, { ...spent }, seconds, startedAt, endedAt);
+            (lastShape ? ` [response ${lastShape}]` : ""), attemptsMade, spentAny ? { ...spent } : null, seconds, startedAt, endedAt);
     }
     const parsed = extractFindingsJson(raw);
     if (!parsed) {
@@ -46370,11 +46371,14 @@ async function getPrDiff(octokit, owner, repo, pr, payloadHeadSha) {
 function summarizeUsage(records) {
     const byModel = new Map();
     for (const u of records) {
-        const e = byModel.get(u.model) ?? { In: 0, Out: 0, known: false, start: u.startedAt, end: u.endedAt };
+        const e = byModel.get(u.model) ?? { In: 0, Out: 0, known: false, unknown: false, start: u.startedAt, end: u.endedAt };
         if (u.usage) {
             e.In += u.usage.in;
             e.Out += u.usage.out;
             e.known = true;
+        }
+        else {
+            e.unknown = true;
         }
         e.start = Math.min(e.start, u.startedAt);
         e.end = Math.max(e.end, u.endedAt);
@@ -46384,10 +46388,14 @@ function summarizeUsage(records) {
         .map(([m, e]) => {
         if (!e.known)
             return `${m} ?/?`;
+        // A "+" marks a partial sum: some agents on this model omitted usage,
+        // so the total covers only the known records (dogfood on #72). The
+        // agents line names the ?/? agents.
+        const partial = e.unknown ? "+" : "";
         // No pace badge on sub-second windows: a 1ms floor turns any output
         // into an absurd rate (dogfood on #72). Fast runs just show totals.
         const elapsed = (e.end - e.start) / 1000;
-        return (`${m} ${formatTokens(e.In)}/${formatTokens(e.Out)}` +
+        return (`${m} ${formatTokens(e.In)}/${formatTokens(e.Out)}${partial}` +
             (e.Out > 0 && elapsed >= 1 ? ` ${(e.Out / elapsed).toFixed(0)}t/s` : ""));
     })
         .join(" · ");
@@ -46566,11 +46574,13 @@ async function run() {
                     // A failed agent still spent tokens on its attempts (issue #52):
                     // AgentFailedError carries the totals so the footer can account
                     // for them instead of the agent vanishing as "no usage".
+                    // usageTotal stays null when nothing reported usage — unknown,
+                    // never zero — so the footer renders ?/? (dogfood on #72).
                     const failed = e instanceof AgentFailedError ? e : null;
                     const now = Date.now();
                     return {
                         findings: [],
-                        usage: failed ? { ...failed.usageTotal } : null,
+                        usage: failed?.usageTotal ? { ...failed.usageTotal } : null,
                         seconds: failed?.seconds ?? 0,
                         attempts: failed?.attempts ?? 1,
                         startedAt: failed?.startedAt ?? now,

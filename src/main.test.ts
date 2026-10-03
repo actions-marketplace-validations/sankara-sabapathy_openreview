@@ -156,4 +156,13 @@ describe("summarizeUsage (issue #52)", () => {
     ]);
     assert.equal(modelsLine, "m 10/50");
   });
+
+  it("marks partial model sums when some agents omit usage (dogfood on #72)", () => {
+    const { modelsLine, agentsLine } = summarizeUsage([
+      { agent: "a", model: "m", usage: { in: 1000, out: 500 }, seconds: 10, attempts: 1, startedAt: 0, endedAt: 10000 },
+      { agent: "b", model: "m", usage: null, seconds: 10, attempts: 1, startedAt: 0, endedAt: 10000 },
+    ]);
+    assert.equal(modelsLine, "m 1.0k/500+ 50t/s");
+    assert.ok(agentsLine.includes("b ?/?"));
+  });
 });
