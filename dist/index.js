@@ -44968,6 +44968,19 @@ async function readBodyWithIdleTimeout(res, idleMs, label, windowMs = 60000, min
 function countsAsReview(o) {
     return o === "ok" || o === "no-findings";
 }
+/** Thrown when an agent exhausts its attempts without a usable result. Carries
+ * what was spent so the caller can still account for it (issue #52) instead of
+ * the agent vanishing from the usage footer as "no usage". */
+class AgentFailedError extends Error {
+    attempts;
+    usageTotal;
+    constructor(message, attempts, usageTotal) {
+        super(message);
+        this.attempts = attempts;
+        this.usageTotal = usageTotal;
+        this.name = "AgentFailedError";
+    }
+}
 /** Compact token counts: 12345 -> "12.3k". */
 function formatTokens(n) {
     if (n >= 1000)
@@ -45220,13 +45233,16 @@ async function runAgent(opts) {
     const rp = resolveProvider(opts.provider, opts.keys, process.env, opts.sessionId);
     // missing BYOK key -> report it as a skip so it can never read as a clean
     // review, and the caller can name the missing secret (issue #46)
-    if (!rp.apiKey)
-        return { findings: [], usage: null, seconds: 0, outcome: "skipped-no-key" };
+    if (!rp.apiKey) {
+        const now = Date.now();
+        return { findings: [], usage: null, seconds: 0, attempts: 0, startedAt: now, endedAt: now, outcome: "skipped-no-key" };
+    }
     // No time left in the run's budget (issue #51): don't start a call we cannot
     // finish. Reported as a non-voting outcome, never as a clean review.
     if (opts.deadlineAt !== undefined && Date.now() >= opts.deadlineAt) {
         logWarning(`Agent ${opts.agentName}: skipped, run budget exhausted.`);
-        return { findings: [], usage: null, seconds: 0, outcome: "budget-exhausted" };
+        const now = Date.now();
+        return { findings: [], usage: null, seconds: 0, attempts: 0, startedAt: now, endedAt: now, outcome: "budget-exhausted" };
     }
     // Retry budget (issue #30): transient empties/5xx must not silently approve.
     // Per-attempt timeout bounds hung gateway connections (the 9-minute run was
@@ -45236,8 +45252,14 @@ async function runAgent(opts) {
     // the run's deadline approaches (issue #51).
     const perAttempt = (opts.provider.timeout_s ?? 420) * 1000;
     const started = Date.now();
+    const startedAt = started;
     let raw = "";
-    let usage = null;
+    // Total spend across EVERY attempt (issue #52). A retried attempt still
+    // billed — overwriting with only the last attempt's usage hid real cost.
+    // Empty-content attempts keep their usage here even though they contribute
+    // no answer: the tokens were spent all the same.
+    const spent = { in: 0, out: 0 };
+    let spentAny = false;
     let lastError = "";
     // An empty-but-successful response is usually deterministic (the model keeps
     // answering in a field we don't read), so a third attempt just triples the
@@ -45287,18 +45309,20 @@ async function runAgent(opts) {
                 });
             }
             raw = out.text;
-            usage = out.usage;
+            if (out.usage) {
+                spent.in += out.usage.in;
+                spent.out += out.usage.out;
+                spentAny = true;
+            }
             lastShape = out.shape;
             if (raw && raw.trim())
                 break; // success
             lastError = `empty content from ${opts.provider.model}`;
             raw = "";
-            usage = null;
         }
         catch (e) {
             lastError = e.message;
             raw = "";
-            usage = null;
         }
         if (attempt < maxAttempts && isRetryableError(lastError)) {
             if (lastError.startsWith("empty content")) {
@@ -45322,6 +45346,8 @@ async function runAgent(opts) {
         }
     }
     const seconds = (Date.now() - started) / 1000;
+    const endedAt = Date.now();
+    const usage = spentAny ? { ...spent } : null;
     const usageStr = usage
         ? `, ${formatTokens(usage.in)} in / ${formatTokens(usage.out)} out` +
             (usage.out > 0 && seconds > 0 ? `, ${(usage.out / seconds).toFixed(1)} tok/s` : "")
@@ -45334,16 +45360,17 @@ async function runAgent(opts) {
         // Total failure surfaces into the PR's agent-error block (main.ts catch).
         // Include the redacted response SHAPE: a gateway that returns content in an
         // unexpected field spends the tokens and then reports "empty", which is
-        // undiagnosable from the outside without this.
-        throw new Error(`Agent ${opts.agentName} failed after ${attemptsMade} attempt(s): ${lastError || "run budget exhausted"}` +
-            (lastShape ? ` [response ${lastShape}]` : ""));
+        // undiagnosable from the outside without this. The spend rides along on
+        // the error so the footer can still account for it (issue #52).
+        throw new AgentFailedError(`Agent ${opts.agentName} failed after ${attemptsMade} attempt(s): ${lastError || "run budget exhausted"}` +
+            (lastShape ? ` [response ${lastShape}]` : ""), attemptsMade, { ...spent });
     }
     const parsed = extractFindingsJson(raw);
     if (!parsed) {
         // Raw heads can be megabytes of reasoning trace; keep the log useful.
         logWarning(`Agent ${opts.agentName}: could not parse findings JSON; raw head: ${raw.slice(0, 200)}` +
             (raw.length > 200 ? ` (${raw.length} chars total)` : ""));
-        return { findings: [], usage, seconds, outcome: "unparseable" };
+        return { findings: [], usage, seconds, attempts: attemptsMade, startedAt, endedAt, outcome: "unparseable" };
     }
     try {
         const out = [];
@@ -45362,12 +45389,12 @@ async function runAgent(opts) {
                 provider: opts.providerName,
             });
         }
-        return { findings: out, usage, seconds, outcome: out.length > 0 ? "ok" : "no-findings" };
+        return { findings: out, usage, seconds, attempts: attemptsMade, startedAt, endedAt, outcome: out.length > 0 ? "ok" : "no-findings" };
     }
     catch (e) {
         // Validation of individual findings failed — warn, don't silently drop everything.
         logWarning(`Agent ${opts.agentName}: findings validation failed (${e.message}); raw head: ${raw.slice(0, 200)}`);
-        return { findings: [], usage, seconds, outcome: "unparseable" };
+        return { findings: [], usage, seconds, attempts: attemptsMade, startedAt, endedAt, outcome: "unparseable" };
     }
 }
 // Parse the findings JSON out of a model response. A strict parse first, then
@@ -46328,6 +46355,37 @@ async function getPrDiff(octokit, owner, repo, pr, payloadHeadSha) {
         (await octokit.rest.pulls.get({ owner, repo, pull_number: pr })).data.head.sha;
     return { fileNames: names, diff: parts.join("\n\n"), headSha, omitted, truncated, totalFiles: files.length };
 }
+/**
+ * Footer lines for the sticky (issue #52). Models line groups true spend by
+ * model with wall-clock throughput; agents line shows each agent's own spend
+ * so retried and failed attempts stay visible instead of vanishing.
+ */
+function summarizeUsage(records) {
+    const byModel = new Map();
+    for (const u of records) {
+        const e = byModel.get(u.model) ?? { In: 0, Out: 0, start: u.startedAt, end: u.endedAt };
+        e.In += u.usage.in;
+        e.Out += u.usage.out;
+        e.start = Math.min(e.start, u.startedAt);
+        e.end = Math.max(e.end, u.endedAt);
+        byModel.set(u.model, e);
+    }
+    const modelsLine = [...byModel.entries()]
+        .map(([m, e]) => {
+        const elapsed = Math.max((e.end - e.start) / 1000, 0.001);
+        return (`${m} ${formatTokens(e.In)}/${formatTokens(e.Out)}` +
+            (e.Out > 0 ? ` ${(e.Out / elapsed).toFixed(0)}t/s` : ""));
+    })
+        .join(" · ");
+    const agentsLine = records
+        .map((u) => {
+        const pace = u.usage.out > 0 && u.seconds > 0 ? ` · ${(u.usage.out / u.seconds).toFixed(0)}t/s` : "";
+        const tries = u.attempts === 1 ? "1 attempt" : `${u.attempts} attempts`;
+        return `${u.agent} ${formatTokens(u.usage.in)}/${formatTokens(u.usage.out)}${pace} · ${u.seconds.toFixed(0)}s · ${tries}`;
+    })
+        .join("; ");
+    return { modelsLine, agentsLine };
+}
 /** Run thunks with at most `limit` in flight, preserving result order.
  * Takes thunks, NOT promises: an already-started promise is in flight before
  * the pool can see it, so passing promises caps nothing. */
@@ -46480,6 +46538,9 @@ async function run() {
                     findings: result.findings,
                     usage: result.usage,
                     seconds: result.seconds,
+                    attempts: result.attempts,
+                    startedAt: result.startedAt,
+                    endedAt: result.endedAt,
                     outcome: result.outcome,
                     agent: a.name ?? "agent",
                     providerName: a.provider,
@@ -46487,10 +46548,18 @@ async function run() {
                     .catch((e) => {
                     const msg = e.message;
                     logWarning(`Agent ${a.name} failed: ${msg}`);
+                    // A failed agent still spent tokens on its attempts (issue #52):
+                    // AgentFailedError carries the totals so the footer can account
+                    // for them instead of the agent vanishing as "no usage".
+                    const failed = e instanceof AgentFailedError ? e : null;
+                    const now = Date.now();
                     return {
                         findings: [],
-                        usage: null,
+                        usage: failed ? { ...failed.usageTotal } : null,
                         seconds: 0,
+                        attempts: failed?.attempts ?? 1,
+                        startedAt: now,
+                        endedAt: now,
                         error: msg,
                         outcome: "error",
                         agent: a.name ?? "agent",
@@ -46564,12 +46633,19 @@ async function run() {
                     seconds: r.seconds,
                 })),
                 usage: results
-                    .filter((r) => r.usage)
+                    // Every agent that started an attempt is accounted for (issue #52):
+                    // failed agents carry their spend on the error, so only agents that
+                    // never started (no key, no budget left) are absent — and those are
+                    // named separately in the skipped-key warning below.
+                    .filter((r) => r.attempts > 0)
                     .map((r) => ({
                     agent: r.agent,
                     model: config.providers[r.providerName]?.model ?? r.providerName,
-                    usage: r.usage,
+                    usage: r.usage ?? { in: 0, out: 0 },
                     seconds: r.seconds,
+                    attempts: r.attempts,
+                    startedAt: r.startedAt,
+                    endedAt: r.endedAt,
                 })),
             });
             if (counted === 0) {
@@ -46623,21 +46699,12 @@ async function run() {
         // "No provider API keys configured" on a fully successful run (issue #49).
         const skippedNoKey = perReview.flatMap((r) => r.agents).filter((a) => a.outcome === "skipped-no-key");
         const allErrors = perReview.flatMap((r) => r.errors);
-        // Consolidated usage, grouped by model: "model 12.3k/1.1k 38t/s".
-        const usageByModel = new Map();
-        for (const r of perReview) {
-            for (const u of r.usage) {
-                const e = usageByModel.get(u.model) ?? { In: 0, Out: 0, seconds: 0 };
-                e.In += u.usage.in;
-                e.Out += u.usage.out;
-                e.seconds += u.seconds;
-                usageByModel.set(u.model, e);
-            }
-        }
-        const usageLine = [...usageByModel.entries()]
-            .map(([m, e]) => `${m} ${formatTokens(e.In)}/${formatTokens(e.Out)}` +
-            (e.Out > 0 && e.seconds > 0 ? ` ${(e.Out / e.seconds).toFixed(0)}t/s` : ""))
-            .join(" · ");
+        // True spend, grouped by model (issue #52): "model 12.3k/1.1k 38t/s".
+        // Throughput divides by the group's WALL-CLOCK elapsed
+        // (max(end) - min(start)), not the sum of per-call durations — with
+        // concurrent agents the sum understates tok/s (two 60s calls of 1k tokens
+        // each used to report 500 tok/s for 1k tokens in 60s).
+        const { modelsLine, agentsLine } = summarizeUsage(perReview.flatMap((r) => r.usage));
         let sticky = stickyBase;
         if (truncated || omitted.length > 0) {
             const bits = [];
@@ -46647,9 +46714,13 @@ async function run() {
                 bits.push(`${omitted.length} file(s) not reviewable (binary or diff too large): ${omitted.slice(0, 8).map((f) => `\`${f}\``).join(", ")}${omitted.length > 8 ? ", …" : ""}`);
             sticky += `\n\n> ⚠️ ${bits.join(". ")}.`;
         }
-        if (usageLine) {
-            sticky += `\n<sub>Models: ${usageLine}</sub>`;
-            logInfo(`Usage: ${usageLine}`);
+        if (modelsLine) {
+            sticky += `\n<sub>Models: ${modelsLine}</sub>`;
+            logInfo(`Usage: ${modelsLine}`);
+        }
+        if (agentsLine) {
+            sticky += `\n<sub>Agents: ${agentsLine}</sub>`;
+            logInfo(`Per-agent usage: ${agentsLine}`);
         }
         if (skippedNoKey.length > 0) {
             const names = [...new Set(skippedNoKey.map((a) => a.agent))].map((a) => `\`${a}\``).join(", ");

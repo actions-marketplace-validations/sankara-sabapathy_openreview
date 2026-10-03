@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { runPooled, getPrDiff, MAX_DIFF_FILES } from "./main.js";
+import { runPooled, getPrDiff, MAX_DIFF_FILES, summarizeUsage } from "./main.js";
 
 describe("runPooled (issue #51)", () => {
   it("preserves result order regardless of completion order", async () => {
@@ -113,5 +113,32 @@ describe("getPrDiff (issue #50)", () => {
     const withoutPayload = await getPrDiff(ok, "o", "r", 1, undefined);
     assert.equal(withoutPayload.headSha, "from-api");
     assert.equal(getCalls, 1);
+  });
+});
+
+describe("summarizeUsage (issue #52)", () => {
+  it("divides throughput by wall-clock elapsed, not summed durations", () => {
+    // Two concurrent agents on one model: A runs 0-60s, B runs 30-90s.
+    // True elapsed is 90s for 2000 out = 22t/s; summing durations gives 150s = 13t/s.
+    const { modelsLine } = summarizeUsage([
+      { agent: "a", model: "m", usage: { in: 1000, out: 1000 }, seconds: 60, attempts: 1, startedAt: 0, endedAt: 60000 },
+      { agent: "b", model: "m", usage: { in: 2000, out: 1000 }, seconds: 60, attempts: 2, startedAt: 30000, endedAt: 90000 },
+    ]);
+    assert.equal(modelsLine, "m 3.0k/2.0k 22t/s");
+  });
+
+  it("names every agent's own spend and retry count", () => {
+    const { agentsLine } = summarizeUsage([
+      { agent: "a", model: "m", usage: { in: 8100, out: 2050 }, seconds: 62, attempts: 2, startedAt: 0, endedAt: 62000 },
+      { agent: "b", model: "m", usage: { in: 0, out: 0 }, seconds: 0, attempts: 1, startedAt: 0, endedAt: 1000 },
+    ]);
+    assert.equal(agentsLine, "a 8.1k/2.0k · 33t/s · 62s · 2 attempts; b 0/0 · 0s · 1 attempt");
+  });
+
+  it("omits tok/s when nothing was produced", () => {
+    const { modelsLine } = summarizeUsage([
+      { agent: "a", model: "m", usage: { in: 100, out: 0 }, seconds: 5, attempts: 1, startedAt: 0, endedAt: 5000 },
+    ]);
+    assert.equal(modelsLine, "m 100/0");
   });
 });

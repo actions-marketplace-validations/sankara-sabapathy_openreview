@@ -197,10 +197,32 @@ export function countsAsReview(o: AgentOutcome): boolean {
 
 export type AgentResult = {
   findings: Finding[];
+  /** Tokens SPENT across all attempts, including retried ones (issue #52).
+   * A retried attempt still billed, so only the last attempt's usage would
+   * under-report real spend. Null when no attempt ran or none reported usage. */
   usage: Usage;
   seconds: number;
+  /** Attempts started (1 = no retry). */
+  attempts: number;
+  /** Wall-clock window of the agent's work, for true throughput math. */
+  startedAt: number;
+  endedAt: number;
   outcome: Exclude<AgentOutcome, "error">;
 };
+
+/** Thrown when an agent exhausts its attempts without a usable result. Carries
+ * what was spent so the caller can still account for it (issue #52) instead of
+ * the agent vanishing from the usage footer as "no usage". */
+export class AgentFailedError extends Error {
+  constructor(
+    message: string,
+    readonly attempts: number,
+    readonly usageTotal: { in: number; out: number }
+  ) {
+    super(message);
+    this.name = "AgentFailedError";
+  }
+}
 
 /** Compact token counts: 12345 -> "12.3k". */
 export function formatTokens(n: number): string {
@@ -506,13 +528,16 @@ export async function runAgent(opts: {
   const rp = resolveProvider(opts.provider, opts.keys, process.env as any, opts.sessionId);
   // missing BYOK key -> report it as a skip so it can never read as a clean
   // review, and the caller can name the missing secret (issue #46)
-  if (!rp.apiKey)
-    return { findings: [], usage: null, seconds: 0, outcome: "skipped-no-key" };
+  if (!rp.apiKey) {
+    const now = Date.now();
+    return { findings: [], usage: null, seconds: 0, attempts: 0, startedAt: now, endedAt: now, outcome: "skipped-no-key" };
+  }
   // No time left in the run's budget (issue #51): don't start a call we cannot
   // finish. Reported as a non-voting outcome, never as a clean review.
   if (opts.deadlineAt !== undefined && Date.now() >= opts.deadlineAt) {
     logWarning(`Agent ${opts.agentName}: skipped, run budget exhausted.`);
-    return { findings: [], usage: null, seconds: 0, outcome: "budget-exhausted" };
+    const now = Date.now();
+    return { findings: [], usage: null, seconds: 0, attempts: 0, startedAt: now, endedAt: now, outcome: "budget-exhausted" };
   }
 
   // Retry budget (issue #30): transient empties/5xx must not silently approve.
@@ -523,8 +548,14 @@ export async function runAgent(opts: {
   // the run's deadline approaches (issue #51).
   const perAttempt = (opts.provider.timeout_s ?? 420) * 1000;
   const started = Date.now();
+  const startedAt = started;
   let raw = "";
-  let usage: Usage = null;
+  // Total spend across EVERY attempt (issue #52). A retried attempt still
+  // billed — overwriting with only the last attempt's usage hid real cost.
+  // Empty-content attempts keep their usage here even though they contribute
+  // no answer: the tokens were spent all the same.
+  const spent = { in: 0, out: 0 };
+  let spentAny = false;
   let lastError = "";
   // An empty-but-successful response is usually deterministic (the model keeps
   // answering in a field we don't read), so a third attempt just triples the
@@ -574,16 +605,18 @@ export async function runAgent(opts: {
         });
       }
       raw = out.text;
-      usage = out.usage;
+      if (out.usage) {
+        spent.in += out.usage.in;
+        spent.out += out.usage.out;
+        spentAny = true;
+      }
       lastShape = out.shape;
       if (raw && raw.trim()) break; // success
       lastError = `empty content from ${opts.provider.model}`;
       raw = "";
-      usage = null;
     } catch (e) {
       lastError = (e as Error).message;
       raw = "";
-      usage = null;
     }
     if (attempt < maxAttempts && isRetryableError(lastError)) {
       if (lastError.startsWith("empty content")) {
@@ -608,6 +641,8 @@ export async function runAgent(opts: {
     }
   }
   const seconds = (Date.now() - started) / 1000;
+  const endedAt = Date.now();
+  const usage: Usage = spentAny ? { ...spent } : null;
   const usageStr = usage
     ? `, ${formatTokens(usage.in)} in / ${formatTokens(usage.out)} out` +
       (usage.out > 0 && seconds > 0 ? `, ${(usage.out / seconds).toFixed(1)} tok/s` : "")
@@ -622,10 +657,13 @@ export async function runAgent(opts: {
     // Total failure surfaces into the PR's agent-error block (main.ts catch).
     // Include the redacted response SHAPE: a gateway that returns content in an
     // unexpected field spends the tokens and then reports "empty", which is
-    // undiagnosable from the outside without this.
-    throw new Error(
+    // undiagnosable from the outside without this. The spend rides along on
+    // the error so the footer can still account for it (issue #52).
+    throw new AgentFailedError(
       `Agent ${opts.agentName} failed after ${attemptsMade} attempt(s): ${lastError || "run budget exhausted"}` +
-        (lastShape ? ` [response ${lastShape}]` : "")
+        (lastShape ? ` [response ${lastShape}]` : ""),
+      attemptsMade,
+      { ...spent }
     );
   }
   const parsed = extractFindingsJson(raw);
@@ -635,7 +673,7 @@ export async function runAgent(opts: {
       `Agent ${opts.agentName}: could not parse findings JSON; raw head: ${raw.slice(0, 200)}` +
         (raw.length > 200 ? ` (${raw.length} chars total)` : "")
     );
-    return { findings: [], usage, seconds, outcome: "unparseable" };
+    return { findings: [], usage, seconds, attempts: attemptsMade, startedAt, endedAt, outcome: "unparseable" };
   }
   try {
     const out: Finding[] = [];
@@ -654,13 +692,13 @@ export async function runAgent(opts: {
         provider: opts.providerName,
       });
     }
-    return { findings: out, usage, seconds, outcome: out.length > 0 ? "ok" : "no-findings" };
+    return { findings: out, usage, seconds, attempts: attemptsMade, startedAt, endedAt, outcome: out.length > 0 ? "ok" : "no-findings" };
   } catch (e) {
     // Validation of individual findings failed — warn, don't silently drop everything.
     logWarning(
       `Agent ${opts.agentName}: findings validation failed (${(e as Error).message}); raw head: ${raw.slice(0, 200)}`
     );
-    return { findings: [], usage, seconds, outcome: "unparseable" };
+    return { findings: [], usage, seconds, attempts: attemptsMade, startedAt, endedAt, outcome: "unparseable" };
   }
 }
 
