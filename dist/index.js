@@ -44835,7 +44835,23 @@ function resolveKeysFromEnv(env) {
         githubToken: env["INPUT_GITHUB-TOKEN"] || env["GITHUB_TOKEN"] || env["GH_TOKEN"] || "",
     };
 }
-const SYSTEM_WRAPPER = (lang, instructions) => `You are a senior code reviewer. Language: ${lang}.\nCustom instructions: ${instructions}\n\nReturn ONLY valid JSON: {"findings":[{"file":string,"line":number|null,"severity":"high|medium|suggestion","category":string,"comment":string,"confidence":0-1}]}. No markdown fences. Be strict on bugs/security, lenient on style. Skip low-confidence nits.`;
+const FINDINGS_SCHEMA = '{"findings":[{"file":string,"line":number|null,"severity":"high|medium|suggestion","category":string,"comment":string,"confidence":0-1}]}';
+// The output contract is enforced in the prompt because `response_format` is
+// NOT reliable across gateways: some ignore it, and a free/preview model that
+// ignores it answers 8k chars of markdown, which is unusable. Spell out the
+// contract hard enough that a chatty model still complies (issue #54).
+const SYSTEM_WRAPPER = (lang, instructions) => `You are a senior code reviewer. Language: ${lang}.
+Custom instructions: ${instructions}
+
+OUTPUT FORMAT — mandatory, and your reply is checked against it:
+Reply with ONE JSON object and NOTHING else. The first character must be "{" and the last must be "}".
+No markdown, no headings, no bullets, no code fences, no preamble, no summary, no explanation.
+Schema: ${FINDINGS_SCHEMA}
+
+Be strict on bugs/security, lenient on style. Skip low-confidence nits.`;
+/** Final line of the user message: restating the contract at the end of a long
+ * prompt works far better than stating it once at the top. */
+const SCHEMA_REMINDER = `\n\nReminder: your entire reply must be one JSON object of this exact shape, nothing else:\n${FINDINGS_SCHEMA}`;
 function truncate(s, n) {
     return s.length > n ? s.slice(0, n) + "\n...[truncated]" : s;
 }
@@ -45199,6 +45215,8 @@ async function runAgent(opts) {
     if (opts.contextBlock) {
         user += `\n\n${opts.contextBlock}\nGround every finding in the diff above; use <context> only as cross-file evidence (callers, types, contracts). Never flag context-only code.`;
     }
+    // Restate the output contract last, after a long diff + context block.
+    user += SCHEMA_REMINDER;
     const rp = resolveProvider(opts.provider, opts.keys, process.env, opts.sessionId);
     // missing BYOK key -> report it as a skip so it can never read as a clean
     // review, and the caller can name the missing secret (issue #46)
