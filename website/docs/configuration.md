@@ -16,6 +16,8 @@ defaults:
   lang: en
   ignore: ["**.lock", "dist/**"] # path globs skipped everywhere
   max_diff_chars: 80000          # diff truncation budget per agent
+  # Diff fetch: all PR files are paginated (up to 300 reviewed; the sticky
+  # names any files skipped as binary/unrenderable or over the cap).
   max_runtime_s: 1200           # wall-clock budget for the whole run (default 1200)
   max_concurrency: 4            # agents in flight per review (default 4)
   max_context_chars: 20000       # cross-file context budget per review (0 = diff only)
