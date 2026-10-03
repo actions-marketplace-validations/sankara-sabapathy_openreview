@@ -8,6 +8,7 @@ import {
   extractFindingsJson,
   describeResponseShape,
   runAgent,
+  AgentFailedError,
   countsAsReview,
 } from "./providers.js";
 import { parseConfig } from "./config.js";
@@ -485,5 +486,81 @@ describe("describeResponseShape (diagnostics)", () => {
   });
   it("describes a response with no choices at all", () => {
     assert.match(describeResponseShape({ error: "boom" }), /no choices/);
+  });
+});
+
+describe("usage accounting (issue #52)", () => {
+  const cfg = parseConfig({
+    version: 1,
+    providers: { oai: { model: "m", kind: "openai", base_url: "http://127.0.0.1:1/v1" } },
+    reviews: [{ id: "r", main: { provider: "oai", instructions: "i" } }],
+  });
+  const keys = {
+    anthropicApiKey: "",
+    openaiApiKey: "k",
+    opencodeApiKey: "",
+    opencodeBaseUrl: "",
+    githubToken: "",
+  };
+  const base = {
+    agentName: "a",
+    providerName: "oai",
+    provider: cfg.providers.oai,
+    instructions: "i",
+    diff: "d",
+    lang: "en",
+    keys,
+    maxDiffChars: 100,
+    sessionId: "s",
+  };
+  const chat = (content: string, usage: any) =>
+    new Response(JSON.stringify({ choices: [{ message: { content } }], usage }));
+  const withFetch = async (impl: (url: any, init: any) => Promise<Response>, fn: () => Promise<any>) => {
+    const real = globalThis.fetch;
+    globalThis.fetch = impl as any;
+    try {
+      return await fn();
+    } finally {
+      globalThis.fetch = real;
+    }
+  };
+
+  it("reports tokens from ALL attempts, not just the last", async () => {
+    let n = 0;
+    const r = await withFetch(async () => {
+      n++;
+      // Attempt 1 spends 8k/2k and answers empty (retryable once); attempt 2 succeeds.
+      return n === 1
+        ? chat("", { prompt_tokens: 8000, completion_tokens: 2000 })
+        : chat('{"findings":[]}', { prompt_tokens: 100, completion_tokens: 50 });
+    }, () => runAgent(base));
+    assert.equal(r.attempts, 2);
+    assert.deepEqual(r.usage, { in: 8100, out: 2050 });
+    assert.equal(r.outcome, "no-findings");
+    assert.ok(r.endedAt >= r.startedAt);
+  });
+
+  it("a total failure carries its spend on the error", async () => {
+    let n = 0;
+    const err = await withFetch(async () => {
+      n++;
+      if (n === 1) return chat("", { prompt_tokens: 8000, completion_tokens: 2000 });
+      return new Response("boom", { status: 500 });
+    }, () => runAgent(base).then(() => null, (e) => e));
+    assert.ok(err instanceof AgentFailedError);
+    assert.equal(err.attempts, 3);
+    assert.deepEqual(err.usageTotal, { in: 8000, out: 2000 });
+    // Timing must ride along too, or the footer collapses the model's
+    // wall-clock window to ~1ms (dogfood on PR #72).
+    assert.ok(err.endedAt >= err.startedAt);
+    assert.ok(err.seconds >= 0);
+  });
+
+  it("a failure with no reported usage carries null, not zero (dogfood on #72)", async () => {
+    const err = await withFetch(async () => new Response("boom", { status: 500 }), () =>
+      runAgent(base).then(() => null, (e) => e)
+    );
+    assert.ok(err instanceof AgentFailedError);
+    assert.equal(err.usageTotal, null);
   });
 });

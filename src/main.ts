@@ -10,6 +10,7 @@ import {
   runAgent,
   formatTokens,
   countsAsReview,
+  AgentFailedError,
   type Finding,
   type AgentOutcome,
 } from "./providers.js";
@@ -57,16 +58,118 @@ async function loadConfig(configPath: string) {
   );
 }
 
-async function getPrDiff(octokit: ReturnType<typeof github.getOctokit>, owner: string, repo: string, pr: number) {
-  const { data: files } = await octokit.rest.pulls.listFiles({ owner, repo, pull_number: pr, per_page: 100 });
+/** Cap for paginated file listing (issue #50). GitHub renders at most one page
+ * of 100 files per listFiles call; a 150-file PR used to silently review only
+ * the first 100. We paginate everything and review up to this many, reporting
+ * the rest — an invisible skip is worse than a visible one. */
+export const MAX_DIFF_FILES = 300;
+
+export type PrDiff = {
+  fileNames: string[];
+  diff: string;
+  headSha: string;
+  /** Files with no renderable patch (binary or too large to render). */
+  omitted: string[];
+  /** True when the PR touched more than MAX_DIFF_FILES files. */
+  truncated: boolean;
+  /** Total files touched by the PR, before the MAX_DIFF_FILES cap. */
+  totalFiles: number;
+};
+
+export async function getPrDiff(
+  octokit: ReturnType<typeof github.getOctokit>,
+  owner: string,
+  repo: string,
+  pr: number,
+  payloadHeadSha?: string
+): Promise<PrDiff> {
+  const files = await octokit.paginate(octokit.rest.pulls.listFiles, {
+    owner, repo, pull_number: pr, per_page: 100,
+  });
+  const truncated = files.length > MAX_DIFF_FILES;
+  const capped = files.slice(0, MAX_DIFF_FILES);
   const parts: string[] = [];
   const names: string[] = [];
-  for (const f of files) {
+  const omitted: string[] = [];
+  for (const f of capped) {
     names.push(f.filename);
     if (f.patch) parts.push(`--- a/${f.filename}\n+++ b/${f.filename}\n${f.patch}`);
+    else omitted.push(f.filename);
   }
-  const { data: pull } = await octokit.rest.pulls.get({ owner, repo, pull_number: pr });
-  return { fileNames: names, diff: parts.join("\n\n"), headSha: pull.head.sha };
+  if (truncated)
+    logWarning(
+      `Diff truncated: PR touches ${files.length} files, reviewing the first ${MAX_DIFF_FILES}.`
+    );
+  if (omitted.length > 0)
+    logWarning(
+      `${omitted.length} file(s) have no renderable patch (binary or too large) and were not sent to reviewers: ${omitted.slice(0, 10).join(", ")}${omitted.length > 10 ? ", …" : ""}`
+    );
+  // The pull_request payload already carries head.sha; only fall back to an
+  // extra pulls.get when it is missing (issue_comment path).
+  const headSha =
+    payloadHeadSha ??
+    (await octokit.rest.pulls.get({ owner, repo, pull_number: pr })).data.head.sha;
+  return { fileNames: names, diff: parts.join("\n\n"), headSha, omitted, truncated, totalFiles: files.length };
+}
+
+/** One agent's accounted spend: totals across all its attempts (issue #52). */
+export type AgentSpend = {
+  agent: string;
+  model: string;
+  /** Null when the provider omitted usage: unknown spend, never zero. */
+  usage: { in: number; out: number } | null;
+  seconds: number;
+  attempts: number;
+  startedAt: number;
+  endedAt: number;
+};
+
+/**
+ * Footer lines for the sticky (issue #52). Models line groups true spend by
+ * model with wall-clock throughput; agents line shows each agent's own spend
+ * so retried and failed attempts stay visible instead of vanishing.
+ * Unknown usage (provider omitted it) renders as ?/?, never 0/0.
+ */
+export function summarizeUsage(records: AgentSpend[]): { modelsLine: string; agentsLine: string } {
+  const byModel = new Map<string, { In: number; Out: number; known: boolean; unknown: boolean; start: number; end: number }>();
+  for (const u of records) {
+    const e = byModel.get(u.model) ?? { In: 0, Out: 0, known: false, unknown: false, start: u.startedAt, end: u.endedAt };
+    if (u.usage) {
+      e.In += u.usage.in;
+      e.Out += u.usage.out;
+      e.known = true;
+    } else {
+      e.unknown = true;
+    }
+    e.start = Math.min(e.start, u.startedAt);
+    e.end = Math.max(e.end, u.endedAt);
+    byModel.set(u.model, e);
+  }
+  const modelsLine = [...byModel.entries()]
+    .map(([m, e]) => {
+      if (!e.known) return `${m} ?/?`;
+      // A "+" marks a partial sum: some agents on this model omitted usage,
+      // so the total covers only the known records (dogfood on #72). The
+      // agents line names the ?/? agents.
+      const partial = e.unknown ? "+" : "";
+      // No pace badge on sub-second windows: a 1ms floor turns any output
+      // into an absurd rate (dogfood on #72). Fast runs just show totals.
+      const elapsed = (e.end - e.start) / 1000;
+      return (
+        `${m} ${formatTokens(e.In)}/${formatTokens(e.Out)}${partial}` +
+        (e.Out > 0 && elapsed >= 1 ? ` ${(e.Out / elapsed).toFixed(0)}t/s` : "")
+      );
+    })
+    .join(" · ");
+  const agentsLine = records
+    .map((u) => {
+      const spend = u.usage ? `${formatTokens(u.usage.in)}/${formatTokens(u.usage.out)}` : "?/?";
+      const pace = u.usage && u.usage.out > 0 && u.seconds > 0 ? ` · ${(u.usage.out / u.seconds).toFixed(0)}t/s` : "";
+      const tries = u.attempts === 1 ? "1 attempt" : `${u.attempts} attempts`;
+      return `${u.agent} ${spend}${pace} · ${u.seconds.toFixed(0)}s · ${tries}`;
+    })
+    .join("; ");
+  return { modelsLine, agentsLine };
 }
 
 /** Run thunks with at most `limit` in flight, preserving result order.
@@ -156,9 +259,15 @@ export async function run(): Promise<void> {
     const sessionId =
       process.env.GITHUB_RUN_ID ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
     logInfo(`Reviewing PR #${prNumber} in ${owner}/${repo}`);
-    const { fileNames, diff, headSha } = await getPrDiff(octokit, owner, repo, prNumber);
+    const { fileNames, diff, headSha, omitted, truncated, totalFiles } = await getPrDiff(
+      octokit, owner, repo, prNumber, (ctx.payload as any).pull_request?.head?.sha
+    );
     logInfo(`Diff: ${fileNames.length} files, ${diff.length} chars (head ${headSha.slice(0, 7)})`);
     logDebug(`Diff files: ${fileNames.join(", ")}`);
+    if (truncated)
+      logWarning(`PR touches more than ${MAX_DIFF_FILES} files; only the first ${MAX_DIFF_FILES} were reviewed.`);
+    if (omitted.length > 0)
+      logWarning(`${omitted.length} changed file(s) skipped (binary or patch too large): ${omitted.slice(0, 10).join(", ")}${omitted.length > 10 ? ", …" : ""}`);
     const inScope = filterIgnored(fileNames, config.defaults.ignore ?? []);
     if (!diff.trim() || inScope.length === 0) {
       logInfo("Empty diff or all files ignored.");
@@ -184,7 +293,7 @@ export async function run(): Promise<void> {
       /** Agents that actually reviewed (issue #46: only these may vote). */
       counted: boolean;
       agents: AgentRun[];
-      usage: { agent: string; model: string; usage: { in: number; out: number }; seconds: number }[];
+      usage: AgentSpend[];
     }[] = [];
     for (const review of config.reviews) {
       const scopedFiles = inScope.filter((f) => matchesAny(f, review.if_paths));
@@ -218,6 +327,9 @@ export async function run(): Promise<void> {
         findings: Finding[];
         usage: { in: number; out: number } | null;
         seconds: number;
+        attempts: number;
+        startedAt: number;
+        endedAt: number;
         error?: string;
         outcome: AgentOutcome;
         agent: string;
@@ -256,6 +368,9 @@ export async function run(): Promise<void> {
               findings: result.findings,
               usage: result.usage,
               seconds: result.seconds,
+              attempts: result.attempts,
+              startedAt: result.startedAt,
+              endedAt: result.endedAt,
               outcome: result.outcome,
               agent: a.name ?? "agent",
               providerName: a.provider,
@@ -263,10 +378,20 @@ export async function run(): Promise<void> {
             .catch((e) => {
               const msg = (e as Error).message;
               logWarning(`Agent ${a.name} failed: ${msg}`);
+              // A failed agent still spent tokens on its attempts (issue #52):
+              // AgentFailedError carries the totals so the footer can account
+              // for them instead of the agent vanishing as "no usage".
+              // usageTotal stays null when nothing reported usage — unknown,
+              // never zero — so the footer renders ?/? (dogfood on #72).
+              const failed = e instanceof AgentFailedError ? e : null;
+              const now = Date.now();
               return {
                 findings: [] as Finding[],
-                usage: null,
-                seconds: 0,
+                usage: failed?.usageTotal ? { ...failed.usageTotal } : null,
+                seconds: failed?.seconds ?? 0,
+                attempts: failed?.attempts ?? 1,
+                startedAt: failed?.startedAt ?? now,
+                endedAt: failed?.endedAt ?? now,
                 error: msg,
                 outcome: "error" as const,
                 agent: a.name ?? "agent",
@@ -345,12 +470,19 @@ export async function run(): Promise<void> {
           seconds: r.seconds,
         })),
         usage: results
-          .filter((r) => r.usage)
+          // Every agent that started an attempt is accounted for (issue #52):
+          // failed agents carry their spend on the error, so only agents that
+          // never started (no key, no budget left) are absent — and those are
+          // named separately in the skipped-key warning below.
+          .filter((r) => r.attempts > 0)
           .map((r) => ({
             agent: r.agent,
             model: config.providers[r.providerName]?.model ?? r.providerName,
-            usage: r.usage as { in: number; out: number },
+            usage: r.usage,
             seconds: r.seconds,
+            attempts: r.attempts,
+            startedAt: r.startedAt,
+            endedAt: r.endedAt,
           })),
       });
       if (counted === 0) {
@@ -417,28 +549,29 @@ export async function run(): Promise<void> {
     // "No provider API keys configured" on a fully successful run (issue #49).
     const skippedNoKey = perReview.flatMap((r) => r.agents).filter((a) => a.outcome === "skipped-no-key");
     const allErrors = perReview.flatMap((r) => r.errors);
-    // Consolidated usage, grouped by model: "model 12.3k/1.1k 38t/s".
-    const usageByModel = new Map<string, { In: number; Out: number; seconds: number }>();
-    for (const r of perReview) {
-      for (const u of r.usage) {
-        const e = usageByModel.get(u.model) ?? { In: 0, Out: 0, seconds: 0 };
-        e.In += u.usage.in;
-        e.Out += u.usage.out;
-        e.seconds += u.seconds;
-        usageByModel.set(u.model, e);
-      }
-    }
-    const usageLine = [...usageByModel.entries()]
-      .map(
-        ([m, e]) =>
-          `${m} ${formatTokens(e.In)}/${formatTokens(e.Out)}` +
-          (e.Out > 0 && e.seconds > 0 ? ` ${(e.Out / e.seconds).toFixed(0)}t/s` : "")
-      )
-      .join(" · ");
+    // True spend, grouped by model (issue #52): "model 12.3k/1.1k 38t/s".
+    // Throughput divides by the group's WALL-CLOCK elapsed
+    // (max(end) - min(start)), not the sum of per-call durations — with
+    // concurrent agents the sum understates tok/s (two 60s calls of 1k tokens
+    // each used to report 500 tok/s for 1k tokens in 60s).
+    const { modelsLine, agentsLine } = summarizeUsage(perReview.flatMap((r) => r.usage));
     let sticky = stickyBase;
-    if (usageLine) {
-      sticky += `\n<sub>Models: ${usageLine}</sub>`;
-      logInfo(`Usage: ${usageLine}`);
+    if (truncated || omitted.length > 0) {
+      const bits: string[] = [];
+      if (truncated) bits.push(`only the first ${MAX_DIFF_FILES} of ${totalFiles} changed files were reviewed`);
+      if (omitted.length > 0)
+        bits.push(
+          `${omitted.length} file(s) not reviewable (binary or diff too large): ${omitted.slice(0, 8).map((f) => `\`${f}\``).join(", ")}${omitted.length > 8 ? ", …" : ""}`
+        );
+      sticky += `\n\n> ⚠️ ${bits.join(". ")}.`;
+    }
+    if (modelsLine) {
+      sticky += `\n<sub>Models: ${modelsLine}</sub>`;
+      logInfo(`Usage: ${modelsLine}`);
+    }
+    if (agentsLine) {
+      sticky += `\n<sub>Agents: ${agentsLine}</sub>`;
+      logInfo(`Per-agent usage: ${agentsLine}`);
     }
     if (skippedNoKey.length > 0) {
       const names = [...new Set(skippedNoKey.map((a) => a.agent))].map((a) => `\`${a}\``).join(", ");
