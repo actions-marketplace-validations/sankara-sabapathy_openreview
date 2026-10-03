@@ -44,4 +44,4 @@ global_verdict:
   `lib/`.
 - `global_verdict.strategy: any_blocking|majority` merges per-review verdicts.
 - Output: sticky comment (marker `openreview:sticky`), inline `pulls.createReview` (max 20), `verdict` output.
-- Every run appends usage footers to the sticky (`Models: <model> <in>/<out> <tok/s> …`, summed per model, plus an `Agents:` line with each agent's own spend and attempt count). Token counts accumulate across all attempts — a retried attempt still billed — and model throughput divides by wall-clock elapsed, not summed durations. Providers that omit `usage` show duration only.
+- Every run appends usage footers to the sticky (`Models: <model> <in>/<out> <tok/s> …`, summed per model, plus an `Agents:` line with each agent's own spend and attempt count). Token counts accumulate across all attempts — a retried attempt still billed — and model throughput divides by wall-clock elapsed, not summed durations. Providers that omit `usage` render as `?/?` (unknown, never zero); a model total covering only some agents carries a `+` partial marker.
