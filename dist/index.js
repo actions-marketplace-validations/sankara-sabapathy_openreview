@@ -44974,10 +44974,16 @@ function countsAsReview(o) {
 class AgentFailedError extends Error {
     attempts;
     usageTotal;
-    constructor(message, attempts, usageTotal) {
+    seconds;
+    startedAt;
+    endedAt;
+    constructor(message, attempts, usageTotal, seconds, startedAt, endedAt) {
         super(message);
         this.attempts = attempts;
         this.usageTotal = usageTotal;
+        this.seconds = seconds;
+        this.startedAt = startedAt;
+        this.endedAt = endedAt;
         this.name = "AgentFailedError";
     }
 }
@@ -45363,7 +45369,7 @@ async function runAgent(opts) {
         // undiagnosable from the outside without this. The spend rides along on
         // the error so the footer can still account for it (issue #52).
         throw new AgentFailedError(`Agent ${opts.agentName} failed after ${attemptsMade} attempt(s): ${lastError || "run budget exhausted"}` +
-            (lastShape ? ` [response ${lastShape}]` : ""), attemptsMade, { ...spent });
+            (lastShape ? ` [response ${lastShape}]` : ""), attemptsMade, { ...spent }, seconds, startedAt, endedAt);
     }
     const parsed = extractFindingsJson(raw);
     if (!parsed) {
@@ -46556,10 +46562,10 @@ async function run() {
                     return {
                         findings: [],
                         usage: failed ? { ...failed.usageTotal } : null,
-                        seconds: 0,
+                        seconds: failed?.seconds ?? 0,
                         attempts: failed?.attempts ?? 1,
-                        startedAt: now,
-                        endedAt: now,
+                        startedAt: failed?.startedAt ?? now,
+                        endedAt: failed?.endedAt ?? now,
                         error: msg,
                         outcome: "error",
                         agent: a.name ?? "agent",

@@ -550,5 +550,9 @@ describe("usage accounting (issue #52)", () => {
     assert.ok(err instanceof AgentFailedError);
     assert.equal(err.attempts, 3);
     assert.deepEqual(err.usageTotal, { in: 8000, out: 2000 });
+    // Timing must ride along too, or the footer collapses the model's
+    // wall-clock window to ~1ms (dogfood on PR #72).
+    assert.ok(err.endedAt >= err.startedAt);
+    assert.ok(err.seconds >= 0);
   });
 });

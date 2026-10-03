@@ -371,10 +371,10 @@ export async function run(): Promise<void> {
               return {
                 findings: [] as Finding[],
                 usage: failed ? { ...failed.usageTotal } : null,
-                seconds: 0,
+                seconds: failed?.seconds ?? 0,
                 attempts: failed?.attempts ?? 1,
-                startedAt: now,
-                endedAt: now,
+                startedAt: failed?.startedAt ?? now,
+                endedAt: failed?.endedAt ?? now,
                 error: msg,
                 outcome: "error" as const,
                 agent: a.name ?? "agent",

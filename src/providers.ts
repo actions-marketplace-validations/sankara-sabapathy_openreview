@@ -217,7 +217,10 @@ export class AgentFailedError extends Error {
   constructor(
     message: string,
     readonly attempts: number,
-    readonly usageTotal: { in: number; out: number }
+    readonly usageTotal: { in: number; out: number },
+    readonly seconds: number,
+    readonly startedAt: number,
+    readonly endedAt: number
   ) {
     super(message);
     this.name = "AgentFailedError";
@@ -663,7 +666,10 @@ export async function runAgent(opts: {
       `Agent ${opts.agentName} failed after ${attemptsMade} attempt(s): ${lastError || "run budget exhausted"}` +
         (lastShape ? ` [response ${lastShape}]` : ""),
       attemptsMade,
-      { ...spent }
+      { ...spent },
+      seconds,
+      startedAt,
+      endedAt
     );
   }
   const parsed = extractFindingsJson(raw);
