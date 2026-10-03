@@ -51,9 +51,12 @@ providers:
     model: longcat-2.5-preview-free
     base_url: https://opencode.ai/zen/go/v1
     key_from: secrets.OPENCODE_API_KEY # any $NAME: "secrets.FOO" | "env.FOO"
-    # The parser now tolerates prose-wrapped JSON (see #54), so we do not need
-    # json_object mode and avoid depending on it from a preview-tier model.
-    json_mode: false
+    # json_mode stays TRUE (the default) for this model. Setting it false was a
+    # speculative hedge against a preview-tier model rejecting response_format —
+    # and it backfired: without `response_format: {type: json_object}` the model
+    # ignored the "Return ONLY valid JSON" instruction and answered 7.4k chars of
+    # markdown prose on a full diff, so every agent reported "unusable response".
+    # The parser tolerates prose AROUND json, not prose INSTEAD of it.
     # auth: { header: Authorization, scheme: Bearer } # defaults shown; Azure uses { header: api-key, scheme: "" }
     # headers: { X-Custom: value } # extra headers merged into every request
     # endpoint_path: /chat/completions # default per protocol (/chat/completions, /v1/messages)

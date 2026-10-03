@@ -62,8 +62,14 @@ providers:
     model: longcat-2.5-preview-free
     base_url: https://opencode.ai/zen/go/v1
     key_from: secrets.OPENCODE_API_KEY
-    json_mode: false   # the parser tolerates prose-wrapped JSON; no need to depend on it
 ```
+
+Keep `json_mode: true` (the default) with these models. Turning it off removes
+`response_format: {type: json_object}`, and a preview-tier model may then ignore
+the "return only JSON" instruction entirely and answer in markdown — which shows
+up as `unusable response` on every agent. OpenReview's parser tolerates prose
+*around* JSON, not prose *instead of* it. Only disable `json_mode` for a
+provider that actually rejects `response_format` (the PR's error block names it).
 
 > **Reasoning models cost more than they look — measure before you assume.**
 > Most modern models think to some degree, including both free ones above, so
