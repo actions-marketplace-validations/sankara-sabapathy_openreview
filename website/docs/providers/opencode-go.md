@@ -109,6 +109,13 @@ every agent. OpenReview's parser tolerates prose *around* JSON, not prose
 > on 3/3 probe runs. If a reviewer is slow and expensive, probe it before you
 > trust it. OpenReview reads `reasoning_content` as a fallback
 > ([#26](https://github.com/sankara-sabapathy/openreview/issues/26)).
+> Cap the thinking, not the answer: on an 80k-char diff `space-bunny-free`
+> thinks ~9.5k chars, exhausts the 2000-token output budget, and returns empty
+> content with `finish_reason=length` (0/5 parseable across both prompt styles;
+> raising the cap to 8000 does not help — thinking expands to fill it, 0/2).
+> With `extra_body: { reasoning_effort: "low" }` the same diff parses 2/2 with
+> real findings. This repo sets that on its own provider; do the same for any
+> reasoning reviewer on a busy repo.
 
 > **Known flake (2026-09-30, [issue #30](https://github.com/sankara-sabapathy/openreview/issues/30)):**
 > `glm-5.3-flash` intermittently returns **empty content** (upstream thinking

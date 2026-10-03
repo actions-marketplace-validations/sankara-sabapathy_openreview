@@ -57,16 +57,58 @@ async function loadConfig(configPath: string) {
   );
 }
 
-async function getPrDiff(octokit: ReturnType<typeof github.getOctokit>, owner: string, repo: string, pr: number) {
-  const { data: files } = await octokit.rest.pulls.listFiles({ owner, repo, pull_number: pr, per_page: 100 });
+/** Cap for paginated file listing (issue #50). GitHub renders at most one page
+ * of 100 files per listFiles call; a 150-file PR used to silently review only
+ * the first 100. We paginate everything and review up to this many, reporting
+ * the rest — an invisible skip is worse than a visible one. */
+export const MAX_DIFF_FILES = 300;
+
+export type PrDiff = {
+  fileNames: string[];
+  diff: string;
+  headSha: string;
+  /** Files with no renderable patch (binary or too large to render). */
+  omitted: string[];
+  /** True when the PR touched more than MAX_DIFF_FILES files. */
+  truncated: boolean;
+  /** Total files touched by the PR, before the MAX_DIFF_FILES cap. */
+  totalFiles: number;
+};
+
+export async function getPrDiff(
+  octokit: ReturnType<typeof github.getOctokit>,
+  owner: string,
+  repo: string,
+  pr: number,
+  payloadHeadSha?: string
+): Promise<PrDiff> {
+  const files = await octokit.paginate(octokit.rest.pulls.listFiles, {
+    owner, repo, pull_number: pr, per_page: 100,
+  });
+  const truncated = files.length > MAX_DIFF_FILES;
+  const capped = files.slice(0, MAX_DIFF_FILES);
   const parts: string[] = [];
   const names: string[] = [];
-  for (const f of files) {
+  const omitted: string[] = [];
+  for (const f of capped) {
     names.push(f.filename);
     if (f.patch) parts.push(`--- a/${f.filename}\n+++ b/${f.filename}\n${f.patch}`);
+    else omitted.push(f.filename);
   }
-  const { data: pull } = await octokit.rest.pulls.get({ owner, repo, pull_number: pr });
-  return { fileNames: names, diff: parts.join("\n\n"), headSha: pull.head.sha };
+  if (truncated)
+    logWarning(
+      `Diff truncated: PR touches ${files.length} files, reviewing the first ${MAX_DIFF_FILES}.`
+    );
+  if (omitted.length > 0)
+    logWarning(
+      `${omitted.length} file(s) have no renderable patch (binary or too large) and were not sent to reviewers: ${omitted.slice(0, 10).join(", ")}${omitted.length > 10 ? ", …" : ""}`
+    );
+  // The pull_request payload already carries head.sha; only fall back to an
+  // extra pulls.get when it is missing (issue_comment path).
+  const headSha =
+    payloadHeadSha ??
+    (await octokit.rest.pulls.get({ owner, repo, pull_number: pr })).data.head.sha;
+  return { fileNames: names, diff: parts.join("\n\n"), headSha, omitted, truncated, totalFiles: files.length };
 }
 
 /** Run thunks with at most `limit` in flight, preserving result order.
@@ -156,9 +198,15 @@ export async function run(): Promise<void> {
     const sessionId =
       process.env.GITHUB_RUN_ID ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
     logInfo(`Reviewing PR #${prNumber} in ${owner}/${repo}`);
-    const { fileNames, diff, headSha } = await getPrDiff(octokit, owner, repo, prNumber);
+    const { fileNames, diff, headSha, omitted, truncated, totalFiles } = await getPrDiff(
+      octokit, owner, repo, prNumber, (ctx.payload as any).pull_request?.head?.sha
+    );
     logInfo(`Diff: ${fileNames.length} files, ${diff.length} chars (head ${headSha.slice(0, 7)})`);
     logDebug(`Diff files: ${fileNames.join(", ")}`);
+    if (truncated)
+      logWarning(`PR touches more than ${MAX_DIFF_FILES} files; only the first ${MAX_DIFF_FILES} were reviewed.`);
+    if (omitted.length > 0)
+      logWarning(`${omitted.length} changed file(s) skipped (binary or patch too large): ${omitted.slice(0, 10).join(", ")}${omitted.length > 10 ? ", …" : ""}`);
     const inScope = filterIgnored(fileNames, config.defaults.ignore ?? []);
     if (!diff.trim() || inScope.length === 0) {
       logInfo("Empty diff or all files ignored.");
@@ -436,6 +484,15 @@ export async function run(): Promise<void> {
       )
       .join(" · ");
     let sticky = stickyBase;
+    if (truncated || omitted.length > 0) {
+      const bits: string[] = [];
+      if (truncated) bits.push(`only the first ${MAX_DIFF_FILES} of ${totalFiles} changed files were reviewed`);
+      if (omitted.length > 0)
+        bits.push(
+          `${omitted.length} file(s) not reviewable (binary or diff too large): ${omitted.slice(0, 8).map((f) => `\`${f}\``).join(", ")}${omitted.length > 8 ? ", …" : ""}`
+        );
+      sticky += `\n\n> ⚠️ ${bits.join(". ")}.`;
+    }
     if (usageLine) {
       sticky += `\n<sub>Models: ${usageLine}</sub>`;
       logInfo(`Usage: ${usageLine}`);
