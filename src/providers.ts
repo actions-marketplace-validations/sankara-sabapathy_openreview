@@ -199,7 +199,7 @@ async function callAnthropic(opts: {
   user: string;
   extraBody: Record<string, unknown>;
   timeoutMs: number;
-}): Promise<{ text: string; usage: Usage }> {
+}): Promise<{ text: string; usage: Usage; shape: string }> {
   const base = opts.baseUrl.replace(/\/$/, "");
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), opts.timeoutMs);
@@ -229,7 +229,7 @@ async function callAnthropic(opts: {
       typeof u.input_tokens === "number" || typeof u.output_tokens === "number"
         ? { in: u.input_tokens ?? 0, out: u.output_tokens ?? 0 }
         : null;
-    return { text: out, usage };
+    return { text: out, usage, shape: `anthropic blocks=${(j.content ?? []).length}` };
   } catch (e) {
     if ((e as Error).name === "AbortError")
       throw new Error(`timeout after ${opts.timeoutMs}ms`);
@@ -249,13 +249,64 @@ async function callAnthropic(opts: {
  * concatenate them: `reasoning_content` is the model's whole thinking trace
  * (131k tokens observed on a live run), and prepending it to the answer makes
  * `extractFindingsJson`'s brace-matching span the entire monologue, so a
- * perfectly good review fails to parse. */
+ * perfectly good review fails to parse.
+ *
+ * `content` is not always a string: gateways return it as an array of blocks
+ * (`[{type:"text",text}]`) or as an object. A live run spent 2k output tokens
+ * per agent and produced "" for BOTH agents, because the shape check dropped a
+ * non-string content. Flatten those shapes instead of dropping them. */
 export function extractAssistantText(j: any): string {
-  const msg = j?.choices?.[0]?.message ?? {};
-  if (typeof msg.content === "string" && msg.content.trim()) return msg.content;
-  return [msg.reasoning_content, msg.reasoning]
-    .filter((p): p is string => typeof p === "string" && p.trim().length > 0)
+  const choice = j?.choices?.[0] ?? {};
+  const msg = choice.message ?? {};
+  const content = flattenText(msg.content);
+  if (content.trim()) return content;
+  // `choices[0].text` is completions-style leakage on some gateways.
+  const text = flattenText(choice.text);
+  if (text.trim()) return text;
+  return [flattenText(msg.reasoning_content), flattenText(msg.reasoning), flattenText(msg.thinking)]
+    .filter((p) => p.trim().length > 0)
     .join("\n");
+}
+
+/** Flatten a content field that may be a string, an array of blocks, or nested
+ * objects carrying `text`/`content`. Returns "" when there is no text. */
+function flattenText(v: unknown, depth = 0): string {
+  if (typeof v === "string") return v;
+  if (v === null || v === undefined) return "";
+  if (depth > 4) return "";
+  if (Array.isArray(v)) return v.map((x) => flattenText(x, depth + 1)).filter(Boolean).join("\n");
+  if (typeof v === "object") {
+    const o = v as Record<string, unknown>;
+    return [flattenText(o.text, depth + 1), flattenText(o.content, depth + 1)]
+      .filter(Boolean)
+      .join("\n");
+  }
+  return "";
+}
+
+/** A redacted description of where a response's text lived, for diagnosing an
+ * empty parse. Names and sizes only — never content. */
+export function describeResponseShape(j: any): string {
+  const choice = j?.choices?.[0];
+  if (!choice) return `no choices (keys: ${Object.keys(j ?? {}).slice(0, 6).join(",") || "none"})`;
+  const msg = choice.message ?? {};
+  const parts: string[] = [];
+  const note = (label: string, v: unknown) => {
+    if (v === undefined || v === null) return;
+    const size =
+      typeof v === "string" ? `${v.length}ch` : Array.isArray(v) ? `array[${v.length}]` : typeof v;
+    parts.push(`${label}=${size}`);
+  };
+  for (const k of ["content", "reasoning_content", "reasoning", "thinking", "text"]) note(k, (msg as any)[k] ?? (choice as any)[k]);
+  // finish_reason is a short provider enum ("stop"/"length"/"tool_calls") and is
+  // the single most useful clue, so echo the value — sanitized and truncated, so
+  // nothing content-shaped can ride along.
+  const fr = choice.finish_reason;
+  if (typeof fr === "string" && fr.length > 0)
+    parts.push(`finish_reason=${fr.replace(/[^a-zA-Z_.-]/g, "").slice(0, 24) || "?"}`);
+  const u = j?.usage ?? {};
+  note("completion_tokens", u.completion_tokens);
+  return `${parts.join(" ")} || shape(${Object.keys(msg).slice(0, 6).join(",") || "empty"})`;
 }
 
 async function callOpenAICompatible(opts: {
@@ -269,7 +320,7 @@ async function callOpenAICompatible(opts: {
   jsonMode: boolean;
   extraBody: Record<string, unknown>;
   timeoutMs: number;
-}): Promise<{ text: string; usage: Usage }> {
+}): Promise<{ text: string; usage: Usage; shape: string }> {
   const base = opts.baseUrl.replace(/\/$/, "");
   const body: Record<string, unknown> = {
     model: opts.model,
@@ -300,7 +351,7 @@ async function callOpenAICompatible(opts: {
       typeof u.prompt_tokens === "number" || typeof u.completion_tokens === "number"
         ? { in: u.prompt_tokens ?? 0, out: u.completion_tokens ?? 0 }
         : null;
-    return { text: extractAssistantText(j), usage };
+    return { text: extractAssistantText(j), usage, shape: describeResponseShape(j) };
   } catch (e) {
     if ((e as Error).name === "AbortError")
       throw new Error(`timeout after ${opts.timeoutMs}ms`);
@@ -459,6 +510,7 @@ export async function runAgent(opts: {
   // wall-clock cost. Allow one retry, not `retries` (issue #51).
   let emptyRetries = 0;
   let attemptsMade = 0;
+  let lastShape = "";
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     // Re-check the budget before EVERY attempt. A retry is a new HTTP call: it
     // must not start once the run budget is gone, or the run overruns
@@ -502,6 +554,7 @@ export async function runAgent(opts: {
       }
       raw = out.text;
       usage = out.usage;
+      lastShape = out.shape;
       if (raw && raw.trim()) break; // success
       lastError = `empty content from ${opts.provider.model}`;
       raw = "";
@@ -546,14 +599,20 @@ export async function runAgent(opts: {
   );
   if (!raw.trim()) {
     // Total failure surfaces into the PR's agent-error block (main.ts catch).
+    // Include the redacted response SHAPE: a gateway that returns content in an
+    // unexpected field spends the tokens and then reports "empty", which is
+    // undiagnosable from the outside without this.
     throw new Error(
-      `Agent ${opts.agentName} failed after ${attemptsMade} attempt(s): ${lastError || "run budget exhausted"}`
+      `Agent ${opts.agentName} failed after ${attemptsMade} attempt(s): ${lastError || "run budget exhausted"}` +
+        (lastShape ? ` [response ${lastShape}]` : "")
     );
   }
   const parsed = extractFindingsJson(raw);
   if (!parsed) {
+    // Raw heads can be megabytes of reasoning trace; keep the log useful.
     logWarning(
-      `Agent ${opts.agentName}: could not parse findings JSON; raw head: ${raw.slice(0, 300)}`
+      `Agent ${opts.agentName}: could not parse findings JSON; raw head: ${raw.slice(0, 200)}` +
+        (raw.length > 200 ? ` (${raw.length} chars total)` : "")
     );
     return { findings: [], usage, seconds, outcome: "unparseable" };
   }

@@ -6,6 +6,7 @@ import {
   isRetryableError,
   extractAssistantText,
   extractFindingsJson,
+  describeResponseShape,
   runAgent,
   countsAsReview,
 } from "./providers.js";
@@ -430,5 +431,59 @@ describe("runAgent deadline (issue #51)", () => {
     // Loopback refuses connections immediately either way; the point is that it
     // returns fast and does not run the full attempt budget.
     assert.ok(elapsed < 5000, `took ${elapsed}ms, expected the budget clamp to bound it`);
+  });
+});
+
+describe("response shape tolerance (any-provider robustness)", () => {
+  const J = '{"findings":[{"file":"a.ts"}]}';
+  const at = (message: any, extra: any = {}) =>
+    extractAssistantText({ choices: [{ message, ...extra }] });
+
+  it("reads array-shaped content blocks", () => {
+    // A live run spent 2k output tokens per agent and returned "" for BOTH
+    // agents: content arrived as [{type:'text',text}] and the old
+    // `typeof === "string"` check dropped it.
+    assert.equal(at({ content: [{ type: "text", text: J }] }), J);
+    assert.equal(at({ content: [{ type: "text", text: "pre" }, { type: "text", text: J }] }), `pre\n${J}`);
+  });
+  it("reads object-shaped content", () => {
+    assert.equal(at({ content: { text: J } }), J);
+    assert.equal(at({ content: { content: J } }), J);
+  });
+  it("reads completions-style choices[0].text", () => {
+    assert.equal(extractAssistantText({ choices: [{ text: J }] }), J);
+  });
+  it("still prefers real content over a reasoning trace", () => {
+    assert.equal(at({ reasoning_content: "long trace", content: J }), J);
+  });
+  it("falls back through every reasoning field name", () => {
+    for (const k of ["reasoning_content", "reasoning", "thinking"]) {
+      assert.equal(at({ content: null, [k]: J }), J, `${k} not read`);
+    }
+  });
+  it("stays empty when there is genuinely no text", () => {
+    assert.equal(at({ content: 42 }), "");
+    assert.equal(at({}), "");
+    assert.equal(extractAssistantText({}), "");
+  });
+  it("cannot loop forever on a self-referential shape", () => {
+    const cyclic: any = {};
+    cyclic.content = cyclic;
+    assert.equal(extractAssistantText({ choices: [{ message: cyclic }] }), "");
+  });
+});
+
+describe("describeResponseShape (diagnostics)", () => {
+  it("names fields and sizes without leaking content", () => {
+    const s = describeResponseShape({
+      choices: [{ message: { content: [{ type: "text", text: "SECRET-PAYLOAD" }] }, finish_reason: "length" }],
+      usage: { completion_tokens: 2000 },
+    });
+    assert.match(s, /content=array\[1\]/);
+    assert.match(s, /finish_reason=length/);
+    assert.ok(!s.includes("SECRET-PAYLOAD"), "diagnostics must not echo response content");
+  });
+  it("describes a response with no choices at all", () => {
+    assert.match(describeResponseShape({ error: "boom" }), /no choices/);
   });
 });
