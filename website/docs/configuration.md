@@ -37,7 +37,7 @@ providers:
 
 reviews:
   - id: general-quality
-    if_paths: ["**"] # which files this review sees
+    if_paths: ["**"] # which files this review SEES (the diff is scoped to these, too)
     main: # synthesizer; name defaults to "<id>:main"
       provider: go
       instructions: "Synthesize sub-agent findings. Strict on bugs, lenient on style."

@@ -11,6 +11,8 @@ import {
   resolveNoise,
   satisfiesActionVersion,
   applyDegradedFloor,
+  splitDiff,
+  scopeDiff,
 } from "./reviewer.js";
 
 type V = "approve" | "comment" | "request_changes";
@@ -193,6 +195,76 @@ describe("applyDegradedFloor (issue #46)", () => {
   });
   it("nothing reviewed is left to the caller's exclusion", () => {
     assert.equal(applyDegradedFloor("approve", 0, 2), "approve");
+  });
+});
+
+describe("splitDiff / scopeDiff (issue #47)", () => {
+  const FILES = ["src/a.ts", "src/b.ts", "website/x.md", "dist/bundle.js"];
+  // Exactly the shape getPrDiff() builds.
+  const build = (files: string[]) =>
+    files
+      .map((f) => `--- a/${f}\n+++ b/${f}\n@@ -1,2 +1,3 @@\n ctx\n+added in ${f}\n`)
+      .join("\n\n");
+
+  it("splits a multi-file diff into one patch per file", () => {
+    const parsed = splitDiff(build(FILES));
+    assert.deepEqual(parsed.map((p) => p.file), FILES);
+    for (const p of parsed) assert.match(p.patch, /^@@/);
+  });
+
+  it("a src/-scoped review sees ZERO bytes of out-of-scope files", () => {
+    // The bug: if_paths only decided whether a review ran; agents always got
+    // the whole diff, so they paid for (and could comment on) dist/ and docs.
+    const parsed = splitDiff(build(FILES));
+    const scoped = scopeDiff(["src/a.ts", "src/b.ts"], parsed, FILES.length);
+    assert.ok(scoped.includes("src/a.ts") && scoped.includes("src/b.ts"));
+    assert.ok(!scoped.includes("website/x.md"), "website leaked into a src/-only review");
+    assert.ok(!scoped.includes("dist/bundle.js"), "dist leaked into a src/-only review");
+  });
+
+  it("tells the model how much was withheld", () => {
+    const scoped = scopeDiff(["src/a.ts"], splitDiff(build(FILES)), FILES.length);
+    assert.match(scoped, /OpenReview scope note/);
+    assert.match(scoped, /1 of 4 in-scope/);
+  });
+
+  it("omits the manifest when nothing was withheld", () => {
+    const full = scopeDiff(FILES, splitDiff(build(FILES)), FILES.length);
+    for (const f of FILES) assert.ok(full.includes(f), `${f} missing`);
+    assert.ok(!full.includes("OpenReview scope note"));
+  });
+
+  it("ignores ignore-filtered files only through the caller's file list", () => {
+    const inScope = FILES.filter((f) => f !== "dist/bundle.js");
+    const parsed = splitDiff(build(FILES));
+    const scoped = scopeDiff(inScope, parsed, inScope.length);
+    assert.ok(!scoped.includes("dist/bundle.js"));
+    assert.ok(!scoped.includes("OpenReview scope note"), "ignore-filtered files are not 'withheld by if_paths'");
+  });
+
+  it("is not fooled by header-looking text inside a patch body", () => {
+    // An added line reading `+++ b/inner` is written `++++ b/inner` on the
+    // wire, and a removed one is `-+++ b/inner`; neither starts with `+++ b/`.
+    const tricky =
+      '--- a/q.ts\n+++ b/q.ts\n@@ -1 +1,3 @@\n+const s = "+++ b/inner";\n+// --- a/decoy\n-+++ b/removed\n';
+    const parsed = splitDiff(tricky);
+    assert.equal(parsed.length, 1);
+    assert.equal(parsed[0].file, "q.ts");
+    assert.ok(parsed[0].patch.includes('"+++ b/inner"'));
+  });
+
+  it("survives empty input", () => {
+    assert.deepEqual(splitDiff(""), []);
+    assert.equal(scopeDiff([], [], 0), "");
+  });
+
+  it("says so plainly when no patch text is available at all", () => {
+    // Can't happen when fileNames and the diff come from one call, but if it
+    // does the prompt must not read "judge the files above" over nothing.
+    const out = scopeDiff(["nope.ts"], splitDiff(build(["a.ts"])), 1);
+    assert.match(out, /NO patch text is available/);
+    assert.match(out, /Report no findings rather than guessing/);
+    assert.ok(!out.includes("Judge only the files above"));
   });
 });
 

@@ -35,7 +35,7 @@ requires for routing/prompt-caching. Only `chat/completions`-listed models work
 
 | Model ID | Monthly included usage |
 |---|---|
-| `longcat-2.5-preview-free`, `space-bunny-free` | **Free / unlimited (limited time)** |
+| `space-bunny-free`, `longcat-2.5-preview-free` | **Free / unlimited (limited time)** — only `space-bunny-free` is review-capable, see below |
 | `glm-5.3-flash` | $60 — good all-round reviewer |
 | `kimi-k2.7-code` | $60 — coding specialist, good subagent/main |
 | `kimi-k2.6`, `kimi-k3` | $60 |
@@ -59,11 +59,31 @@ fast over a busy repo:
 providers:
   go:
     protocol: openai-chat
-    model: longcat-2.5-preview-free
+    model: space-bunny-free
     base_url: https://opencode.ai/zen/go/v1
     key_from: secrets.OPENCODE_API_KEY
-    json_mode: false   # the parser tolerates prose-wrapped JSON; no need to depend on it
 ```
+
+**Use `space-bunny-free` for reviews, not `longcat-2.5-preview-free`.** Both are
+free and both reason, but on a full-size diff `longcat-2.5-preview-free` answers
+7-8k characters of **markdown prose with no JSON at all**, so every agent ends as
+`unusable response` and the run reports zero findings. It also ignores
+`response_format: {type: json_object}`, so `json_mode` cannot fix it and neither
+could a much harder prompt instruction. `space-bunny-free` honours the JSON
+contract on real diffs and is what this repo reviews itself with.
+
+Verify before you trust a model on a real diff, not a toy prompt:
+
+```bash
+OPENCODE_API_KEY=sk-... npm run probe:model <model-id>
+```
+
+Keep `json_mode: true` (the default). Turning it off removes
+`response_format: {type: json_object}`, and a model that ignores the "JSON only"
+instruction then answers in markdown — which shows up as `unusable response` on
+every agent. OpenReview's parser tolerates prose *around* JSON, not prose
+*instead of* it. Only disable `json_mode` for a provider that actually rejects
+`response_format` (the PR's error block names it).
 
 > **Reasoning models cost more than they look — measure before you assume.**
 > Most modern models think to some degree, including both free ones above, so

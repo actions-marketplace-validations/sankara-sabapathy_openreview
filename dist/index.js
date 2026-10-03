@@ -44835,7 +44835,23 @@ function resolveKeysFromEnv(env) {
         githubToken: env["INPUT_GITHUB-TOKEN"] || env["GITHUB_TOKEN"] || env["GH_TOKEN"] || "",
     };
 }
-const SYSTEM_WRAPPER = (lang, instructions) => `You are a senior code reviewer. Language: ${lang}.\nCustom instructions: ${instructions}\n\nReturn ONLY valid JSON: {"findings":[{"file":string,"line":number|null,"severity":"high|medium|suggestion","category":string,"comment":string,"confidence":0-1}]}. No markdown fences. Be strict on bugs/security, lenient on style. Skip low-confidence nits.`;
+const FINDINGS_SCHEMA = '{"findings":[{"file":string,"line":number|null,"severity":"high|medium|suggestion","category":string,"comment":string,"confidence":0-1}]}';
+// The output contract is enforced in the prompt because `response_format` is
+// NOT reliable across gateways: some ignore it, and a free/preview model that
+// ignores it answers 8k chars of markdown, which is unusable. Spell out the
+// contract hard enough that a chatty model still complies (issue #54).
+const SYSTEM_WRAPPER = (lang, instructions) => `You are a senior code reviewer. Language: ${lang}.
+Custom instructions: ${instructions}
+
+OUTPUT FORMAT — mandatory, and your reply is checked against it:
+Reply with ONE JSON object and NOTHING else. The first character must be "{" and the last must be "}".
+No markdown, no headings, no bullets, no code fences, no preamble, no summary, no explanation.
+Schema: ${FINDINGS_SCHEMA}
+
+Be strict on bugs/security, lenient on style. Skip low-confidence nits.`;
+/** Final line of the user message: restating the contract at the end of a long
+ * prompt works far better than stating it once at the top. */
+const SCHEMA_REMINDER = `\n\nReminder: your entire reply must be one JSON object of this exact shape, nothing else:\n${FINDINGS_SCHEMA}`;
 function truncate(s, n) {
     return s.length > n ? s.slice(0, n) + "\n...[truncated]" : s;
 }
@@ -44988,7 +45004,7 @@ async function callAnthropic(opts) {
         const usage = typeof u.input_tokens === "number" || typeof u.output_tokens === "number"
             ? { in: u.input_tokens ?? 0, out: u.output_tokens ?? 0 }
             : null;
-        return { text: out, usage };
+        return { text: out, usage, shape: `anthropic blocks=${(j.content ?? []).length}` };
     }
     catch (e) {
         if (e.name === "AbortError")
@@ -45009,14 +45025,70 @@ async function callAnthropic(opts) {
  * concatenate them: `reasoning_content` is the model's whole thinking trace
  * (131k tokens observed on a live run), and prepending it to the answer makes
  * `extractFindingsJson`'s brace-matching span the entire monologue, so a
- * perfectly good review fails to parse. */
+ * perfectly good review fails to parse.
+ *
+ * `content` is not always a string: gateways return it as an array of blocks
+ * (`[{type:"text",text}]`) or as an object. A live run spent 2k output tokens
+ * per agent and produced "" for BOTH agents, because the shape check dropped a
+ * non-string content. Flatten those shapes instead of dropping them. */
 function extractAssistantText(j) {
-    const msg = j?.choices?.[0]?.message ?? {};
-    if (typeof msg.content === "string" && msg.content.trim())
-        return msg.content;
-    return [msg.reasoning_content, msg.reasoning]
-        .filter((p) => typeof p === "string" && p.trim().length > 0)
+    const choice = j?.choices?.[0] ?? {};
+    const msg = choice.message ?? {};
+    const content = flattenText(msg.content);
+    if (content.trim())
+        return content;
+    // `choices[0].text` is completions-style leakage on some gateways.
+    const text = flattenText(choice.text);
+    if (text.trim())
+        return text;
+    return [flattenText(msg.reasoning_content), flattenText(msg.reasoning), flattenText(msg.thinking)]
+        .filter((p) => p.trim().length > 0)
         .join("\n");
+}
+/** Flatten a content field that may be a string, an array of blocks, or nested
+ * objects carrying `text`/`content`. Returns "" when there is no text. */
+function flattenText(v, depth = 0) {
+    if (typeof v === "string")
+        return v;
+    if (v === null || v === undefined)
+        return "";
+    if (depth > 4)
+        return "";
+    if (Array.isArray(v))
+        return v.map((x) => flattenText(x, depth + 1)).filter(Boolean).join("\n");
+    if (typeof v === "object") {
+        const o = v;
+        return [flattenText(o.text, depth + 1), flattenText(o.content, depth + 1)]
+            .filter(Boolean)
+            .join("\n");
+    }
+    return "";
+}
+/** A redacted description of where a response's text lived, for diagnosing an
+ * empty parse. Names and sizes only — never content. */
+function describeResponseShape(j) {
+    const choice = j?.choices?.[0];
+    if (!choice)
+        return `no choices (keys: ${Object.keys(j ?? {}).slice(0, 6).join(",") || "none"})`;
+    const msg = choice.message ?? {};
+    const parts = [];
+    const note = (label, v) => {
+        if (v === undefined || v === null)
+            return;
+        const size = typeof v === "string" ? `${v.length}ch` : Array.isArray(v) ? `array[${v.length}]` : typeof v;
+        parts.push(`${label}=${size}`);
+    };
+    for (const k of ["content", "reasoning_content", "reasoning", "thinking", "text"])
+        note(k, msg[k] ?? choice[k]);
+    // finish_reason is a short provider enum ("stop"/"length"/"tool_calls") and is
+    // the single most useful clue, so echo the value — sanitized and truncated, so
+    // nothing content-shaped can ride along.
+    const fr = choice.finish_reason;
+    if (typeof fr === "string" && fr.length > 0)
+        parts.push(`finish_reason=${fr.replace(/[^a-zA-Z_.-]/g, "").slice(0, 24) || "?"}`);
+    const u = j?.usage ?? {};
+    note("completion_tokens", u.completion_tokens);
+    return `${parts.join(" ")} || shape(${Object.keys(msg).slice(0, 6).join(",") || "empty"})`;
 }
 async function callOpenAICompatible(opts) {
     const base = opts.baseUrl.replace(/\/$/, "");
@@ -45050,7 +45122,7 @@ async function callOpenAICompatible(opts) {
         const usage = typeof u.prompt_tokens === "number" || typeof u.completion_tokens === "number"
             ? { in: u.prompt_tokens ?? 0, out: u.completion_tokens ?? 0 }
             : null;
-        return { text: extractAssistantText(j), usage };
+        return { text: extractAssistantText(j), usage, shape: describeResponseShape(j) };
     }
     catch (e) {
         if (e.name === "AbortError")
@@ -45143,6 +45215,8 @@ async function runAgent(opts) {
     if (opts.contextBlock) {
         user += `\n\n${opts.contextBlock}\nGround every finding in the diff above; use <context> only as cross-file evidence (callers, types, contracts). Never flag context-only code.`;
     }
+    // Restate the output contract last, after a long diff + context block.
+    user += SCHEMA_REMINDER;
     const rp = resolveProvider(opts.provider, opts.keys, process.env, opts.sessionId);
     // missing BYOK key -> report it as a skip so it can never read as a clean
     // review, and the caller can name the missing secret (issue #46)
@@ -45170,6 +45244,7 @@ async function runAgent(opts) {
     // wall-clock cost. Allow one retry, not `retries` (issue #51).
     let emptyRetries = 0;
     let attemptsMade = 0;
+    let lastShape = "";
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         // Re-check the budget before EVERY attempt. A retry is a new HTTP call: it
         // must not start once the run budget is gone, or the run overruns
@@ -45213,6 +45288,7 @@ async function runAgent(opts) {
             }
             raw = out.text;
             usage = out.usage;
+            lastShape = out.shape;
             if (raw && raw.trim())
                 break; // success
             lastError = `empty content from ${opts.provider.model}`;
@@ -45256,11 +45332,17 @@ async function runAgent(opts) {
         `prompt=${system.length + user.length} chars (diff ${opts.diff.length}, ctx ${(opts.contextBlock ?? "").length})`);
     if (!raw.trim()) {
         // Total failure surfaces into the PR's agent-error block (main.ts catch).
-        throw new Error(`Agent ${opts.agentName} failed after ${attemptsMade} attempt(s): ${lastError || "run budget exhausted"}`);
+        // Include the redacted response SHAPE: a gateway that returns content in an
+        // unexpected field spends the tokens and then reports "empty", which is
+        // undiagnosable from the outside without this.
+        throw new Error(`Agent ${opts.agentName} failed after ${attemptsMade} attempt(s): ${lastError || "run budget exhausted"}` +
+            (lastShape ? ` [response ${lastShape}]` : ""));
     }
     const parsed = extractFindingsJson(raw);
     if (!parsed) {
-        logWarning(`Agent ${opts.agentName}: could not parse findings JSON; raw head: ${raw.slice(0, 300)}`);
+        // Raw heads can be megabytes of reasoning trace; keep the log useful.
+        logWarning(`Agent ${opts.agentName}: could not parse findings JSON; raw head: ${raw.slice(0, 200)}` +
+            (raw.length > 200 ? ` (${raw.length} chars total)` : ""));
         return { findings: [], usage, seconds, outcome: "unparseable" };
     }
     try {
@@ -45445,6 +45527,71 @@ function filterIgnored(files, ignore) {
     if (!ignore.length)
         return files;
     return files.filter((f) => !ignore.some((p) => matchGlob(f, p)));
+}
+/**
+ * Split a multi-file unified diff into per-file patches (issue #47).
+ * GitHub hands us one blob built as
+ *   --- a/<file>\n+++ b/<file>\n<patch>
+ * so the `+++ b/` header is the reliable boundary: every line inside a patch
+ * body starts with ' ', '+' or '-', so no body line can itself start with
+ * `+++ b/` — an added line reading `+++ b/x` is written `++++ b/x` and a
+ * context line carries a leading space.
+ *
+ * A file whose content legitimately contains that sequence cannot be
+ * represented — no caller builds such a diff, so this is a documented
+ * limitation rather than a guess.
+ */
+function splitDiff(diff) {
+    const out = [];
+    let cur = null;
+    let curBody = [];
+    const flush = () => {
+        if (cur && curBody.length) {
+            const body = curBody.join("\n");
+            // Patch lines only (skip the ---/+++ headers we consumed).
+            if (body.startsWith("@@") || body.startsWith("+") || body.startsWith("-")) {
+                out.push({ file: cur.file, patch: body });
+            }
+        }
+        cur = null;
+        curBody = [];
+    };
+    for (const line of diff.split("\n")) {
+        if (line.startsWith("+++ b/")) {
+            flush();
+            cur = { file: line.slice(6), patch: "" };
+            continue;
+        }
+        if (cur && !line.startsWith("--- a/"))
+            curBody.push(line);
+    }
+    flush();
+    return out;
+}
+/**
+ * The diff restricted to `files`, with an honest manifest header.
+ *
+ * `if_paths` used to only decide *whether* a review ran: agents always received
+ * the entire PR diff, so a review scoped to `src/**` still saw (and paid for,
+ * and could comment on) the website/ and dist/ changes (issue #47).
+ */
+function scopeDiff(files, parsed, totalInScope) {
+    const wanted = new Set(files);
+    const picked = parsed.filter((p) => wanted.has(p.file));
+    const body = picked.map((p) => `--- a/${p.file}\n+++ b/${p.file}\n${p.patch}`).join("\n\n");
+    if (totalInScope <= 0 || picked.length === totalInScope)
+        return body;
+    const omitted = totalInScope - picked.length;
+    if (picked.length === 0) {
+        // Should not happen when fileNames and the diff come from the same call, so
+        // say so plainly instead of telling the model to judge an empty prompt.
+        return (`# OpenReview scope note: NO patch text is available for the ${totalInScope} in-scope ` +
+            `changed file(s) this review matched (${files.slice(0, 5).join(", ")}${files.length > 5 ? ", …" : ""}). ` +
+            `They may be binary or too large for GitHub to render. Report no findings rather than guessing.`);
+    }
+    return (`${body}\n\n# OpenReview scope note: ${picked.length} of ${totalInScope} in-scope changed ` +
+        `file(s) are included, matched against if_paths. ${omitted} omitted. Judge only the ` +
+        `files above.`);
 }
 function dedupeFindings(findings) {
     const seen = new Set();
@@ -46250,6 +46397,10 @@ async function run() {
             logInfo("Empty diff or all files ignored.");
             return;
         }
+        // Parse the multi-file diff once; every review scopes from this (#47).
+        const parsedDiff = splitDiff(diff);
+        if (parsedDiff.length === 0)
+            logWarning(`Diff parser found no per-file patches for ${fileNames.length} changed file(s).`);
         const perReview = [];
         for (const review of config.reviews) {
             const scopedFiles = inScope.filter((f) => matchesAny(f, review.if_paths));
@@ -46257,8 +46408,13 @@ async function run() {
                 logInfo(`Review ${review.id}: no matching paths, skipped.`);
                 continue;
             }
-            // Build a scoped diff (best-effort: filter diff hunks by filename header)
-            const scopedDiff = scopedFiles.length === inScope.length ? diff : diff; // keep full diff; agents see file names
+            // Scoped diff (issue #47). `if_paths` used to decide only *whether* a
+            // review ran — agents always got the whole PR diff, so a src/-only review
+            // still paid for (and could comment on) website/ and dist/. Parsed once per
+            // run, reused by every review and agent.
+            const scopedDiff = scopeDiff(scopedFiles, parsedDiff, inScope.length);
+            logDebug(`Review ${review.id}: ${scopedFiles.length}/${inScope.length} in-scope file(s) sent ` +
+                `(${scopedDiff.length} chars)`);
             // Cross-file context (issue #20): full files + call-site excerpts, budgeted.
             const { block: contextBlock } = buildContextBlock({
                 repoRoot: process.cwd(),

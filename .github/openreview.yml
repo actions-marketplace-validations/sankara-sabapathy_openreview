@@ -29,36 +29,45 @@ defaults:
   # Agents in flight per review (1-32, default 4). Unbounded fan-out rate-limits
   # small providers and turns a retry wave into a 429 storm.
   max_concurrency: 4
+  # Cross-file context budget + noise defaults (commented = defaults shown).
+  # max_context_chars: 20000
+  # include_full_files: true
+  # profile: balanced # quiet | balanced | assertive
+  # min_confidence: 0.6
+  # max_findings: 10
 
 providers:
   # --- Active: OpenCode Go, free tier ---
-  # Go lists exactly two free models: `space-bunny-free` (reserved for
-  # day-to-day development, deliberately not used for reviews) and
-  # `longcat-2.5-preview-free`, which is what we use here.
+  # This repo reviews itself with `space-bunny-free`. Go ships exactly two free
+  # models; the other one, `longcat-2.5-preview-free`, was tried first and
+  # REJECTED for review work:
+  #   * it answers a full-size diff with 7-8k chars of markdown prose and no
+  #     JSON at all, so every agent reported "unusable response" -> zero findings
+  #   * it ignores `response_format: {type: json_object}`, so `json_mode` cannot
+  #     save it, and neither could a much harder prompt instruction
+  # Both are reasoning models; the difference is that space-bunny-free honours
+  # the JSON contract on a real diff while longcat does not. Verify a model
+  # before trusting it: `npm run probe:model <id>` (needs OPENCODE_API_KEY).
   #
-  # BOTH free models are reasoning models — the difference is thinking VOLUME,
-  # not reasoning on/off. Measured with `npm run probe:model` on a small diff:
-  # longcat-free emits ~300-1200 chars of reasoning_content and ~250-470 output
-  # tokens, and returned valid findings JSON on 3/3 runs. deepseek-v4-flash,
-  # by contrast, billed 100k+ reasoning tokens on a full PR diff and sometimes
-  # answered with an empty `content` field (retried as "empty content"). That
-  # gap — not the price tier — is what made runs 10+ minutes. See #26.
+  # Deepseek/GLM/Kimi etc. are available on the same subscription — see
+  # website/docs/providers/opencode-go.md and openreview.example.yml for the
+  # full provider matrix. Only the model this repo actually uses is configured.
   opencode:
     # kind: is a deprecated shorthand (anthropic|openai|opencode|openai-compatible).
     # Prefer protocol below; both are shown here for reference.
     kind: opencode
     protocol: openai-chat # openai-chat | anthropic-messages
-    model: longcat-2.5-preview-free
+    model: space-bunny-free
     base_url: https://opencode.ai/zen/go/v1
     key_from: secrets.OPENCODE_API_KEY # any $NAME: "secrets.FOO" | "env.FOO"
-    # The parser now tolerates prose-wrapped JSON (see #54), so we do not need
-    # json_object mode and avoid depending on it from a preview-tier model.
-    json_mode: false
+    # json_mode stays TRUE (the default). Turning it off removes
+    # `response_format: {type: json_object}`, and a model that ignores the
+    # "JSON only" instruction then answers in markdown, which is unusable. Only
+    # disable it for a provider that genuinely rejects response_format.
     # auth: { header: Authorization, scheme: Bearer } # defaults shown; Azure uses { header: api-key, scheme: "" }
     # headers: { X-Custom: value } # extra headers merged into every request
     # endpoint_path: /chat/completions # default per protocol (/chat/completions, /v1/messages)
-    # json_mode: true is the default; set false for providers that reject
-    # response_format — this config sets it explicitly, see above.
+    # json_mode: true # set false ONLY for providers that reject response_format
     # extra_body: { temperature: 0.1 } # extra JSON body fields merged into requests
     # retries: 2 # attempts after the first for empty/5xx/429/network (0-5)
     # timeout_s: 420 # per-attempt TOTAL cap in seconds (10-600); 90s idle + 60s/1KB trickle guards always on

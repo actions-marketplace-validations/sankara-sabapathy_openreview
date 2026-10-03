@@ -28,6 +28,20 @@ global_verdict:
   `any` = most severe ballot wins, `all` = unanimous to escalate, `majority` =
   median ballot (even-count ties break toward more severe). Single-provider reviews
   behave identically under all three.
+- **`if_paths` scopes the diff, not just the trigger.** A review only receives
+  patches for files matching its own `if_paths`, and its prompt ends with a note
+  saying how many of the in-scope files were withheld:
+
+  ```
+  # OpenReview scope note: 2 of 9 in-scope changed file(s) are included,
+  # matched against if_paths. 7 omitted. Judge only the files above.
+  ```
+
+  So in the example above the `security-strict` review never sees (and never
+  spends tokens on) `website/` changes, and cannot file a finding about them.
+  Cross-file context (`context_files`, call-site excerpts) is still built from the
+  whole repo — that is what makes a finding on `auth/**` able to cite a caller in
+  `lib/`.
 - `global_verdict.strategy: any_blocking|majority` merges per-review verdicts.
 - Output: sticky comment (marker `openreview:sticky`), inline `pulls.createReview` (max 20), `verdict` output.
 - Every run appends a one-line usage footer to the sticky (`Models: <model> <in>/<out> <tok/s> …`, summed per model) and logs per-agent tokens/sec. Token counts come from each provider's `usage` block; providers that omit it show duration only.
