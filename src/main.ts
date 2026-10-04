@@ -19,7 +19,7 @@ import {
   applyDegradedFloor, resolveNoise, applyNoiseControls, splitDiff, scopeDiff, parseHunkRanges, type Verdict,
   satisfiesActionVersion, runningActionVersion,
 } from "./reviewer.js";
-import { renderStickyBody, upsertStickyComment, createInlineReview, type RunStatus } from "./github.js";
+import { renderStickyBody, upsertStickyComment, appendStickySection, renderAppendSection, createInlineReview, type RunStatus } from "./github.js";
 import { initLogger, logInfo, logWarning, logDebug } from "./logger.js";
 import { buildContextBlock, buildRepoIndex } from "./context.js";
 import { authorizeTrigger } from "./authorize.js";
@@ -541,22 +541,24 @@ export async function run(): Promise<void> {
     core.setOutput("review_status", status);
 
     const runUrl = `${process.env.GITHUB_SERVER_URL ?? "https://github.com"}/${owner}/${repo}/actions/runs/${process.env.GITHUB_RUN_ID ?? ""}`;
+    const reviewRows = perReview.map((r) => ({
+      id: r.id,
+      verdict: r.verdict,
+      count: r.findings.length,
+      counted: r.counted,
+    }));
+    const agentRows = perReview.flatMap((r) =>
+      r.agents.map((a) => ({
+        ...a,
+        provider: a.providerName,
+        review: r.id,
+      }))
+    );
     const stickyBase = renderStickyBody({
       verdict: global,
       status,
-      perReview: perReview.map((r) => ({
-        id: r.id,
-        verdict: r.verdict,
-        count: r.findings.length,
-        counted: r.counted,
-      })),
-      agents: perReview.flatMap((r) =>
-        r.agents.map((a) => ({
-          ...a,
-          provider: a.providerName,
-          review: r.id,
-        }))
-      ),
+      perReview: reviewRows,
+      agents: agentRows,
       findings: all,
       runUrl,
     });
@@ -571,7 +573,9 @@ export async function run(): Promise<void> {
     // concurrent agents the sum understates tok/s (two 60s calls of 1k tokens
     // each used to report 500 tok/s for 1k tokens in 60s).
     const { modelsLine, agentsLine } = summarizeUsage(perReview.flatMap((r) => r.usage));
-    let sticky = stickyBase;
+    // Per-run footer extras: shared by update mode (appended to the sticky)
+    // and append mode (inside the run's section) — issue #69.
+    const extras: string[] = [];
     if (truncated || omitted.length > 0) {
       const bits: string[] = [];
       if (truncated) bits.push(`only the first ${MAX_DIFF_FILES} of ${totalFiles} changed files were reviewed`);
@@ -579,21 +583,22 @@ export async function run(): Promise<void> {
         bits.push(
           `${omitted.length} file(s) not reviewable (binary or diff too large): ${omitted.slice(0, 8).map((f) => `\`${f}\``).join(", ")}${omitted.length > 8 ? ", …" : ""}`
         );
-      sticky += `\n\n> ⚠️ ${bits.join(". ")}.`;
+      extras.push(`\n\n> ⚠️ ${bits.join(". ")}.`);
     }
     if (modelsLine) {
-      sticky += `\n<sub>Models: ${modelsLine}</sub>`;
+      extras.push(`\n<sub>Models: ${modelsLine}</sub>`);
       logInfo(`Usage: ${modelsLine}`);
     }
     if (agentsLine) {
-      sticky += `\n<sub>Agents: ${agentsLine}</sub>`;
+      extras.push(`\n<sub>Agents: ${agentsLine}</sub>`);
       logInfo(`Per-agent usage: ${agentsLine}`);
     }
     if (skippedNoKey.length > 0) {
       const names = [...new Set(skippedNoKey.map((a) => a.agent))].map((a) => `\`${a}\``).join(", ");
-      sticky +=
+      extras.push(
         `\n\n> ⚠️ ${skippedNoKey.length} agent(s) skipped — no API key for their provider: ${names}. ` +
-        `Add the secret each provider's \`key_from\` names (see \`.github/openreview.yml\`).`;
+        `Add the secret each provider's \`key_from\` names (see \`.github/openreview.yml\`).`
+      );
       logWarning(`${skippedNoKey.length} agent(s) skipped for a missing API key: ${names}`);
     }
     if (allErrors.length > 0) {
@@ -601,16 +606,11 @@ export async function run(): Promise<void> {
         status === "error"
           ? "⚠️ All agents failed — no review completed"
           : `⚠️ ${allErrors.length} agent error(s)`;
-      sticky += `\n\n<details><summary>${scope} — details</summary>\n\n${allErrors.join("\n")}\n\nCheck model IDs and base URLs against the provider docs. Secrets are never logged.</details>`;
-    }
-    if (dryRun) {
-      logInfo(`DRY RUN verdict=${global} status=${status}\n${sticky.slice(0, 2000)}`);
-      return;
+      extras.push(`\n\n<details><summary>${scope} — details</summary>\n\n${allErrors.join("\n")}\n\nCheck model IDs and base URLs against the provider docs. Secrets are never logged.</details>`);
     }
     // Inline review runs BEFORE the single sticky publish so a dropped-count
     // note can ride along in the sticky (issue #53). Skipped entirely on dry
     // runs — like the sticky publish below, it must never touch the API.
-    let inlineDropped = 0;
     if (!dryRun && selectInlineFindings(perReview).length > 0) {
       try {
         // Commentable ranges from the full parsed diff (issue #53): a finding
@@ -623,21 +623,37 @@ export async function run(): Promise<void> {
         const res = await createInlineReview(
           octokit, owner, repo, prNumber, headSha, global, inline, validLines
         );
-        inlineDropped = res.dropped;
+        if (res.dropped > 0)
+          extras.push(`\n<sub>ℹ️ ${res.dropped} finding(s) could not be placed inline (invalid position or over the 20-comment cap).</sub>`);
         logInfo(`Published inline review (${global}): ${res.posted} posted, ${res.dropped} dropped.`);
       } catch (e) {
         logWarning(`Inline review failed (non-fatal): ${(e as Error).message}`);
       }
     }
-    if (inlineDropped > 0)
-      sticky += `\n<sub>ℹ️ ${inlineDropped} finding(s) could not be placed inline (invalid position or over the 20-comment cap).</sub>`;
+    const mode = config.global_verdict.sticky_comment_mode ?? "update";
     if (dryRun) {
-      logInfo(`DRY RUN verdict=${global} status=${status}\n${sticky.slice(0, 2000)}`);
+      const preview = mode === "append" ? "(append section preview)" : stickyBase + extras.join("");
+      logInfo(`DRY RUN verdict=${global} status=${status} mode=${mode}\n${preview.slice(0, 2000)}`);
       return;
     }
     if (config.global_verdict.sticky_comment) {
-      await upsertStickyComment(octokit, owner, repo, prNumber, sticky);
-      logInfo(`Published sticky comment (verdict ${global}, ${all.length} findings).`);
+      if (mode === "append") {
+        const section = renderAppendSection({
+          verdict: global,
+          status,
+          perReview: reviewRows,
+          agents: agentRows,
+          findings: all,
+          headSha,
+          runUrl,
+          extras,
+        });
+        const { rotated } = await appendStickySection(octokit, owner, repo, prNumber, section);
+        logInfo(`Appended sticky section (verdict ${global}, ${all.length} findings${rotated ? ", rotated" : ""}).`);
+      } else {
+        await upsertStickyComment(octokit, owner, repo, prNumber, stickyBase + extras.join(""));
+        logInfo(`Published sticky comment (verdict ${global}, ${all.length} findings).`);
+      }
     }
     if (global === "request_changes" && config.global_verdict.fail_check_on_request_changes)
       core.setFailed("OpenReview verdict: request_changes");

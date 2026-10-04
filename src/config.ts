@@ -130,6 +130,9 @@ export const OpenReviewConfig = z.object({
     .object({
       strategy: z.enum(["any_blocking", "max_severity", "majority"]).default("any_blocking"),
       sticky_comment: z.boolean().default(true),
+      // update: one mutable status slot (history replaced). append: each run
+      // adds a headed section to the same comment (history kept, see #69).
+      sticky_comment_mode: z.enum(["update", "append"]).default("update"),
       fail_check_on_request_changes: z.boolean().default(false),
     })
     .default({}),
