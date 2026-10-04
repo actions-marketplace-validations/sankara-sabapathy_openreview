@@ -206,6 +206,22 @@ export function renderAppendSection(
 /** GitHub hard-caps comments at 65536 chars; rotate well before hitting it. */
 export const STICKY_LIMIT = 60000;
 
+/** GitHub's hard comment cap. */
+export const GITHUB_COMMENT_LIMIT = 65536;
+
+/**
+ * Mark a rotated comment as superseded (issue #69). Drops the marker so
+ * future lookups select the NEW comment — keeping it re-selected the old one
+ * on every run, rotating forever (dogfood on #75). Caps at the GitHub limit
+ * so the marking edit itself can never 422 (dogfood on #75).
+ */
+export function markSuperseded(body: string): string {
+  const mark = `\n\n> _History rotated — continued in the newest sticky comment._`;
+  const unmarked = body.replace(STICKY_MARKER + "\n", "");
+  const full = unmarked + mark;
+  return full.length > GITHUB_COMMENT_LIMIT ? full.slice(0, GITHUB_COMMENT_LIMIT - mark.length) + mark : full;
+}
+
 /**
  * Pure append: existing body + section, trailing re-review line kept last.
  * Reports rotation when the result would pass STICKY_LIMIT — the caller then
@@ -292,8 +308,7 @@ export async function appendStickySection(
     owner, repo, issue_number: issueNumber, body: freshAppendBody(section),
   });
   await octokit.rest.issues.updateComment({
-    owner, repo, comment_id: prev.id,
-    body: `${prev.body}\n\n> _History rotated — continued in the newest sticky comment._`,
+    owner, repo, comment_id: prev.id, body: markSuperseded(prev.body),
   });
   return { rotated: true };
 }

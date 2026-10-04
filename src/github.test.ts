@@ -319,3 +319,42 @@ describe("append mode (issue #69)", () => {
     assert.match(calls.updated.body, /rotated/);
   });
 });
+
+describe("rotation bookkeeping (dogfood on #75)", () => {
+  it("markSuperseded drops the marker and keeps the note", async () => {
+    const { markSuperseded, GITHUB_COMMENT_LIMIT } = await import("./github.js");
+    const body = markSuperseded(`${STICKY_MARKER}\nold content`);
+    assert.ok(!body.includes(STICKY_MARKER), "marker must go or lookup reselects this comment");
+    assert.match(body, /rotated/);
+    assert.match(body, /old content/);
+    const huge = markSuperseded(`${STICKY_MARKER}\n` + "z".repeat(GITHUB_COMMENT_LIMIT));
+    assert.ok(huge.length <= GITHUB_COMMENT_LIMIT);
+    assert.match(huge, /rotated/);
+  });
+
+  it("a rotated comment is never reselected", async () => {
+    const { markSuperseded } = await import("./github.js");
+    const calls: any = {};
+    const octokit = {
+      paginate: async () => calls.comments,
+      rest: {
+        issues: {
+          listComments: () => {},
+          updateComment: async (p: any) => { calls.updated = p; },
+          createComment: async (p: any) => { calls.created = p; },
+        },
+      },
+    } as any;
+    calls.comments = [{ id: 4, user: { type: "Bot" }, body: `${STICKY_MARKER}\n` + "y".repeat(STICKY_LIMIT) }];
+    await appendStickySection(octokit, "o", "r", 7, "### `c` — COMMENT");
+    assert.ok(!calls.updated.body.includes(STICKY_MARKER));
+    // Next run's lookup over [old, new] must select the new comment.
+    const { findStickyComment } = await import("./github.js");
+    calls.comments = [
+      { id: 4, user: { type: "Bot" }, body: calls.updated.body },
+      { id: 5, user: { type: "Bot" }, body: calls.created.body },
+    ];
+    const found = await findStickyComment(octokit, "o", "r", 7);
+    assert.equal(found?.id, 5);
+  });
+});
