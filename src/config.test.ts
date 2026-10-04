@@ -18,7 +18,11 @@ import {
 // Comments are stripped first, so a key mentioned only in prose fails.
 // Dynamic maps (provider names, models entries) have user-defined keys and
 // are not schema keys — only the map field itself (`providers`, `models`) is
-// checked. Runs in-repo only (needs ../../src next to dist-src).
+// checked. Runs in-repo only (needs ../src next to dist-src).
+//
+// Heuristic, stated plainly: lexical presence is not proof of a read. What
+// it guarantees is weaker but still useful — no key can rot unnoticed;
+// a flagged key gets human triage, not auto-deletion.
 function fixedKeys(schema: any, out = new Set<string>(), seen = new Set<any>()): Set<string> {
   if (!schema || seen.has(schema)) return out;
   seen.add(schema);
@@ -37,18 +41,33 @@ function fixedKeys(schema: any, out = new Set<string>(), seen = new Set<any>()):
 }
 
 describe("config surface (issue #57)", () => {
-  it("every schema field is read outside config.ts", () => {
+  it("every schema field is read outside config.ts", (t) => {
     const here = dirname(fileURLToPath(import.meta.url));
-    const src = join(here, "../../src");
-    if (!existsSync(src)) return; // tests running outside a checkout
-    const code = readdirSync(src)
-      .filter((f) => f.endsWith(".ts") && !f.endsWith(".test.ts") && f !== "config.ts")
+    const src = join(here, "../src");
+    // Explicit skip, never a silent pass: outside a checkout there is nothing
+    // to guard (dogfood on #80 caught a wrong relative path hiding here).
+    if (!existsSync(src)) {
+      t.skip("no src/ next to the built tests — nothing to guard");
+      return;
+    }
+    const files: string[] = [];
+    const walk = (dir: string) => {
+      for (const e of readdirSync(dir, { withFileTypes: true })) {
+        const full = join(dir, e.name);
+        if (e.isDirectory()) walk(full);
+        else if (e.name.endsWith(".ts") && !e.name.endsWith(".test.ts") && e.name !== "config.ts")
+          files.push(full);
+      }
+    };
+    walk(src);
+    const code = files
       .map((f) =>
-        readFileSync(join(src, f), "utf8")
+        readFileSync(f, "utf8")
           .replace(/\/\*[\s\S]*?\*\//g, "")
           .replace(/(^|\s)\/\/.*$/gm, "$1")
       )
       .join("\n");
+    assert.ok(files.length > 5, `expected a real tree, found ${files.length} files`);
     const keys = fixedKeys(OpenReviewConfig);
     for (const s of [ProviderConfig, ReviewConfig, VerdictConfig, AgentConfig, AuthConfig])
       fixedKeys(s, keys);
