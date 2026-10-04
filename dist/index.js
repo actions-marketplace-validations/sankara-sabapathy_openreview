@@ -46865,7 +46865,7 @@ async function run() {
             }
         }
         if (inlineDropped > 0)
-            sticky += `\n<sub>ℹ️ ${inlineDropped} finding(s) could not be placed inline (invalid position or over the 20-comment cap) — see table above.</sub>`;
+            sticky += `\n<sub>ℹ️ ${inlineDropped} finding(s) could not be placed inline (invalid position or over the 20-comment cap).</sub>`;
         if (dryRun) {
             logInfo(`DRY RUN verdict=${global} status=${status}\n${sticky.slice(0, 2000)}`);
             return;
