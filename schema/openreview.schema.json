@@ -96,6 +96,7 @@
       "properties": {
         "strategy": { "enum": ["any_blocking", "max_severity", "majority"] },
         "sticky_comment": { "type": "boolean" },
+        "sticky_comment_mode": { "enum": ["update", "append"] },
         "fail_check_on_request_changes": { "type": "boolean" }
       }
     }

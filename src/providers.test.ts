@@ -564,3 +564,21 @@ describe("usage accounting (issue #52)", () => {
     assert.equal(err.usageTotal, null);
   });
 });
+
+describe("sticky_comment_mode default (issue #69)", () => {
+  it("defaults to update, preserving current behavior", () => {
+    const cfg = parseConfig({
+      version: 1,
+      providers: { oai: { model: "m", kind: "openai" } },
+      reviews: [{ id: "r", main: { provider: "oai", instructions: "i" } }],
+    });
+    assert.equal(cfg.global_verdict.sticky_comment_mode, "update");
+    const cfg2 = parseConfig({
+      version: 1,
+      providers: { oai: { model: "m", kind: "openai" } },
+      reviews: [{ id: "r", main: { provider: "oai", instructions: "i" } }],
+      global_verdict: { strategy: "any_blocking", sticky_comment_mode: "append" },
+    });
+    assert.equal(cfg2.global_verdict.sticky_comment_mode, "append");
+  });
+});

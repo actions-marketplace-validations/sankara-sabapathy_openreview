@@ -115,6 +115,7 @@ one pipeline, no divergence between what's posted and what's decided.
 global_verdict: # merges per-review verdicts
   strategy: any_blocking # any_blocking | max_severity | majority
   sticky_comment: true
+  # sticky_comment_mode: update # update (default): sticky always shows the latest run | append: every run adds a headed section, history kept in one comment (rotates past ~60KB)
   fail_check_on_request_changes: false # fail CI when verdict is request_changes?
 ```
 
