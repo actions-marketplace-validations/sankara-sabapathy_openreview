@@ -64,6 +64,7 @@
             "additionalProperties": {
               "type": "object",
               "properties": {
+                "kind": { "enum": ["anthropic", "openai", "opencode", "openai-compatible"] },
                 "model": { "type": "string" },
                 "protocol": { "enum": ["openai-chat", "anthropic-messages"] },
                 "base_url": { "type": "string" },
