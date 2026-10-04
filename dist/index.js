@@ -45998,6 +45998,15 @@ async function upsertStickyComment(octokit, owner, repo, issueNumber, body) {
  * First run creates a marker+logo+section body; later runs append sections.
  * Past STICKY_LIMIT a fresh comment starts and the old one is marked
  * superseded, so there is always one canonical comment.
+ *
+ * Two accepted residuals (dogfood on #75), both loud, neither silent:
+ * - Concurrent runs race read-modify-write (the REST API offers no
+ *   compare-and-swap, and update mode has always shared this): the loser’s
+ *   section is missing from history, but its findings remain in that run’s
+ *   inline review and logs. No retry can close it — only narrow it.
+ * - A single section is assumed under STICKY_LIMIT: renderer caps (50
+ *   findings rows, 10 file notes, 12 agents) bound it to ~16KB worst case,
+ *   4x headroom. If caps ever grow past the limit, creation 422s loudly.
  */
 async function appendStickySection(octokit, owner, repo, issueNumber, section) {
     const prev = await findStickyComment(octokit, owner, repo, issueNumber);
