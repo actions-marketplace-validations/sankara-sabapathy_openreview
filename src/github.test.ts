@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { renderStickyBody, STICKY_MARKER } from "./github.js";
+import { renderStickyBody, upsertStickyComment, createInlineReview, STICKY_MARKER } from "./github.js";
 import { countsAsReview, type AgentOutcome } from "./providers.js";
 
 const base = { findings: [], runUrl: "https://example.test/run/1" };
@@ -111,5 +111,93 @@ describe("countsAsReview", () => {
   const nonVoting: AgentOutcome[] = ["skipped-no-key", "budget-exhausted", "unparseable", "error"];
     for (const o of voting) assert.equal(countsAsReview(o), true, `${o} should vote`);
     for (const o of nonVoting) assert.equal(countsAsReview(o), false, `${o} must not vote`);
+  });
+});
+describe("upsertStickyComment (issue #53)", () => {
+  const sticky = `${STICKY_MARKER}\nbody`;
+  const mock = (comments: any[], calls: any) => ({
+    paginate: async () => comments,
+    rest: {
+      issues: {
+        listComments: () => {},
+        updateComment: async (p: any) => { calls.updated = p; },
+        createComment: async (p: any) => { calls.created = p; },
+      },
+      pulls: { createReview: async () => {} },
+    },
+  }) as any;
+
+  it("updates the bot's first-line-marker comment", async () => {
+    const calls: any = {};
+    await upsertStickyComment(
+      mock([{ id: 1, user: { type: "Bot" }, body: sticky }], calls),
+      "o", "r", 7, sticky
+    );
+    assert.equal(calls.updated.comment_id, 1);
+    assert.equal(calls.created, undefined);
+  });
+
+  it("ignores a marker buried mid-body and a non-bot marker", async () => {
+    const calls: any = {};
+    await upsertStickyComment(
+      mock(
+        [
+          { id: 1, user: { type: "User" }, body: `${STICKY_MARKER}\nspoof` },
+          { id: 2, user: { type: "Bot" }, body: `hello ${STICKY_MARKER} bye` },
+        ],
+        calls
+      ),
+      "o", "r", 7, sticky
+    );
+    assert.equal(calls.updated, undefined);
+    assert.ok(calls.created, "must create, not hijack");
+  });
+
+  it("finds the sticky past the first page via pagination", async () => {
+    const calls: any = {};
+    const many = Array.from({ length: 150 }, (_, i) => ({
+      id: 100 + i, user: { type: "User" }, body: `comment ${i}`,
+    }));
+    many.push({ id: 999, user: { type: "Bot" }, body: sticky });
+    await upsertStickyComment(mock(many, calls), "o", "r", 7, sticky);
+    assert.equal(calls.updated.comment_id, 999);
+  });
+});
+
+describe("createInlineReview (issue #53)", () => {
+  const ranges = new Map([
+    ["src/a.ts", [{ start: 10, end: 14 }]],
+    ["src/b.ts", [{ start: 1, end: 3 }]],
+  ]);
+  const mock = (calls: any) => ({
+    rest: { pulls: { createReview: async (p: any) => { calls.review = p; } } },
+  }) as any;
+
+  it("a bogus path/line never drops the good findings", async () => {
+    const calls: any = {};
+    const res = await createInlineReview(
+      mock(calls), "o", "r", 1, "sha", "comment",
+      [
+        { file: "src/a.ts", line: 12, comment: "good" },
+        { file: "nope.ts", line: 5, comment: "bogus path" },
+        { file: "src/a.ts", line: 999, comment: "bogus line" },
+      ],
+      ranges
+    );
+    assert.deepEqual(res, { posted: 1, dropped: 2 });
+    assert.equal(calls.review.comments.length, 1);
+    assert.equal(calls.review.comments[0].path, "src/a.ts");
+  });
+
+  it("line-less findings ride in the body instead of vanishing", async () => {
+    const calls: any = {};
+    const res = await createInlineReview(
+      mock(calls), "o", "r", 1, "sha", "comment",
+      [{ file: "src/a.ts", comment: "file-level note" }],
+      ranges
+    );
+    assert.deepEqual(res, { posted: 0, dropped: 0 });
+    assert.match(calls.review.body, /File-level notes/);
+    assert.match(calls.review.body, /src\/a\.ts/);
   });
 });

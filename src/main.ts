@@ -16,7 +16,7 @@ import {
 } from "./providers.js";
 import {
   matchesAny, filterIgnored, dedupeFindings, decideReviewVerdict, combineVerdicts, combineBallots,
-  applyDegradedFloor, resolveNoise, applyNoiseControls, splitDiff, scopeDiff, type Verdict,
+  applyDegradedFloor, resolveNoise, applyNoiseControls, splitDiff, scopeDiff, parseHunkRanges, type Verdict,
   satisfiesActionVersion, runningActionVersion,
 } from "./reviewer.js";
 import { renderStickyBody, upsertStickyComment, createInlineReview, type RunStatus } from "./github.js";
@@ -172,6 +172,14 @@ export function summarizeUsage(records: AgentSpend[]): { modelsLine: string; age
   return { modelsLine, agentsLine };
 }
 
+/** Findings eligible for inline comments: only reviews that did not opt out
+ * via verdict.post_inline (issue #53). Pure helper, unit-tested. */
+export function selectInlineFindings(
+  reviews: { postInline: boolean; findings: Finding[] }[]
+): Finding[] {
+  return reviews.filter((r) => r.postInline).flatMap((r) => r.findings);
+}
+
 /** Run thunks with at most `limit` in flight, preserving result order.
  * Takes thunks, NOT promises: an already-started promise is in flight before
  * the pool can see it, so passing promises caps nothing. */
@@ -292,6 +300,8 @@ export async function run(): Promise<void> {
       errors: string[];
       /** Agents that actually reviewed (issue #46: only these may vote). */
       counted: boolean;
+      /** verdict.post_inline honored per review (issue #53). */
+      postInline: boolean;
       agents: AgentRun[];
       usage: AgentSpend[];
     }[] = [];
@@ -463,6 +473,9 @@ export async function run(): Promise<void> {
         findings,
         errors: agentErrors,
         counted: counted > 0,
+        // verdict.post_inline finally honored (issue #53): a review that opts
+        // out contributes no inline comments, only sticky rows.
+        postInline: review.verdict.post_inline !== false,
         agents: results.map((r) => ({
           agent: r.agent,
           providerName: r.providerName,
@@ -595,14 +608,38 @@ export async function run(): Promise<void> {
       await upsertStickyComment(octokit, owner, repo, prNumber, sticky);
       logInfo(`Published sticky comment (verdict ${global}, ${all.length} findings).`);
     }
-    const wantInline = perReview.some((r) => r.findings.length > 0);
-    if (wantInline) {
+    // Inline review runs BEFORE the sticky publish so a dropped-count note can
+    // ride along in the sticky (issue #53).
+    let inlineDropped = 0;
+    let inlinePosted = false;
+    if (selectInlineFindings(perReview).length > 0) {
       try {
-        await createInlineReview(octokit, owner, repo, prNumber, headSha, global, all);
-        logInfo(`Published inline review (${global}).`);
+        // Commentable ranges from the full parsed diff (issue #53): a finding
+        // with a bogus path/line is dropped before posting so one bad position
+        // can never 422 the whole batch.
+        const validLines = new Map(
+          parsedDiff.map((p) => [p.file, parseHunkRanges(p.patch)] as const)
+        );
+        const inline = selectInlineFindings(perReview);
+        const res = await createInlineReview(
+          octokit, owner, repo, prNumber, headSha, global, inline, validLines
+        );
+        inlinePosted = true;
+        inlineDropped = res.dropped;
+        logInfo(`Published inline review (${global}): ${res.posted} posted, ${res.dropped} dropped.`);
       } catch (e) {
         logWarning(`Inline review failed (non-fatal): ${(e as Error).message}`);
       }
+    }
+    if (inlineDropped > 0)
+      sticky += `\n<sub>ℹ️ ${inlineDropped} finding(s) could not be placed inline (stale path or line) — see table above.</sub>`;
+    if (dryRun) {
+      logInfo(`DRY RUN verdict=${global} status=${status}\n${sticky.slice(0, 2000)}`);
+      return;
+    }
+    if (config.global_verdict.sticky_comment) {
+      await upsertStickyComment(octokit, owner, repo, prNumber, sticky);
+      logInfo(`Published sticky comment (verdict ${global}, ${all.length} findings).`);
     }
     if (global === "request_changes" && config.global_verdict.fail_check_on_request_changes)
       core.setFailed("OpenReview verdict: request_changes");

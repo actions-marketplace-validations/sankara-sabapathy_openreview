@@ -1,4 +1,5 @@
 import * as github from "@actions/github";
+import { lineInRanges } from "./reviewer.js";
 
 export const STICKY_MARKER = "<!-- openreview:sticky -->";
 
@@ -143,16 +144,26 @@ export async function upsertStickyComment(
   issueNumber: number,
   body: string
 ): Promise<void> {
-  const { data: comments } = await octokit.rest.issues.listComments({
+  // Paginate everything: on a busy PR the sticky may sit past comment 100,
+  // and stopping at the first page posted duplicate stickies (issue #53).
+  const comments = await octokit.paginate(octokit.rest.issues.listComments, {
     owner, repo, issue_number: issueNumber, per_page: 100,
   });
-  const prev = comments.find((c) => c.body?.includes(STICKY_MARKER));
+  // The marker must be the FIRST line and the comment bot-authored. Matching
+  // `includes` anywhere let any user hijack the sticky: their comment got
+  // picked and the update 403d, failing the whole run (issue #53).
+  const prev = comments.find(
+    (c) => c.user?.type === "Bot" && typeof c.body === "string" && c.body.startsWith(STICKY_MARKER)
+  );
   if (prev) {
     await octokit.rest.issues.updateComment({ owner, repo, comment_id: prev.id, body });
   } else {
     await octokit.rest.issues.createComment({ owner, repo, issue_number: issueNumber, body });
   }
 }
+
+/** Result of posting an inline review: posted vs dropped counts. */
+export type InlineResult = { posted: number; dropped: number };
 
 export async function createInlineReview(
   octokit: ReturnType<typeof github.getOctokit>,
@@ -161,16 +172,45 @@ export async function createInlineReview(
   pullNumber: number,
   commitSha: string,
   verdict: "approve" | "comment" | "request_changes",
-  findings: { file: string; line?: number; comment: string }[]
-): Promise<void> {
+  findings: { file: string; line?: number; comment: string }[],
+  /** Commentable line ranges per changed file (new-file coordinates). */
+  validLines: Map<string, { start: number; end: number }[]>
+): Promise<InlineResult> {
   const event = verdict === "approve" ? "APPROVE" : verdict === "request_changes" ? "REQUEST_CHANGES" : "COMMENT";
-  const comments = findings
-    .filter((f) => f.line && f.line > 0)
-    .slice(0, 20)
-    .map((f) => ({ path: f.file, line: f.line as number, body: f.comment }));
+  // Validate BEFORE posting (issue #53): `file`/`line` are unvalidated model
+  // output, and one bad position 422s the entire batch — 19 good findings
+  // lost with it. Invalid entries never reach the API; the caller reports
+  // the dropped count on the sticky instead of failing silently.
+  let dropped = 0;
+  const comments = [];
+  const fileLevel: { file: string; comment: string }[] = [];
+  for (const f of findings) {
+    if (!f.line || f.line <= 0) {
+      fileLevel.push({ file: f.file, comment: f.comment });
+      continue;
+    }
+    const ranges = validLines.get(f.file);
+    if (!ranges || !lineInRanges(f.line, ranges)) {
+      dropped++;
+      continue;
+    }
+    comments.push({ path: f.file, line: f.line as number, body: f.comment });
+    if (comments.length >= 20) break;
+  }
+  // File-level (line-less) findings used to be silently discarded by the
+  // `.filter(line > 0)`; they now ride in the review body (issue #53).
+  let body =
+    `<img src="${logoUrl()}" width="20" height="20" alt="OpenReview AI" /> **OpenReview AI:** ${verdict} (${findings.length} findings)`;
+  if (fileLevel.length > 0) {
+    const shown = fileLevel.slice(0, 10);
+    body += "\n\n**File-level notes:**\n" + shown.map((f) => `- \`${f.file}\`: ${f.comment}`).join("\n");
+    if (fileLevel.length > shown.length)
+      body += `\n… and ${fileLevel.length - shown.length} more (see sticky comment).`;
+  }
   await octokit.rest.pulls.createReview({
     owner, repo, pull_number: pullNumber, commit_id: commitSha, event: event as any,
-    body: `<img src="${logoUrl()}" width="20" height="20" alt="OpenReview AI" /> **OpenReview AI:** ${verdict} (${findings.length} findings)`,
-    comments: comments as any,
+    body,
+    comments: comments.slice(0, 20) as any,
   });
+  return { posted: comments.length, dropped };
 }
