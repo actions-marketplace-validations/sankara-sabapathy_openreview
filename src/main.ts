@@ -87,6 +87,12 @@ export async function getPrDiff(
   pr: number,
   payloadHeadSha?: string
 ): Promise<PrDiff> {
+  // Baseline head BEFORE listing: the payload's when available, else one
+  // pulls.get up front. The issue_comment path carries no payload sha, so
+  // without this its mid-pagination pushes are undetectable (dogfood on #78).
+  const baseline =
+    payloadHeadSha ??
+    (await octokit.rest.pulls.get({ owner, repo, pull_number: pr })).data.head.sha;
   const files = await octokit.paginate(octokit.rest.pulls.listFiles, {
     owner, repo, pull_number: pr, per_page: 100,
   });
@@ -109,16 +115,16 @@ export async function getPrDiff(
       `${omitted.length} file(s) have no renderable patch (binary or too large) and were not sent to reviewers: ${omitted.slice(0, 10).join(", ")}${omitted.length > 10 ? ", …" : ""}`
     );
   // Revalidate the head AFTER listing (issue #71): a `synchronize` push
-  // landing mid-pagination leaves the file list and the payload sha from
-  // different heads. One pulls.get per run is worth it — on mismatch we warn
+  // landing mid-pagination leaves the file list and the baseline sha from
+  // different heads. pulls.get calls are worth it — on mismatch we warn
   // loudly and anchor to the fresh sha (inline positions are revalidated
   // before posting, so worst case is a lost inline post, never a wrong review).
   const { data: pull } = await octokit.rest.pulls.get({ owner, repo, pull_number: pr });
   const freshSha = pull.head.sha;
-  const stale = !!payloadHeadSha && payloadHeadSha !== freshSha;
+  const stale = baseline !== freshSha;
   if (stale)
     logWarning(
-      `PR head moved during diff fetch (${payloadHeadSha.slice(0, 7)} -> ${freshSha.slice(0, 7)}); ` +
+      `PR head moved during diff fetch (${baseline.slice(0, 7)} -> ${freshSha.slice(0, 7)}); ` +
         `file list may mix both heads, inline positions revalidated before posting.`
     );
   return { fileNames: names, diff: parts.join("\n\n"), headSha: freshSha, omitted, truncated, totalFiles: files.length, stale };

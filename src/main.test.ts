@@ -98,22 +98,49 @@ describe("getPrDiff (issue #50)", () => {
 
   it("revalidates the head after listing and reports a mid-fetch move", async () => {
     const listing = [{ filename: "a.ts", patch: "@@ -1 +1 @@\n+x" }];
-    const mk = (sha: string) => ({
-      paginate: async () => listing,
-      rest: {
-        pulls: {
-          listFiles: () => {},
-          get: async () => ({ data: { head: { sha } } }),
+    const mk = (shas: string[]) => {
+      let n = 0;
+      return {
+        paginate: async () => listing,
+        rest: {
+          pulls: {
+            listFiles: () => {},
+            get: async () => ({ data: { head: { sha: shas[Math.min(n++, shas.length - 1)] } } }),
+          },
         },
-      },
-    }) as any;
+      } as any;
+    };
     // Head steady: fresh sha used, not stale.
-    const steady = await getPrDiff(mk("same-sha"), "o", "r", 1, "same-sha");
+    const steady = await getPrDiff(mk(["same-sha"]), "o", "r", 1, "same-sha");
     assert.equal(steady.headSha, "same-sha");
     assert.equal(steady.stale, false);
     // Push landed mid-fetch: anchor to the fresh sha and say so.
-    const moved = await getPrDiff(mk("new-sha"), "o", "r", 1, "old-sha");
+    const moved = await getPrDiff(mk(["new-sha"]), "o", "r", 1, "old-sha");
     assert.equal(moved.headSha, "new-sha");
+    assert.equal(moved.stale, true);
+  });
+
+  it("covers the issue_comment path: baseline fetched up front (dogfood on #78)", async () => {
+    const listing = [{ filename: "a.ts", patch: "@@ -1 +1 @@\n+x" }];
+    const mk = (shas: string[]) => {
+      let n = 0;
+      return {
+        paginate: async () => listing,
+        rest: {
+          pulls: {
+            listFiles: () => {},
+            get: async () => ({ data: { head: { sha: shas[Math.min(n++, shas.length - 1)] } } }),
+          },
+        },
+      } as any;
+    };
+    // No payload sha: steady across both calls, not stale.
+    const steady = await getPrDiff(mk(["s", "s"]), "o", "r", 1, undefined);
+    assert.equal(steady.headSha, "s");
+    assert.equal(steady.stale, false);
+    // Push between the two calls: detected.
+    const moved = await getPrDiff(mk(["old", "new"]), "o", "r", 1, undefined);
+    assert.equal(moved.headSha, "new");
     assert.equal(moved.stale, true);
   });
 });
