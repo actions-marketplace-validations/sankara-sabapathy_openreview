@@ -79,7 +79,7 @@ export const AgentConfig = z.object({
   name: z.string().optional(),
   provider: z.string(),
   instructions: z.string(),
-  max_files: z.number().int().positive().optional(),
+  // NOTE: no max_files (issue #57 removed the reserved-but-unused key).
 });
 export type AgentConfig = z.infer<typeof AgentConfig>;
 
@@ -123,9 +123,10 @@ export const OpenReviewConfig = z.object({
   extends: z.array(z.string()).default([]),
   defaults: z
     .object({
-      on: z.array(z.string()).default(["opened", "synchronize", "ready_for_review"]),
+      // NOTE: event triggers (`on:`) and draft-PR handling live in the
+      // WORKFLOW file, not here — the action observes events, never subscribes
+      // (issue #57 removed the dead `on`/`draft` keys outright).
       command: z.string().default("/review"),
-      draft: z.boolean().default(false),
       lang: z.string().default("en"),
       ignore: z.array(z.string()).default([]),
       max_diff_chars: z.number().int().positive().default(80000),

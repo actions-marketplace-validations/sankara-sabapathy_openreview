@@ -16,9 +16,9 @@ requires_action: ">=0.3.0"
 # extends: [github:acme-corp/review-standards/backend@sha:abc123...]
 
 defaults:
-  on: [opened, synchronize, ready_for_review]
+  # Event triggers live in the WORKFLOW (.github/workflows/ai-review.yml),
+  # not here.
   command: "/review"
-  draft: false
   lang: en
   ignore: ["**.lock", "dist/**", "website/build/**"]
   max_diff_chars: 80000
@@ -139,7 +139,6 @@ reviews:
       # name: defaults to "<review-id>:main"
       provider: opencode
       instructions: "Synthesize findings. Strict on bugs, lenient on style."
-      # max_files: 50 # reserved; currently unused
     subagents:
       - name: correctness
         provider: opencode

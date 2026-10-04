@@ -9,10 +9,10 @@ version: 1 # schema version (required). Additive-only in v1.x.
 # requires_action: ">=0.3.0" # optional floor for the action release; the workflow uses: ref selects it.
 
 defaults:
-  on: [opened, synchronize, ready_for_review]
+  # NOTE: event triggers live in the WORKFLOW (`on: pull_request: types:`),
+  # not here — the action can only observe the event, never subscribe.
   command: "/review" # issue-comment trigger: must match EXACTLY (trimmed), and only an
                      # author_association in allowed-author-associations may send it
-  draft: false       # review draft PRs?
   lang: en
   ignore: ["**.lock", "dist/**"] # path globs skipped everywhere
   max_diff_chars: 80000          # diff truncation budget per agent
