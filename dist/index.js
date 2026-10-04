@@ -46221,11 +46221,16 @@ function buildContextBlock(input, repoIndex) {
     let extraCount = 0;
     let callerCount = 0;
     const warnings = [];
-    // 1. Full content of changed in-scope files.
+    // 1. Full content of changed in-scope files. A shared index built for
+    // another root must not serve its cache here (both are exported): verify
+    // first, fall back to direct reads on mismatch (dogfood on #74).
+    const indexUsable = !!repoIndex && external_node_path_namespaceObject.resolve(repoIndex.root) === external_node_path_namespaceObject.resolve(input.repoRoot);
+    if (repoIndex && !indexUsable)
+        logWarning("context: shared index root mismatch, rebuilt privately");
     const changedContents = new Map();
     if (input.includeFullFiles) {
         for (const f of input.scopedFiles) {
-            const content = readCached(repoIndex, input.repoRoot, f, 12000);
+            const content = readCached(indexUsable ? repoIndex : undefined, input.repoRoot, f, 12000);
             if (content === null)
                 continue;
             changedContents.set(f, content);
@@ -46239,7 +46244,7 @@ function buildContextBlock(input, repoIndex) {
     }
     else {
         for (const f of input.scopedFiles) {
-            const content = readCached(repoIndex, input.repoRoot, f, 12000);
+            const content = readCached(indexUsable ? repoIndex : undefined, input.repoRoot, f, 12000);
             if (content !== null)
                 changedContents.set(f, content);
         }
@@ -46253,7 +46258,7 @@ function buildContextBlock(input, repoIndex) {
     // The caller's own `ignore` always applies on top of the walk-time one, so
     // a shared index never smuggles ignored files into a review (dogfood #74).
     const needWalk = input.contextFiles.length > 0 || definedNames.length > 0;
-    const index = repoIndex ?? (needWalk ? buildRepoIndex(input.repoRoot, input.ignore) : undefined);
+    const index = indexUsable ? repoIndex : needWalk ? buildRepoIndex(input.repoRoot, input.ignore) : undefined;
     // Seed a privately built index with the step-1 reads so later steps hit
     // cache instead of re-reading the same files within this call.
     if (index && index !== repoIndex) {
@@ -46317,16 +46322,17 @@ function buildContextBlock(input, repoIndex) {
             for (const other of candidates) {
                 if (emitted.has(other))
                     continue;
-                if (scannedBytes >= MAX_CALLER_SCAN_BYTES)
+                const remaining = MAX_CALLER_SCAN_BYTES - scannedBytes;
+                if (remaining <= 0)
                     break;
-                const otherContent = readCached(index, input.repoRoot, other, 60000) ?? "";
-                // True UTF-8 bytes, minus the truncation suffix: `.length` counts
-                // UTF-16 units, so multibyte sources would undercount a byte budget
-                // by up to ~3x (dogfood on #74). One native pass, next to the regex
-                // passes that already cost far more.
-                scannedBytes += Buffer.byteLength(otherContent.endsWith("\n...[file truncated]")
-                    ? otherContent.slice(0, -"\n...[file truncated]".length)
-                    : otherContent, "utf8");
+                // Clamp the read to what is left AND truncate the scan to it: the
+                // cap alone is in chars, so a multibyte tail could otherwise overshoot
+                // the byte budget by up to a whole file (dogfood on #74). A cut
+                // multibyte char at the boundary is acceptable in best-effort excerpts.
+                const raw = readCached(index, input.repoRoot, other, Math.min(60000, remaining)) ?? "";
+                const buf = Buffer.from(raw, "utf8").subarray(0, remaining);
+                const otherContent = buf.toString("utf8");
+                scannedBytes += buf.length;
                 const hits = findCodeMatches(otherContent, word, 2);
                 if (hits.length > 0) {
                     const excerpt = excerptAround(otherContent, hits[0]);

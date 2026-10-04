@@ -374,3 +374,51 @@ describe("dogfood round 2 (issue #55)", () => {
     }
   });
 });
+
+describe("dogfood round 3 (issue #55)", () => {
+  it("scan never exceeds the byte budget, even for multibyte tails", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "or-idx-"));
+    try {
+      writeFileSync(path.join(dir, "a.ts"), "export function alpha() { return 1; }\n");
+      // 20 files x 60KB chars of CJK ≈ 180KB bytes each: 3.6MB total.
+      const big = ("const v = alpha(); // 汉\n" + "汉".repeat(20000) + "\n").repeat(3).slice(0, 60000);
+      for (let i = 0; i < 20; i++) writeFileSync(path.join(dir, `c${i}.ts`), big);
+      const r = buildContextBlock({
+        repoRoot: dir,
+        scopedFiles: ["a.ts"],
+        contextFiles: [],
+        includeFullFiles: true,
+        maxContextChars: 500000,
+        ignore: [],
+      });
+      const m = /scanned ~(\d+)KB\/(\d+)KB/.exec(r.stats);
+      assert.ok(m, `stats must report the scan: ${r.stats}`);
+      assert.ok(Number(m[1]) <= Number(m[2]), `scan ${m[1]}KB exceeded budget ${m[2]}KB`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("an index built for another root is not trusted", () => {
+    const dirA = mkdtempSync(path.join(tmpdir(), "or-idxA-"));
+    const dirB = mkdtempSync(path.join(tmpdir(), "or-idxB-"));
+    try {
+      writeFileSync(path.join(dirA, "a.ts"), "WRONG REPO CONTENT\n");
+      writeFileSync(path.join(dirB, "a.ts"), "export function alpha() { return 1; }\n");
+      const foreign = buildRepoIndex(dirA, []);
+      const r = buildContextBlock({
+        repoRoot: dirB,
+        scopedFiles: ["a.ts"],
+        contextFiles: [],
+        includeFullFiles: true,
+        maxContextChars: 20000,
+        ignore: [],
+      }, foreign);
+      assert.ok(!r.block.includes("WRONG REPO CONTENT"));
+      assert.match(r.block, /alpha/);
+    } finally {
+      rmSync(dirA, { recursive: true, force: true });
+      rmSync(dirB, { recursive: true, force: true });
+    }
+  });
+});
