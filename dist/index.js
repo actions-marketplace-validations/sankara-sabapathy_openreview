@@ -46329,6 +46329,12 @@ function buildContextBlock(input, repoIndex) {
                 // cap alone is in chars, so a multibyte tail could otherwise overshoot
                 // the byte budget by up to a whole file (dogfood on #74). A cut
                 // multibyte char at the boundary is acceptable in best-effort excerpts.
+                // Exact guarantee: SCANNED bytes never exceed the budget. Disk reads
+                // per file are bounded by `remaining` chars (≤60k): for multibyte
+                // sources that can be up to ~4x remaining in bytes, but only when the
+                // remainder itself is small — negligible in absolute terms, and the
+                // alternative (stat every candidate first) costs a syscall per file
+                // to save microseconds of reads.
                 const raw = readCached(index, input.repoRoot, other, Math.min(60000, remaining)) ?? "";
                 const buf = Buffer.from(raw, "utf8").subarray(0, remaining);
                 const otherContent = buf.toString("utf8");
