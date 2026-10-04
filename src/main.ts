@@ -116,9 +116,10 @@ export async function getPrDiff(
     );
   // Revalidate the head AFTER listing (issue #71): a `synchronize` push
   // landing mid-pagination leaves the file list and the baseline sha from
-  // different heads. pulls.get calls are worth it — on mismatch we warn
-  // loudly and anchor to the fresh sha (inline positions are revalidated
-  // before posting, so worst case is a lost inline post, never a wrong review).
+  // different heads. pulls.get calls are worth it — on mismatch this run
+  // aborts: the newer push always triggers a fresh review, so shipping a
+  // possibly-mixed analysis is pure downside. Fail-closed per #46: error
+  // outputs, nothing published, never a pass.
   const { data: pull } = await octokit.rest.pulls.get({ owner, repo, pull_number: pr });
   const freshSha = pull.head.sha;
   const stale = baseline !== freshSha;
@@ -292,6 +293,15 @@ export async function run(): Promise<void> {
     const { fileNames, diff, headSha, omitted, truncated, totalFiles, stale } = await getPrDiff(
       octokit, owner, repo, prNumber, (ctx.payload as any).pull_request?.head?.sha
     );
+    if (stale) {
+      // Head moved mid-fetch: the file list may mix two pushes. Abort — the
+      // newer push triggers its own run. Outputs mirror the no-review path
+      // below so consumers never read this as a pass (issue #46).
+      core.setOutput("verdict", "comment");
+      core.setOutput("review_status", "error");
+      logWarning("Head moved during diff fetch; aborting — a fresh review runs on the new head.");
+      return;
+    }
     logInfo(`Diff: ${fileNames.length} files, ${diff.length} chars (head ${headSha.slice(0, 7)})`);
     logDebug(`Diff files: ${fileNames.join(", ")}`);
     if (truncated)
@@ -610,14 +620,13 @@ export async function run(): Promise<void> {
     // Per-run footer extras: shared by update mode (appended to the sticky)
     // and append mode (inside the run's section) — issue #69.
     const extras: string[] = [];
-    if (truncated || omitted.length > 0 || stale) {
+    if (truncated || omitted.length > 0) {
       const bits: string[] = [];
       if (truncated) bits.push(`only the first ${MAX_DIFF_FILES} of ${totalFiles} changed files were reviewed`);
       if (omitted.length > 0)
         bits.push(
           `${omitted.length} file(s) not reviewable (binary or diff too large): ${omitted.slice(0, 8).map((f) => `\`${f}\``).join(", ")}${omitted.length > 8 ? ", …" : ""}`
         );
-      if (stale) bits.push(`head moved mid-fetch; inline positions revalidated`);
       extras.push(`\n\n> ⚠️ ${bits.join(". ")}.`);
     }
     if (modelsLine) {
