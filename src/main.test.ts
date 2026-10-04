@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { runPooled, getPrDiff, MAX_DIFF_FILES, summarizeUsage } from "./main.js";
+import { runPooled, getPrDiff, MAX_DIFF_FILES, summarizeUsage, selectInlineFindings } from "./main.js";
 
 describe("runPooled (issue #51)", () => {
   it("preserves result order regardless of completion order", async () => {
@@ -164,5 +164,19 @@ describe("summarizeUsage (issue #52)", () => {
     ]);
     assert.equal(modelsLine, "m 1.0k/500+ 50t/s");
     assert.ok(agentsLine.includes("b ?/?"));
+  });
+});
+
+describe("selectInlineFindings (issue #53)", () => {
+  const f = (file: string) => ({ file, comment: "x" }) as any;
+  it("excludes reviews that opted out via post_inline: false", () => {
+    const out = selectInlineFindings([
+      { postInline: true, findings: [f("a.ts")] },
+      { postInline: false, findings: [f("b.ts")] },
+    ]);
+    assert.deepEqual(out.map((x) => x.file), ["a.ts"]);
+  });
+  it("empty when everything opts out", () => {
+    assert.deepEqual(selectInlineFindings([{ postInline: false, findings: [f("a.ts")] }]), []);
   });
 });
