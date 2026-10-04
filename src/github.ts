@@ -152,6 +152,9 @@ export async function upsertStickyComment(
   // The marker must be the FIRST line and the comment bot-authored. Matching
   // `includes` anywhere let any user hijack the sticky: their comment got
   // picked and the update 403d, failing the whole run (issue #53).
+  // Residual: a *different* bot planting the exact first-line marker would
+  // still match — but that is overt sabotage with a loud 403, not silent
+  // corruption, and authorship cannot be proven further via REST (dogfood #73).
   const prev = comments.find(
     (c) => c.user?.type === "Bot" && typeof c.body === "string" && c.body.startsWith(STICKY_MARKER)
   );
@@ -184,6 +187,9 @@ export async function createInlineReview(
   let dropped = 0;
   const comments = [];
   const fileLevel: { file: string; comment: string }[] = [];
+  // No early exit at the 20-comment cap: the loop must still collect later
+  // file-level notes and count later drops, or the sticky understates what
+  // never made it inline (dogfood on #73).
   for (const f of findings) {
     if (!f.line || f.line <= 0) {
       fileLevel.push({ file: f.file, comment: f.comment });
@@ -194,8 +200,8 @@ export async function createInlineReview(
       dropped++;
       continue;
     }
-    comments.push({ path: f.file, line: f.line as number, body: f.comment });
-    if (comments.length >= 20) break;
+    if (comments.length < 20) comments.push({ path: f.file, line: f.line as number, body: f.comment });
+    else dropped++; // valid but over the cap — counted, not silently lost
   }
   // File-level (line-less) findings used to be silently discarded by the
   // `.filter(line > 0)`; they now ride in the review body (issue #53).

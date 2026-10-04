@@ -201,3 +201,22 @@ describe("createInlineReview (issue #53)", () => {
     assert.match(calls.review.body, /src\/a\.ts/);
   });
 });
+
+describe("createInlineReview cap handling (dogfood on #73)", () => {
+  const ranges = new Map([["src/a.ts", [{ start: 1, end: 100 }]]]);
+  const mock = (calls: any) => ({
+    rest: { pulls: { createReview: async (p: any) => { calls.review = p; } } },
+  }) as any;
+
+  it("scans past the 20-comment cap: later drops still counted, file notes kept", async () => {
+    const calls: any = {};
+    const findings: { file: string; line?: number; comment: string }[] = Array.from({ length: 22 }, (_, i) => ({ file: "src/a.ts", line: i + 1, comment: `c${i}` }));
+    findings.push({ file: "src/a.ts", comment: "late file-level note" });
+    findings.push({ file: "nope.ts", line: 1, comment: "late bogus" });
+    const res = await createInlineReview(mock(calls), "o", "r", 1, "sha", "comment", findings, ranges);
+    assert.equal(calls.review.comments.length, 20);
+    assert.equal(res.posted, 20);
+    assert.equal(res.dropped, 3); // 2 valid over cap + 1 bogus
+    assert.match(calls.review.body, /late file-level note/);
+  });
+});

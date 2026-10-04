@@ -609,10 +609,10 @@ export async function run(): Promise<void> {
       logInfo(`Published sticky comment (verdict ${global}, ${all.length} findings).`);
     }
     // Inline review runs BEFORE the sticky publish so a dropped-count note can
-    // ride along in the sticky (issue #53).
+    // ride along in the sticky (issue #53). Skipped entirely on dry runs —
+    // like the sticky publish below, it must never touch the API (dogfood #73).
     let inlineDropped = 0;
-    let inlinePosted = false;
-    if (selectInlineFindings(perReview).length > 0) {
+    if (!dryRun && selectInlineFindings(perReview).length > 0) {
       try {
         // Commentable ranges from the full parsed diff (issue #53): a finding
         // with a bogus path/line is dropped before posting so one bad position
@@ -624,7 +624,6 @@ export async function run(): Promise<void> {
         const res = await createInlineReview(
           octokit, owner, repo, prNumber, headSha, global, inline, validLines
         );
-        inlinePosted = true;
         inlineDropped = res.dropped;
         logInfo(`Published inline review (${global}): ${res.posted} posted, ${res.dropped} dropped.`);
       } catch (e) {
@@ -632,7 +631,7 @@ export async function run(): Promise<void> {
       }
     }
     if (inlineDropped > 0)
-      sticky += `\n<sub>ℹ️ ${inlineDropped} finding(s) could not be placed inline (stale path or line) — see table above.</sub>`;
+      sticky += `\n<sub>ℹ️ ${inlineDropped} finding(s) could not be placed inline (invalid position or over the 20-comment cap) — see table above.</sub>`;
     if (dryRun) {
       logInfo(`DRY RUN verdict=${global} status=${status}\n${sticky.slice(0, 2000)}`);
       return;

@@ -45908,6 +45908,9 @@ async function upsertStickyComment(octokit, owner, repo, issueNumber, body) {
     // The marker must be the FIRST line and the comment bot-authored. Matching
     // `includes` anywhere let any user hijack the sticky: their comment got
     // picked and the update 403d, failing the whole run (issue #53).
+    // Residual: a *different* bot planting the exact first-line marker would
+    // still match — but that is overt sabotage with a loud 403, not silent
+    // corruption, and authorship cannot be proven further via REST (dogfood #73).
     const prev = comments.find((c) => c.user?.type === "Bot" && typeof c.body === "string" && c.body.startsWith(STICKY_MARKER));
     if (prev) {
         await octokit.rest.issues.updateComment({ owner, repo, comment_id: prev.id, body });
@@ -45927,6 +45930,9 @@ validLines) {
     let dropped = 0;
     const comments = [];
     const fileLevel = [];
+    // No early exit at the 20-comment cap: the loop must still collect later
+    // file-level notes and count later drops, or the sticky understates what
+    // never made it inline (dogfood on #73).
     for (const f of findings) {
         if (!f.line || f.line <= 0) {
             fileLevel.push({ file: f.file, comment: f.comment });
@@ -45937,9 +45943,10 @@ validLines) {
             dropped++;
             continue;
         }
-        comments.push({ path: f.file, line: f.line, body: f.comment });
-        if (comments.length >= 20)
-            break;
+        if (comments.length < 20)
+            comments.push({ path: f.file, line: f.line, body: f.comment });
+        else
+            dropped++; // valid but over the cap — counted, not silently lost
     }
     // File-level (line-less) findings used to be silently discarded by the
     // `.filter(line > 0)`; they now ride in the review body (issue #53).
@@ -46837,10 +46844,10 @@ async function run() {
             logInfo(`Published sticky comment (verdict ${global}, ${all.length} findings).`);
         }
         // Inline review runs BEFORE the sticky publish so a dropped-count note can
-        // ride along in the sticky (issue #53).
+        // ride along in the sticky (issue #53). Skipped entirely on dry runs —
+        // like the sticky publish below, it must never touch the API (dogfood #73).
         let inlineDropped = 0;
-        let inlinePosted = false;
-        if (selectInlineFindings(perReview).length > 0) {
+        if (!dryRun && selectInlineFindings(perReview).length > 0) {
             try {
                 // Commentable ranges from the full parsed diff (issue #53): a finding
                 // with a bogus path/line is dropped before posting so one bad position
@@ -46848,7 +46855,6 @@ async function run() {
                 const validLines = new Map(parsedDiff.map((p) => [p.file, parseHunkRanges(p.patch)]));
                 const inline = selectInlineFindings(perReview);
                 const res = await createInlineReview(octokit, owner, repo, prNumber, headSha, global, inline, validLines);
-                inlinePosted = true;
                 inlineDropped = res.dropped;
                 logInfo(`Published inline review (${global}): ${res.posted} posted, ${res.dropped} dropped.`);
             }
@@ -46857,7 +46863,7 @@ async function run() {
             }
         }
         if (inlineDropped > 0)
-            sticky += `\n<sub>ℹ️ ${inlineDropped} finding(s) could not be placed inline (stale path or line) — see table above.</sub>`;
+            sticky += `\n<sub>ℹ️ ${inlineDropped} finding(s) could not be placed inline (invalid position or over the 20-comment cap) — see table above.</sub>`;
         if (dryRun) {
             logInfo(`DRY RUN verdict=${global} status=${status}\n${sticky.slice(0, 2000)}`);
             return;
