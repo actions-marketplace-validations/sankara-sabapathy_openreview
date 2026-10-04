@@ -11,6 +11,8 @@ import {
   formatTokens,
   countsAsReview,
   AgentFailedError,
+  resolveDottedProvider,
+  assertProviderRefs,
   type Finding,
   type AgentOutcome,
 } from "./providers.js";
@@ -221,6 +223,10 @@ export async function run(): Promise<void> {
 
     const { config, path } = await loadConfig(configPath);
     logInfo(`Loaded config: ${path} (${config.reviews.length} reviews)`);
+    // Fail fast on dotted provider refs that resolve to nothing (issue #67):
+    // a typo'd `opencode.flah` errors here naming both halves, before any
+    // budget is spent. Legacy plain-unknown names keep warn-and-skip per agent.
+    assertProviderRefs(config);
     if (config.requires_action) {
       const running = runningActionVersion(process.env as any);
       if (running && !satisfiesActionVersion(config.requires_action, running)) {
@@ -347,6 +353,7 @@ export async function run(): Promise<void> {
         outcome: AgentOutcome;
         agent: string;
         providerName: string;
+        model: string;
       }>)[] = [];
       const agentDefs = [
         { ...review.main, name: review.main.name ?? `${review.id}:main` },
@@ -358,10 +365,15 @@ export async function run(): Promise<void> {
           .join(", ")}] on ${scopedFiles.length} file(s), strategy=${review.strategy}`
       );
       for (const a of agentDefs) {
-        const provider = config.providers[a.provider];
+        let provider = config.providers[a.provider];
         if (!provider) {
-          logWarning(`Review ${review.id}: unknown provider '${a.provider}', skipped agent ${a.name}.`);
-          continue;
+          if (a.provider.includes(".")) {
+            // Validated at load; throws naming both halves as a backstop.
+            provider = resolveDottedProvider(config.providers, a.provider).config;
+          } else {
+            logWarning(`Review ${review.id}: unknown provider '${a.provider}', skipped agent ${a.name}.`);
+            continue;
+          }
         }
         tasks.push(() =>
           runAgent({
@@ -387,6 +399,7 @@ export async function run(): Promise<void> {
               outcome: result.outcome,
               agent: a.name ?? "agent",
               providerName: a.provider,
+              model: provider.model,
             }))
             .catch((e) => {
               const msg = (e as Error).message;
@@ -409,6 +422,7 @@ export async function run(): Promise<void> {
                 outcome: "error" as const,
                 agent: a.name ?? "agent",
                 providerName: a.provider,
+                model: provider.model,
               };
             })
         );
@@ -450,6 +464,8 @@ export async function run(): Promise<void> {
         if (counted === 0) return "approve" as Verdict; // placeholder, excluded below
         // One ballot per distinct provider (issue #12). `any` reproduces the
         // old pooled behavior exactly; `all`/`majority` resolve disagreement.
+        // Dotted refs (`opencode.flash`) vote under their full ref, so two
+        // models on one transport disagree as two ballots (issue #67).
         const byProvider = new Map<string, typeof findings>();
         for (const f of findings) {
           const list = byProvider.get(f.provider) ?? [];
@@ -493,7 +509,9 @@ export async function run(): Promise<void> {
           .filter((r) => r.attempts > 0)
           .map((r) => ({
             agent: r.agent,
-            model: config.providers[r.providerName]?.model ?? r.providerName,
+            // Resolved model travels with the result: dotted refs
+            // (`opencode.flash`) have no top-level entry to look up (issue #67).
+            model: r.model,
             usage: r.usage,
             seconds: r.seconds,
             attempts: r.attempts,

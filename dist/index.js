@@ -44528,6 +44528,26 @@ const ProviderConfig = objectType({
     json_mode: booleanType().default(true),
     // Extra JSON body fields merged into the request (provider-specific params).
     extra_body: recordType(unknownType()).default({}),
+    // Named per-model overrides sharing this entry's transport + credential
+    // (issue #67): `provider: opencode.flash` merges `{...opencode,
+    // ...opencode.models.flash}`. Every field optional with NO defaults, so an
+    // entry carrying only `model:` cannot clobber the base's retries/timeout
+    // with default values. Overrides replace wholesale per key (shallow merge:
+    // an entry `headers` replaces the base `headers`, it does not extend it).
+    models: recordType(stringType(), objectType({
+        kind: ProviderKind.optional(),
+        protocol: ProviderProtocol.optional(),
+        model: stringType().optional(),
+        base_url: stringType().optional(),
+        key_from: stringType().optional(),
+        auth: AuthConfig.optional(),
+        headers: recordType(stringType()).optional(),
+        endpoint_path: stringType().optional(),
+        retries: numberType().int().min(0).max(5).optional(),
+        timeout_s: numberType().int().min(10).max(600).optional(),
+        json_mode: booleanType().optional(),
+        extra_body: recordType(unknownType()).optional(),
+    })).default({}),
 });
 const AgentConfig = objectType({
     name: stringType().optional(),
@@ -45175,6 +45195,49 @@ function legacyKey(kind, keys) {
     if (kind === "openai")
         return keys.openaiApiKey;
     return keys.opencodeApiKey || keys.openaiApiKey;
+}
+const hasOwn = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
+/**
+ * Resolve a dotted agent provider ref `base.entry` to a merged config
+ * (issue #67): `{...base, ...base.models.entry}`. Entry fields are
+ * default-free, so only explicitly set keys overwrite; `undefined` never
+ * overwrites. Throws naming both halves — a typo'd `opencode.flah` must
+ * never silently review with a different model. Exact provider keys resolve
+ * first (callers check that before coming here); legacy unknown plain names
+ * keep their historical warn-and-skip path in main.ts.
+ */
+function resolveDottedProvider(providers, ref) {
+    const dot = ref.indexOf(".");
+    const base = dot < 0 ? ref : ref.slice(0, dot);
+    const entry = dot < 0 ? "" : ref.slice(dot + 1);
+    const prov = hasOwn(providers, base) ? providers[base] : undefined;
+    if (!prov)
+        throw new Error(`Unknown provider '${base}' in agent provider ref '${ref}'.`);
+    const override = prov.models && hasOwn(prov.models, entry) ? prov.models[entry] : undefined;
+    if (!override)
+        throw new Error(`Unknown model entry '${entry}' for provider '${base}' in agent provider ref '${ref}' ` +
+            `(available: ${Object.keys(prov.models ?? {}).join(", ") || "none"}).`);
+    const { models: _ignored, ...rest } = prov;
+    const merged = { ...rest };
+    for (const [k, v] of Object.entries(override))
+        if (v !== undefined)
+            merged[k] = v;
+    return { name: ref, config: merged };
+}
+/**
+ * Fail fast on dotted refs that resolve to nothing (issue #67), before any
+ * budget is spent. Legacy plain-unknown names keep warn-and-skip at runtime.
+ */
+function assertProviderRefs(config) {
+    for (const r of config.reviews) {
+        for (const a of [r.main, ...r.subagents]) {
+            if (hasOwn(config.providers, a.provider))
+                continue;
+            if (!a.provider.includes("."))
+                continue;
+            resolveDottedProvider(config.providers, a.provider);
+        }
+    }
 }
 function resolveProvider(provider, keys, env, sessionId) {
     const def = kindDefaults(provider.kind);
@@ -46698,6 +46761,10 @@ async function run() {
         const dryRun = (core.getInput("dry-run") || "false").toLowerCase() === "true";
         const { config, path } = await loadConfig(configPath);
         logInfo(`Loaded config: ${path} (${config.reviews.length} reviews)`);
+        // Fail fast on dotted provider refs that resolve to nothing (issue #67):
+        // a typo'd `opencode.flah` errors here naming both halves, before any
+        // budget is spent. Legacy plain-unknown names keep warn-and-skip per agent.
+        assertProviderRefs(config);
         if (config.requires_action) {
             const running = runningActionVersion(process.env);
             if (running && !satisfiesActionVersion(config.requires_action, running)) {
@@ -46790,10 +46857,16 @@ async function run() {
                 .map((a) => `${a.name}/${a.provider}`)
                 .join(", ")}] on ${scopedFiles.length} file(s), strategy=${review.strategy}`);
             for (const a of agentDefs) {
-                const provider = config.providers[a.provider];
+                let provider = config.providers[a.provider];
                 if (!provider) {
-                    logWarning(`Review ${review.id}: unknown provider '${a.provider}', skipped agent ${a.name}.`);
-                    continue;
+                    if (a.provider.includes(".")) {
+                        // Validated at load; throws naming both halves as a backstop.
+                        provider = resolveDottedProvider(config.providers, a.provider).config;
+                    }
+                    else {
+                        logWarning(`Review ${review.id}: unknown provider '${a.provider}', skipped agent ${a.name}.`);
+                        continue;
+                    }
                 }
                 tasks.push(() => runAgent({
                     agentName: a.name ?? "agent",
@@ -46818,6 +46891,7 @@ async function run() {
                     outcome: result.outcome,
                     agent: a.name ?? "agent",
                     providerName: a.provider,
+                    model: provider.model,
                 }))
                     .catch((e) => {
                     const msg = e.message;
@@ -46840,6 +46914,7 @@ async function run() {
                         outcome: "error",
                         agent: a.name ?? "agent",
                         providerName: a.provider,
+                        model: provider.model,
                     };
                 }));
             }
@@ -46878,6 +46953,8 @@ async function run() {
                     return "approve"; // placeholder, excluded below
                 // One ballot per distinct provider (issue #12). `any` reproduces the
                 // old pooled behavior exactly; `all`/`majority` resolve disagreement.
+                // Dotted refs (`opencode.flash`) vote under their full ref, so two
+                // models on one transport disagree as two ballots (issue #67).
                 const byProvider = new Map();
                 for (const f of findings) {
                     const list = byProvider.get(f.provider) ?? [];
@@ -46919,7 +46996,9 @@ async function run() {
                     .filter((r) => r.attempts > 0)
                     .map((r) => ({
                     agent: r.agent,
-                    model: config.providers[r.providerName]?.model ?? r.providerName,
+                    // Resolved model travels with the result: dotted refs
+                    // (`opencode.flash`) have no top-level entry to look up (issue #67).
+                    model: r.model,
                     usage: r.usage,
                     seconds: r.seconds,
                     attempts: r.attempts,

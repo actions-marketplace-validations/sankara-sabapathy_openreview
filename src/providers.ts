@@ -1,4 +1,4 @@
-import type { ProviderConfig, ProviderProtocol } from "./config.js";
+import type { ProviderConfig, ProviderProtocol, OpenReviewConfig } from "./config.js";
 import * as core from "@actions/core";
 import { logInfo, logWarning, logDebug, redactHeaders } from "./logger.js";
 
@@ -427,6 +427,53 @@ function legacyKey(kind: string | undefined, keys: ResolvedKeys): string {
   if (kind === "anthropic") return keys.anthropicApiKey;
   if (kind === "openai") return keys.openaiApiKey;
   return keys.opencodeApiKey || keys.openaiApiKey;
+}
+
+const hasOwn = (o: object, k: string): boolean =>
+  Object.prototype.hasOwnProperty.call(o, k);
+
+/**
+ * Resolve a dotted agent provider ref `base.entry` to a merged config
+ * (issue #67): `{...base, ...base.models.entry}`. Entry fields are
+ * default-free, so only explicitly set keys overwrite; `undefined` never
+ * overwrites. Throws naming both halves — a typo'd `opencode.flah` must
+ * never silently review with a different model. Exact provider keys resolve
+ * first (callers check that before coming here); legacy unknown plain names
+ * keep their historical warn-and-skip path in main.ts.
+ */
+export function resolveDottedProvider(
+  providers: Record<string, ProviderConfig>,
+  ref: string
+): { name: string; config: ProviderConfig } {
+  const dot = ref.indexOf(".");
+  const base = dot < 0 ? ref : ref.slice(0, dot);
+  const entry = dot < 0 ? "" : ref.slice(dot + 1);
+  const prov = hasOwn(providers, base) ? providers[base] : undefined;
+  if (!prov) throw new Error(`Unknown provider '${base}' in agent provider ref '${ref}'.`);
+  const override = prov.models && hasOwn(prov.models, entry) ? prov.models[entry] : undefined;
+  if (!override)
+    throw new Error(
+      `Unknown model entry '${entry}' for provider '${base}' in agent provider ref '${ref}' ` +
+        `(available: ${Object.keys(prov.models ?? {}).join(", ") || "none"}).`
+    );
+  const { models: _ignored, ...rest } = prov;
+  const merged: Record<string, unknown> = { ...rest };
+  for (const [k, v] of Object.entries(override)) if (v !== undefined) merged[k] = v;
+  return { name: ref, config: merged as unknown as ProviderConfig };
+}
+
+/**
+ * Fail fast on dotted refs that resolve to nothing (issue #67), before any
+ * budget is spent. Legacy plain-unknown names keep warn-and-skip at runtime.
+ */
+export function assertProviderRefs(config: OpenReviewConfig): void {
+  for (const r of config.reviews) {
+    for (const a of [r.main, ...r.subagents]) {
+      if (hasOwn(config.providers, a.provider)) continue;
+      if (!a.provider.includes(".")) continue;
+      resolveDottedProvider(config.providers, a.provider);
+    }
+  }
 }
 
 export type ResolvedProvider = {
