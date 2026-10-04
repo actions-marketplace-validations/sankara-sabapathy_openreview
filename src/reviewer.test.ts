@@ -13,6 +13,8 @@ import {
   applyDegradedFloor,
   splitDiff,
   scopeDiff,
+  parseHunkRanges,
+  lineInRanges,
 } from "./reviewer.js";
 
 type V = "approve" | "comment" | "request_changes";
@@ -346,4 +348,26 @@ describe("satisfiesActionVersion", () => {
       assert.equal(satisfiesActionVersion(req, running), ok);
     });
   }
+});
+describe("parseHunkRanges / lineInRanges (issue #53)", () => {
+  it("reads new-file ranges from hunk headers", () => {
+    const ranges = parseHunkRanges("@@ -1,3 +10,5 @@\n ctx\n@@ -20 +30 @@\n+x\n");
+    assert.deepEqual(ranges, [
+      { start: 10, end: 14 },
+      { start: 30, end: 30 },
+    ]);
+  });
+
+  it("a deletion-only hunk contributes no commentable lines", () => {
+    assert.deepEqual(parseHunkRanges("@@ -5,3 +5,0 @@\n-x\n"), []);
+  });
+
+  it("checks lines against ranges", () => {
+    const ranges = [{ start: 10, end: 14 }];
+    assert.equal(lineInRanges(10, ranges), true);
+    assert.equal(lineInRanges(14, ranges), true);
+    assert.equal(lineInRanges(9, ranges), false);
+    assert.equal(lineInRanges(15, ranges), false);
+    assert.equal(lineInRanges(10, []), false);
+  });
 });

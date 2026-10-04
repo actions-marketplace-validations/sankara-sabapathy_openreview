@@ -112,6 +112,31 @@ export function scopeDiff(files: string[], parsed: DiffFile[], totalInScope: num
   );
 }
 
+/**
+ * Commentable line ranges of a unified patch, in new-file coordinates
+ * (issue #53). GitHub only accepts inline comments on lines that are part of
+ * the diff, so a model-invented line number must be checked against these —
+ * otherwise one bad position 422s the whole `createReview` batch and every
+ * finding is lost. Parsed from `@@ -a,b +c,d @@` headers; a `+c,0` hunk
+ * (pure deletion) contributes no commentable lines.
+ */
+export function parseHunkRanges(patch: string): { start: number; end: number }[] {
+  const out: { start: number; end: number }[] = [];
+  for (const line of patch.split("\n")) {
+    const m = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/.exec(line);
+    if (!m) continue;
+    const start = Number(m[1]);
+    const len = m[2] === undefined ? 1 : Number(m[2]);
+    if (len > 0) out.push({ start, end: start + len - 1 });
+  }
+  return out;
+}
+
+/** True when `line` falls inside any commentable range. */
+export function lineInRanges(line: number, ranges: { start: number; end: number }[]): boolean {
+  return ranges.some((r) => line >= r.start && line <= r.end);
+}
+
 export function dedupeFindings<T extends { file: string; line?: number; comment: string }>(
   findings: T[]
 ): T[] {
