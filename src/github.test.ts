@@ -95,11 +95,13 @@ describe("renderStickyBody (issue #46)", () => {
           comment: "a | b | c",
           agent: "main",
           provider: "opencode",
+          model: "space-bunny-free",
         },
       ],
     });
     assert.match(body, /a \\\| b \\\| c/);
     assert.match(body, /`src\/a\.ts:4`/);
+    assert.match(body, /main\/opencode\/space-bunny-free/);
   });
 });
 
@@ -250,7 +252,7 @@ describe("append mode (issue #69)", () => {
     perReview: [{ id: "r", verdict: "comment" as const, count: 1, counted: true }],
     findings: [{
       file: "a.ts", line: 2, severity: "high", category: "bug",
-      comment: "x", agent: "m", provider: "p",
+      comment: "x", agent: "m", provider: "p", model: "mm",
     }],
     headSha: "abc1234567890",
     runUrl: "https://example.test/run/9",
@@ -268,7 +270,7 @@ describe("append mode (issue #69)", () => {
   it("update bodies and sections share the same content core", () => {
     const body = renderStickyBody({ ...sectionOpts });
     const section = renderAppendSection(sectionOpts);
-    for (const needle of ["`r`: **comment** (1 findings)", "| high | `a.ts:2` | x | m/p |"]) {
+    for (const needle of ["`r`: **comment** (1 findings)", "| high | `a.ts:2` | x | m/p/mm |"]) {
       assert.ok(body.includes(needle) && section.includes(needle), `missing: ${needle}`);
     }
   });

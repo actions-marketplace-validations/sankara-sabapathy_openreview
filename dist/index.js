@@ -45460,6 +45460,7 @@ async function runAgent(opts) {
                 confidence: typeof f.confidence === "number" ? f.confidence : 0.7,
                 agent: opts.agentName,
                 provider: opts.providerName,
+                model: opts.provider.model,
             });
         }
         return { findings: out, usage, seconds, attempts: attemptsMade, startedAt, endedAt, outcome: out.length > 0 ? "ok" : "no-findings" };
@@ -45951,7 +45952,7 @@ function renderRunBody(opts) {
         for (const f of findings.slice(0, 50)) {
             const loc = f.line ? `${f.file}:${f.line}` : f.file;
             const one = f.comment.replace(/\n+/g, " ").replace(/\|/g, "\\|").slice(0, 220);
-            lines.push(`| ${f.severity} | \`${loc}\` | ${one} | ${f.agent}/${f.provider} |`);
+            lines.push(`| ${f.severity} | \`${loc}\` | ${one} | ${f.agent}/${f.provider}/${f.model} |`);
         }
         if (findings.length > 50)
             lines.push(`\n… and ${findings.length - 50} more (see inline comments).`);
