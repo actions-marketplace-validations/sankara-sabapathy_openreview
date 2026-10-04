@@ -57,7 +57,28 @@
           "json_mode": { "type": "boolean" },
           "retries": { "type": "integer", "minimum": 0, "maximum": 5 },
           "timeout_s": { "type": "integer", "minimum": 10, "maximum": 600, "description": "Per-attempt total cap in seconds (default 420); 90s idle + 60s/1KB trickle guards kill dead hangs regardless." },
-          "extra_body": { "type": "object" }
+          "extra_body": { "type": "object" },
+          "models": {
+            "type": "object",
+            "description": "Named per-model overrides sharing this entry's transport + credential. Agents address them as provider.entry.",
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "kind": { "enum": ["anthropic", "openai", "opencode", "openai-compatible"] },
+                "model": { "type": "string" },
+                "protocol": { "enum": ["openai-chat", "anthropic-messages"] },
+                "base_url": { "type": "string" },
+                "key_from": { "type": "string" },
+                "auth": { "type": "object" },
+                "headers": { "type": "object", "additionalProperties": { "type": "string" } },
+                "endpoint_path": { "type": "string" },
+                "json_mode": { "type": "boolean" },
+                "retries": { "type": "integer", "minimum": 0, "maximum": 5 },
+                "timeout_s": { "type": "integer", "minimum": 10, "maximum": 600 },
+                "extra_body": { "type": "object" }
+              }
+            }
+          }
         }
       }
     },

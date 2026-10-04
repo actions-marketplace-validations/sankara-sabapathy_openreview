@@ -36,12 +36,17 @@ providers:
     # extra_body: { temperature: 0.1 }     # merged into request JSON
     # retries: 2                           # retry budget for empty/5xx/429/network (0-5)
     # timeout_s: 420                       # per-attempt TOTAL cap, seconds (idle 90s + trickle 60s/1KB guards)
+    # models:                              # named per-model overrides sharing this transport + credential
+    #   flash: { model: deepseek-v4-flash }# agents address them as `go.flash`;
+    #   strict:                            # entries merge over the base — only set keys win
+    #     model: kimi-k2.7-code
+    #     extra_body: { temperature: 1 }   # kimi rejects any other temperature
 
 reviews:
   - id: general-quality
     if_paths: ["**"] # which files this review SEES (the diff is scoped to these, too)
     main: # synthesizer; name defaults to "<id>:main"
-      provider: go
+      provider: go # or go.flash for a models entry; unknown `go.typo` fails the run naming both
       instructions: "Synthesize sub-agent findings. Strict on bugs, lenient on style."
     subagents:
       - name: correctness

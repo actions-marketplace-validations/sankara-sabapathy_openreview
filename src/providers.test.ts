@@ -9,6 +9,8 @@ import {
   describeResponseShape,
   runAgent,
   AgentFailedError,
+  resolveDottedProvider,
+  assertProviderRefs,
   countsAsReview,
 } from "./providers.js";
 import { parseConfig } from "./config.js";
@@ -580,5 +582,89 @@ describe("sticky_comment_mode default (issue #69)", () => {
       global_verdict: { strategy: "any_blocking", sticky_comment_mode: "append" },
     });
     assert.equal(cfg2.global_verdict.sticky_comment_mode, "append");
+  });
+});
+
+describe("resolveDottedProvider (issue #67)", () => {
+  const cfg = parseConfig({
+    version: 1,
+    providers: {
+      opencode: {
+        protocol: "openai-chat",
+        model: "base-model",
+        base_url: "https://opencode.ai/zen/go/v1",
+        key_from: "secrets.OPENCODE_API_KEY",
+        retries: 5,
+        timeout_s: 100,
+        models: {
+          flash: { model: "flash-model" },
+          strict: { model: "strict-model", json_mode: false, timeout_s: 50 },
+        },
+      },
+    },
+    reviews: [{ id: "r", main: { provider: "opencode.flash", instructions: "i" } }],
+  });
+  const providers = cfg.providers;
+
+  it("merges entry over base, keeping untouched base fields", () => {
+    const { name, config } = resolveDottedProvider(providers, "opencode.flash");
+    assert.equal(name, "opencode.flash");
+    assert.equal(config.model, "flash-model");
+    assert.equal(config.base_url, "https://opencode.ai/zen/go/v1");
+    assert.equal(config.key_from, "secrets.OPENCODE_API_KEY");
+    assert.equal(config.retries, 5);
+    assert.equal(config.timeout_s, 100);
+  });
+
+  it("entry overrides win per key", () => {
+    const { config } = resolveDottedProvider(providers, "opencode.strict");
+    assert.equal(config.model, "strict-model");
+    assert.equal(config.json_mode, false);
+    assert.equal(config.timeout_s, 50);
+  });
+
+  it("an entry with only overrides keeps the base model (no default clobber)", () => {
+    const p = parseConfig({
+      version: 1,
+      providers: { o: { model: "m", models: { t: { timeout_s: 10 } } } },
+      reviews: [{ id: "r", main: { provider: "o.t", instructions: "i" } }],
+    });
+    const { config } = resolveDottedProvider(p.providers, "o.t");
+    assert.equal(config.model, "m");
+    assert.equal(config.timeout_s, 10);
+    assert.equal(config.retries, 2);
+  });
+
+  it("splits on the FIRST dot", () => {
+    const p = parseConfig({
+      version: 1,
+      providers: { o: { model: "m", models: { "a.b": { model: "n" } } } },
+      reviews: [{ id: "r", main: { provider: "o.a.b", instructions: "i" } }],
+    });
+    assert.equal(resolveDottedProvider(p.providers, "o.a.b").config.model, "n");
+  });
+
+  it("unknown entry throws naming provider and entry, never falls back", () => {
+    assert.throws(() => resolveDottedProvider(providers, "opencode.flah"), /'flah'.*'opencode'/);
+  });
+
+  it("unknown base throws naming it", () => {
+    assert.throws(() => resolveDottedProvider(providers, "nope.flash"), /'nope'/);
+  });
+
+  it("assertProviderRefs fails fast on dotted typos, ignores legacy plains", () => {
+    assert.doesNotThrow(() => assertProviderRefs(cfg));
+    const bad = parseConfig({
+      version: 1,
+      providers: { o: { model: "m" } },
+      reviews: [{ id: "r", main: { provider: "o.typo", instructions: "i" } }],
+    });
+    assert.throws(() => assertProviderRefs(bad), /'typo'.*'o'/);
+    const legacy = parseConfig({
+      version: 1,
+      providers: { o: { model: "m" } },
+      reviews: [{ id: "r", main: { provider: "ghost", instructions: "i" } }],
+    });
+    assert.doesNotThrow(() => assertProviderRefs(legacy));
   });
 });
