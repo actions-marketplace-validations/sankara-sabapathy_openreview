@@ -18,9 +18,7 @@
     "defaults": {
       "type": "object",
       "properties": {
-        "on": { "type": "array", "items": { "type": "string" } },
         "command": { "type": "string" },
-        "draft": { "type": "boolean" },
         "lang": { "type": "string" },
         "ignore": { "type": "array", "items": { "type": "string" } },
         "max_diff_chars": { "type": "integer", "minimum": 1000 },
@@ -129,8 +127,7 @@
       "properties": {
         "name": { "type": "string" },
         "provider": { "type": "string" },
-        "instructions": { "type": "string", "minLength": 1 },
-        "max_files": { "type": "integer", "minimum": 1 }
+        "instructions": { "type": "string", "minLength": 1 }
       }
     }
   }

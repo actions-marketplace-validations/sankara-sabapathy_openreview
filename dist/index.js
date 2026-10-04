@@ -44553,7 +44553,7 @@ const AgentConfig = objectType({
     name: stringType().optional(),
     provider: stringType(),
     instructions: stringType(),
-    max_files: numberType().int().positive().optional(),
+    // NOTE: no max_files (issue #57 removed the reserved-but-unused key).
 });
 const VerdictConfig = objectType({
     mode: enumType(["comment", "approve", "request_changes"]).default("comment"),
@@ -44590,9 +44590,10 @@ const OpenReviewConfig = objectType({
     requires_action: stringType().optional(),
     extends: arrayType(stringType()).default([]),
     defaults: objectType({
-        on: arrayType(stringType()).default(["opened", "synchronize", "ready_for_review"]),
+        // NOTE: event triggers (`on:`) and draft-PR handling live in the
+        // WORKFLOW file, not here — the action observes events, never subscribes
+        // (issue #57 removed the dead `on`/`draft` keys outright).
         command: stringType().default("/review"),
-        draft: booleanType().default(false),
         lang: stringType().default("en"),
         ignore: arrayType(stringType()).default([]),
         max_diff_chars: numberType().int().positive().default(80000),
