@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, symlinkSync, rmSync, mkdirSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
-import { extractDefinedNames, buildContextBlock } from "./context.js";
+import { extractDefinedNames, buildContextBlock, buildRepoIndex, MAX_CALLER_SCAN_BYTES } from "./context.js";
 import { combineBallots, decideReviewVerdict, matchesAny } from "./reviewer.js";
 import { isRetryableError } from "./providers.js";
 
@@ -206,5 +206,219 @@ describe("logger", () => {
   it("marks unset keys", async () => {
     const { redactHeaders } = await import("./logger.js");
     assert.equal(redactHeaders({ authorization: "" })["authorization"], "(not set)");
+  });
+});
+
+describe("shared repo index (issue #55)", () => {
+  it("one index serves two reviews with identical output, from cache", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "or-idx-"));
+    try {
+      writeFileSync(path.join(dir, "a.ts"), "export function alpha() { return 1; }\n");
+      writeFileSync(path.join(dir, "b.ts"), "import { alpha } from './a';\nconsole.log(alpha());\n");
+      const input = {
+        repoRoot: dir,
+        scopedFiles: ["a.ts"],
+        contextFiles: [] as string[],
+        includeFullFiles: true,
+        maxContextChars: 20000,
+        ignore: [] as string[],
+      };
+      const index = buildRepoIndex(dir, []);
+      assert.ok(index.files.includes("a.ts") && index.files.includes("b.ts"));
+      const r1 = buildContextBlock(input, index);
+      const r2 = buildContextBlock(input, index);
+      assert.equal(r1.block, r2.block);
+      assert.match(r1.block, /callers of alpha in b\.ts/);
+      // Delete from disk: the second review-equivalent still resolves from cache.
+      rmSync(path.join(dir, "b.ts"));
+      const r3 = buildContextBlock(input, index);
+      assert.equal(r3.block, r1.block);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("skips the caller scan when nothing is defined and reports no scan", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "or-idx-"));
+    try {
+      writeFileSync(path.join(dir, "plain.txt"), "just words, no symbols here\n");
+      const r = buildContextBlock({
+        repoRoot: dir,
+        scopedFiles: ["plain.txt"],
+        contextFiles: [],
+        includeFullFiles: true,
+        maxContextChars: 20000,
+        ignore: [],
+      });
+      assert.ok(!r.stats.includes("scanned"), `unexpected scan: ${r.stats}`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("bounds the caller scan by byte budget", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "or-idx-"));
+    try {
+      writeFileSync(path.join(dir, "a.ts"), "export function alpha() { return 1; }\n");
+      // 100 files x 30KB of calling code: far more than the scan budget.
+      const filler = "console.log(alpha());\n".repeat(1500);
+      for (let i = 0; i < 100; i++) writeFileSync(path.join(dir, `c${i}.ts`), filler);
+      const r = buildContextBlock({
+        repoRoot: dir,
+        scopedFiles: ["a.ts"],
+        contextFiles: [],
+        includeFullFiles: true,
+        maxContextChars: 200000,
+        ignore: [],
+      });
+      const m = /scanned ~(\d+)KB\/(\d+)KB/.exec(r.stats);
+      assert.ok(m, `stats must report the scan: ${r.stats}`);
+      assert.ok(Number(m[1]) <= Number(m[2]), `scan ${m[1]}KB exceeded budget ${m[2]}KB`);
+      assert.equal(Number(m[2]), Math.round(MAX_CALLER_SCAN_BYTES / 1024));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("excerpt line numbers stay exact on deep matches", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "or-idx-"));
+    try {
+      writeFileSync(path.join(dir, "a.ts"), "export function alpha() { return 1; }\n");
+      const pad = Array.from({ length: 50 }, (_, i) => `// filler ${i}`).join("\n");
+      writeFileSync(path.join(dir, "b.ts"), `${pad}\nconst x = alpha();\n`);
+      const r = buildContextBlock({
+        repoRoot: dir,
+        scopedFiles: ["a.ts"],
+        contextFiles: [],
+        includeFullFiles: false,
+        maxContextChars: 20000,
+        ignore: [],
+      });
+      assert.match(r.block, /51: const x = alpha\(\);/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("walk nesting (issue #55)", () => {
+  it("returns nested files with their directory prefix", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "or-idx-"));
+    try {
+      mkdirSync(path.join(dir, "sub", "deep"), { recursive: true });
+      writeFileSync(path.join(dir, "top.ts"), "export const t = 1;\n");
+      writeFileSync(path.join(dir, "sub", "nested.ts"), "export function nested() { return 2; }\n");
+      writeFileSync(path.join(dir, "sub", "deep", "leaf.ts"), "const caller = nested();\n");
+      const index = buildRepoIndex(dir, []);
+      assert.ok(index.files.includes("top.ts"));
+      assert.ok(index.files.includes("sub/nested.ts"), `got: ${index.files.join(",")}`);
+      assert.ok(index.files.includes("sub/deep/leaf.ts"));
+      // Caller excerpts now resolve across directories.
+      const r = buildContextBlock({
+        repoRoot: dir,
+        scopedFiles: ["sub/nested.ts"],
+        contextFiles: [],
+        includeFullFiles: true,
+        maxContextChars: 20000,
+        ignore: [],
+      }, index);
+      assert.match(r.block, /callers of nested in sub\/deep\/leaf\.ts/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("dogfood round 2 (issue #55)", () => {
+  it("counts multibyte sources in true bytes", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "or-idx-"));
+    try {
+      writeFileSync(path.join(dir, "a.ts"), "export function alpha() { return 1; }\n");
+      // 1000 CJK chars ≈ 3000 bytes but only 1000 UTF-16 units.
+      writeFileSync(path.join(dir, "b.ts"), "const x = alpha(); // 注释填充\n" + "汉".repeat(1000) + "\n");
+      const r = buildContextBlock({
+        repoRoot: dir,
+        scopedFiles: ["a.ts"],
+        contextFiles: [],
+        includeFullFiles: true,
+        maxContextChars: 20000,
+        ignore: [],
+      });
+      const m = /scanned ~(\d+)KB\/\d+KB/.exec(r.stats);
+      assert.ok(m, `stats must report the scan: ${r.stats}`);
+      assert.ok(Number(m[1]) >= 3, `expected ~3KB+ of true bytes, got ${m[1]}KB`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("a shared index still honors the caller's own ignore", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "or-idx-"));
+    try {
+      writeFileSync(path.join(dir, "a.ts"), "export function alpha() { return 1; }\n");
+      writeFileSync(path.join(dir, "keep.ts"), "const x = alpha();\n");
+      writeFileSync(path.join(dir, "skip.gen.ts"), "const y = alpha();\n");
+      const index = buildRepoIndex(dir, []);
+      const r = buildContextBlock({
+        repoRoot: dir,
+        scopedFiles: ["a.ts"],
+        contextFiles: [],
+        includeFullFiles: true,
+        maxContextChars: 20000,
+        ignore: ["*.gen.ts"],
+      }, index);
+      assert.match(r.block, /keep\.ts/);
+      assert.ok(!r.block.includes("skip.gen.ts"), "ignored file leaked into excerpts");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("dogfood round 3 (issue #55)", () => {
+  it("scan never exceeds the byte budget, even for multibyte tails", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "or-idx-"));
+    try {
+      writeFileSync(path.join(dir, "a.ts"), "export function alpha() { return 1; }\n");
+      // 20 files x 60KB chars of CJK ≈ 180KB bytes each: 3.6MB total.
+      const big = ("const v = alpha(); // 汉\n" + "汉".repeat(20000) + "\n").repeat(3).slice(0, 60000);
+      for (let i = 0; i < 20; i++) writeFileSync(path.join(dir, `c${i}.ts`), big);
+      const r = buildContextBlock({
+        repoRoot: dir,
+        scopedFiles: ["a.ts"],
+        contextFiles: [],
+        includeFullFiles: true,
+        maxContextChars: 500000,
+        ignore: [],
+      });
+      const m = /scanned ~(\d+)KB\/(\d+)KB/.exec(r.stats);
+      assert.ok(m, `stats must report the scan: ${r.stats}`);
+      assert.ok(Number(m[1]) <= Number(m[2]), `scan ${m[1]}KB exceeded budget ${m[2]}KB`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("an index built for another root is not trusted", () => {
+    const dirA = mkdtempSync(path.join(tmpdir(), "or-idxA-"));
+    const dirB = mkdtempSync(path.join(tmpdir(), "or-idxB-"));
+    try {
+      writeFileSync(path.join(dirA, "a.ts"), "WRONG REPO CONTENT\n");
+      writeFileSync(path.join(dirB, "a.ts"), "export function alpha() { return 1; }\n");
+      const foreign = buildRepoIndex(dirA, []);
+      const r = buildContextBlock({
+        repoRoot: dirB,
+        scopedFiles: ["a.ts"],
+        contextFiles: [],
+        includeFullFiles: true,
+        maxContextChars: 20000,
+        ignore: [],
+      }, foreign);
+      assert.ok(!r.block.includes("WRONG REPO CONTENT"));
+      assert.match(r.block, /alpha/);
+    } finally {
+      rmSync(dirA, { recursive: true, force: true });
+      rmSync(dirB, { recursive: true, force: true });
+    }
   });
 });

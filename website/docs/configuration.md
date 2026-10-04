@@ -60,7 +60,9 @@ capped at 12KB), plus call-site excerpts for top-level symbols those files defin
 (who imports/calls them elsewhere — changed files themselves are never cited as
 callers), plus any `context_files` globs — all inside a `<context>` block bounded
 by `max_context_chars` (default 20KB, `0` disables everything including excerpts). Findings must ground in the diff; context is
-evidence only (agents are instructed never to flag context-only code).
+evidence only (agents are instructed never to flag context-only code). The repo
+is walked once per run and shared by all reviews; excerpt hunting stops at a
+2MB scan budget and only traces symbols the changed files actually define.
 
 ```yaml
 reviews:

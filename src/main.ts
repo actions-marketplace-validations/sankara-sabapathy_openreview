@@ -21,7 +21,7 @@ import {
 } from "./reviewer.js";
 import { renderStickyBody, upsertStickyComment, createInlineReview, type RunStatus } from "./github.js";
 import { initLogger, logInfo, logWarning, logDebug } from "./logger.js";
-import { buildContextBlock } from "./context.js";
+import { buildContextBlock, buildRepoIndex } from "./context.js";
 import { authorizeTrigger } from "./authorize.js";
 
 const CONFIG_CANDIDATES = [
@@ -285,6 +285,9 @@ export async function run(): Promise<void> {
     const parsedDiff = splitDiff(diff);
     if (parsedDiff.length === 0)
       logWarning(`Diff parser found no per-file patches for ${fileNames.length} changed file(s).`);
+    // Repo index built ONCE per run and shared by every review's context
+    // builder (issue #55): the walk + candidate reads used to repeat per review.
+    const repoIndex = buildRepoIndex(process.cwd(), config.defaults.ignore ?? []);
 
     type AgentRun = {
       agent: string;
@@ -330,7 +333,7 @@ export async function run(): Promise<void> {
         maxContextChars:
           review.max_context_chars ?? config.defaults.max_context_chars ?? 20000,
         ignore: config.defaults.ignore ?? [],
-      });
+      }, repoIndex);
       // Thunks, not promises: runAgent must not start until the pool allows it
       // (an eager promise is already in flight, so the cap would be a no-op).
       const tasks: (() => Promise<{
