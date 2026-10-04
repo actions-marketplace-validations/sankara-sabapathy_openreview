@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { renderStickyBody, upsertStickyComment, createInlineReview, STICKY_MARKER } from "./github.js";
+import { renderStickyBody, upsertStickyComment, createInlineReview, renderAppendSection, appendToSticky, appendStickySection, STICKY_MARKER, STICKY_LIMIT } from "./github.js";
 import { countsAsReview, type AgentOutcome } from "./providers.js";
 
 const base = { findings: [], runUrl: "https://example.test/run/1" };
@@ -240,5 +240,121 @@ describe("createInlineReview file-level validation (dogfood on #73)", () => {
     assert.deepEqual(res, { posted: 0, dropped: 1 });
     assert.match(calls.review.body, /real file note/);
     assert.doesNotMatch(calls.review.body, /invented file note/);
+  });
+});
+
+describe("append mode (issue #69)", () => {
+  const sectionOpts = {
+    verdict: "comment" as const,
+    status: "ok" as const,
+    perReview: [{ id: "r", verdict: "comment" as const, count: 1, counted: true }],
+    findings: [{
+      file: "a.ts", line: 2, severity: "high", category: "bug",
+      comment: "x", agent: "m", provider: "p",
+    }],
+    headSha: "abc1234567890",
+    runUrl: "https://example.test/run/9",
+    extras: ["\n<sub>Models: m 1/2</sub>"],
+  };
+
+  it("sections are headed by short SHA, verdict and run link", () => {
+    const s = renderAppendSection(sectionOpts);
+    assert.match(s, /### `abc1234` — COMMENT \(\[run\]\(https:\/\/example\.test\/run\/9\)\)/);
+    assert.match(s, /`r`: \*\*comment\*\* \(1 findings\)/);
+    assert.match(s, /Models: m 1\/2/);
+    assert.ok(!s.includes(STICKY_MARKER), "marker must appear once, at the top");
+  });
+
+  it("update bodies and sections share the same content core", () => {
+    const body = renderStickyBody({ ...sectionOpts });
+    const section = renderAppendSection(sectionOpts);
+    for (const needle of ["`r`: **comment** (1 findings)", "| high | `a.ts:2` | x | m/p |"]) {
+      assert.ok(body.includes(needle) && section.includes(needle), `missing: ${needle}`);
+    }
+  });
+
+  it("appendToSticky keeps the re-review line last", () => {
+    const existing = `${STICKY_MARKER}\nlogo\n### \`aaa\` — COMMENT\nstuff\n\n<sub>Re-review with \`/review\`. Config: \`.github/openreview.yml\`.</sub>`;
+    const { body, rotated } = appendToSticky(existing, "### `bbb` — APPROVE\nmore");
+    assert.equal(rotated, false);
+    assert.ok(body.endsWith("<sub>Re-review with `/review`. Config: `.github/openreview.yml`.</sub>"));
+    assert.ok(body.includes("---"), "sections need a separator");
+    assert.ok(body.indexOf("aaa") < body.indexOf("bbb"), "chronological order");
+  });
+
+  it("appendToSticky rotates past the limit", () => {
+    const existing = `${STICKY_MARKER}\n` + "x".repeat(STICKY_LIMIT - 10);
+    const { rotated } = appendToSticky(existing, "new section");
+    assert.equal(rotated, true);
+  });
+
+  it("appendStickySection creates, appends, and rotates", async () => {
+    const calls: any = {};
+    const octokit = {
+      paginate: async () => calls.comments,
+      rest: {
+        issues: {
+          listComments: () => {},
+          updateComment: async (p: any) => { calls.updated = p; },
+          createComment: async (p: any) => { calls.created = p; },
+        },
+      },
+    } as any;
+    // No sticky yet -> create with marker on top.
+    calls.comments = [];
+    await appendStickySection(octokit, "o", "r", 7, "### `a` — COMMENT");
+    assert.ok(calls.created.body.startsWith(STICKY_MARKER));
+    // Existing -> update in place.
+    calls.comments = [{ id: 3, user: { type: "Bot" }, body: `${STICKY_MARKER}\nold` }];
+    calls.created = undefined;
+    await appendStickySection(octokit, "o", "r", 7, "### `b` — APPROVE");
+    assert.equal(calls.updated.comment_id, 3);
+    assert.ok(calls.updated.body.includes("### `b` — APPROVE"));
+    // Oversized -> fresh comment + superseded mark on the old one.
+    calls.comments = [{ id: 4, user: { type: "Bot" }, body: `${STICKY_MARKER}\n` + "y".repeat(STICKY_LIMIT) }];
+    calls.created = undefined;
+    const r = await appendStickySection(octokit, "o", "r", 7, "### `c` — COMMENT");
+    assert.equal(r.rotated, true);
+    assert.ok(calls.created.body.startsWith(STICKY_MARKER));
+    assert.match(calls.updated.body, /rotated/);
+  });
+});
+
+describe("rotation bookkeeping (dogfood on #75)", () => {
+  it("markSuperseded drops the marker and keeps the note", async () => {
+    const { markSuperseded, GITHUB_COMMENT_LIMIT } = await import("./github.js");
+    const body = markSuperseded(`${STICKY_MARKER}\nold content`);
+    assert.ok(!body.includes(STICKY_MARKER), "marker must go or lookup reselects this comment");
+    assert.match(body, /rotated/);
+    assert.match(body, /old content/);
+    const huge = markSuperseded(`${STICKY_MARKER}\n` + "z".repeat(GITHUB_COMMENT_LIMIT));
+    assert.ok(huge.length <= GITHUB_COMMENT_LIMIT);
+    assert.match(huge, /rotated/);
+  });
+
+  it("a rotated comment is never reselected", async () => {
+    const { markSuperseded } = await import("./github.js");
+    const calls: any = {};
+    const octokit = {
+      paginate: async () => calls.comments,
+      rest: {
+        issues: {
+          listComments: () => {},
+          updateComment: async (p: any) => { calls.updated = p; },
+          createComment: async (p: any) => { calls.created = p; },
+        },
+      },
+    } as any;
+    calls.comments = [{ id: 4, user: { type: "Bot" }, body: `${STICKY_MARKER}\n` + "y".repeat(STICKY_LIMIT) }];
+    await appendStickySection(octokit, "o", "r", 7, "### `c` — COMMENT");
+    assert.ok(!calls.updated.body.includes(STICKY_MARKER));
+    // Next run's lookup over [old, new] must select the new comment.
+    const { findStickyComment } = await import("./github.js");
+    calls.comments = [
+      { id: 4, user: { type: "Bot" }, body: calls.updated.body },
+      { id: 5, user: { type: "Bot" }, body: calls.created.body },
+    ];
+    const found = await findStickyComment(octokit, "o", "r", 7);
+    assert.equal(found?.id, 5);
   });
 });

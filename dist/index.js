@@ -44528,6 +44528,26 @@ const ProviderConfig = objectType({
     json_mode: booleanType().default(true),
     // Extra JSON body fields merged into the request (provider-specific params).
     extra_body: recordType(unknownType()).default({}),
+    // Named per-model overrides sharing this entry's transport + credential
+    // (issue #67): `provider: opencode.flash` merges `{...opencode,
+    // ...opencode.models.flash}`. Every field optional with NO defaults, so an
+    // entry carrying only `model:` cannot clobber the base's retries/timeout
+    // with default values. Overrides replace wholesale per key (shallow merge:
+    // an entry `headers` replaces the base `headers`, it does not extend it).
+    models: recordType(stringType(), objectType({
+        kind: ProviderKind.optional(),
+        protocol: ProviderProtocol.optional(),
+        model: stringType().optional(),
+        base_url: stringType().optional(),
+        key_from: stringType().optional(),
+        auth: AuthConfig.optional(),
+        headers: recordType(stringType()).optional(),
+        endpoint_path: stringType().optional(),
+        retries: numberType().int().min(0).max(5).optional(),
+        timeout_s: numberType().int().min(10).max(600).optional(),
+        json_mode: booleanType().optional(),
+        extra_body: recordType(unknownType()).optional(),
+    })).default({}),
 });
 const AgentConfig = objectType({
     name: stringType().optional(),
@@ -44596,6 +44616,9 @@ const OpenReviewConfig = objectType({
     global_verdict: objectType({
         strategy: enumType(["any_blocking", "max_severity", "majority"]).default("any_blocking"),
         sticky_comment: booleanType().default(true),
+        // update: one mutable status slot (history replaced). append: each run
+        // adds a headed section to the same comment (history kept, see #69).
+        sticky_comment_mode: enumType(["update", "append"]).default("update"),
         fail_check_on_request_changes: booleanType().default(false),
     })
         .default({}),
@@ -45172,6 +45195,49 @@ function legacyKey(kind, keys) {
     if (kind === "openai")
         return keys.openaiApiKey;
     return keys.opencodeApiKey || keys.openaiApiKey;
+}
+const hasOwn = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
+/**
+ * Resolve a dotted agent provider ref `base.entry` to a merged config
+ * (issue #67): `{...base, ...base.models.entry}`. Entry fields are
+ * default-free, so only explicitly set keys overwrite; `undefined` never
+ * overwrites. Throws naming both halves — a typo'd `opencode.flah` must
+ * never silently review with a different model. Exact provider keys resolve
+ * first (callers check that before coming here); legacy unknown plain names
+ * keep their historical warn-and-skip path in main.ts.
+ */
+function resolveDottedProvider(providers, ref) {
+    const dot = ref.indexOf(".");
+    const base = dot < 0 ? ref : ref.slice(0, dot);
+    const entry = dot < 0 ? "" : ref.slice(dot + 1);
+    const prov = hasOwn(providers, base) ? providers[base] : undefined;
+    if (!prov)
+        throw new Error(`Unknown provider '${base}' in agent provider ref '${ref}'.`);
+    const override = prov.models && hasOwn(prov.models, entry) ? prov.models[entry] : undefined;
+    if (!override)
+        throw new Error(`Unknown model entry '${entry}' for provider '${base}' in agent provider ref '${ref}' ` +
+            `(available: ${Object.keys(prov.models ?? {}).join(", ") || "none"}).`);
+    const { models: _ignored, ...rest } = prov;
+    const merged = { ...rest };
+    for (const [k, v] of Object.entries(override))
+        if (v !== undefined)
+            merged[k] = v;
+    return { name: ref, config: merged };
+}
+/**
+ * Fail fast on dotted refs that resolve to nothing (issue #67), before any
+ * budget is spent. Legacy plain-unknown names keep warn-and-skip at runtime.
+ */
+function assertProviderRefs(config) {
+    for (const r of config.reviews) {
+        for (const a of [r.main, ...r.subagents]) {
+            if (hasOwn(config.providers, a.provider))
+                continue;
+            if (!a.provider.includes("."))
+                continue;
+            resolveDottedProvider(config.providers, a.provider);
+        }
+    }
 }
 function resolveProvider(provider, keys, env, sessionId) {
     const def = kindDefaults(provider.kind);
@@ -45838,17 +45904,27 @@ const OUTCOME_LABEL = {
     unparseable: "⚠️ unusable response",
     error: "❌ failed",
 };
-function renderStickyBody(opts) {
+function logoImg() {
+    return `<img src="${logoUrl()}" width="28" height="28" align="left" alt="OpenReview AI" />`;
+}
+/** Fresh sticky body for append mode's first run and post-rotation runs. */
+function freshAppendBody(section) {
+    return [STICKY_MARKER, logoImg(), section, `\n${REREVIEW_LINE}`].join("\n");
+}
+/** Verdict heading text shared by update (`##`) and append (`###`) modes. */
+function verdictTitle(verdict, status) {
+    return status === "error" ? "REVIEW FAILED" : verdict.replace(/_/g, " ").toUpperCase();
+}
+/**
+ * The per-run content core: everything after the heading through the
+ * agent-details block. Shared by the update body and append sections so both
+ * render identically (issue #69).
+ */
+function renderRunBody(opts) {
     const status = opts.status ?? "ok";
+    const findings = opts.findings ?? [];
     const lines = [];
-    lines.push(STICKY_MARKER);
-    lines.push(`<img src="${logoUrl()}" width="28" height="28" align="left" alt="OpenReview AI" />`);
-    // Fail loud: a run where nothing was reviewed must never read as a pass
-    // (issue #46). "APPROVE / No actionable findings. Nice work." was printed for
-    // runs where every agent had errored.
-    lines.push(status === "error"
-        ? `## OpenReview AI — REVIEW FAILED`
-        : `## OpenReview AI — ${opts.verdict.replace(/_/g, " ").toUpperCase()}`);
+    lines.push("");
     lines.push("");
     lines.push("<br />");
     lines.push("");
@@ -45864,7 +45940,7 @@ function renderStickyBody(opts) {
         lines.push("**No review completed.** The verdict below is not a pass — see the agent results.");
         lines.push("");
     }
-    if (opts.findings.length === 0) {
+    if (findings.length === 0) {
         lines.push(status === "ok"
             ? "No actionable findings. Nice work."
             : "No findings were produced (the run did not complete cleanly).");
@@ -45872,13 +45948,13 @@ function renderStickyBody(opts) {
     else {
         lines.push("| Severity | File | Finding | Agent |");
         lines.push("|---|---|---|---|");
-        for (const f of opts.findings.slice(0, 50)) {
+        for (const f of findings.slice(0, 50)) {
             const loc = f.line ? `${f.file}:${f.line}` : f.file;
             const one = f.comment.replace(/\n+/g, " ").replace(/\|/g, "\\|").slice(0, 220);
             lines.push(`| ${f.severity} | \`${loc}\` | ${one} | ${f.agent}/${f.provider} |`);
         }
-        if (opts.findings.length > 50)
-            lines.push(`\n… and ${opts.findings.length - 50} more (see inline comments).`);
+        if (findings.length > 50)
+            lines.push(`\n… and ${findings.length - 50} more (see inline comments).`);
     }
     const agents = opts.agents ?? [];
     const rough = agents.filter((a) => a.outcome !== "ok" && a.outcome !== "no-findings");
@@ -45894,12 +45970,70 @@ function renderStickyBody(opts) {
         lines.push("");
         lines.push("</details>");
     }
+    return lines;
+}
+const REREVIEW_LINE = "<sub>Re-review with `/review`. Config: `.github/openreview.yml`.</sub>";
+function renderStickyBody(opts) {
+    const status = opts.status ?? "ok";
+    const lines = [];
+    lines.push(STICKY_MARKER);
+    lines.push(logoImg());
+    // Fail loud: a run where nothing was reviewed must never read as a pass
+    // (issue #46). "APPROVE / No actionable findings. Nice work." was printed for
+    // runs where every agent had errored.
+    lines.push(`## OpenReview AI — ${verdictTitle(opts.verdict, status)}`);
+    lines.push(...renderRunBody(opts));
     if (opts.runUrl)
         lines.push(`\n<sub>Run: ${opts.runUrl}</sub>`);
-    lines.push(`\n<sub>Re-review with \`/review\`. Config: \`.github/openreview.yml\`.</sub>`);
+    lines.push(`\n${REREVIEW_LINE}`);
     return lines.join("\n");
 }
-async function upsertStickyComment(octokit, owner, repo, issueNumber, body) {
+/**
+ * One run's section for append mode (issue #69): headed by short SHA +
+ * verdict + run link, same content core as the update body, then the run's
+ * footer extras (usage, warnings — assembled by the caller).
+ */
+function renderAppendSection(opts) {
+    const status = opts.status ?? "ok";
+    const short = opts.headSha.slice(0, 7);
+    const runLink = opts.runUrl ? ` ([run](${opts.runUrl}))` : "";
+    const lines = [
+        `### \`${short}\` — ${verdictTitle(opts.verdict, status)}${runLink}`,
+        ...renderRunBody(opts),
+    ];
+    for (const e of opts.extras ?? [])
+        lines.push(e);
+    return lines.join("\n");
+}
+/** GitHub hard-caps comments at 65536 chars; rotate well before hitting it. */
+const STICKY_LIMIT = 60000;
+/** GitHub's hard comment cap. */
+const GITHUB_COMMENT_LIMIT = 65536;
+/**
+ * Mark a rotated comment as superseded (issue #69). Drops the marker so
+ * future lookups select the NEW comment — keeping it re-selected the old one
+ * on every run, rotating forever (dogfood on #75). Caps at the GitHub limit
+ * so the marking edit itself can never 422 (dogfood on #75).
+ */
+function markSuperseded(body) {
+    const mark = `\n\n> _History rotated — continued in the newest sticky comment._`;
+    const unmarked = body.replace(STICKY_MARKER + "\n", "");
+    const full = unmarked + mark;
+    return full.length > GITHUB_COMMENT_LIMIT ? full.slice(0, GITHUB_COMMENT_LIMIT - mark.length) + mark : full;
+}
+/**
+ * Pure append: existing body + section, trailing re-review line kept last.
+ * Reports rotation when the result would pass STICKY_LIMIT — the caller then
+ * creates a fresh comment and marks the old one superseded.
+ */
+function appendToSticky(existing, section) {
+    const tail = `\n${REREVIEW_LINE}`;
+    const base = existing.endsWith(tail) ? existing.slice(0, -tail.length) : existing;
+    const body = `${base}\n\n---\n\n${section}${tail}`;
+    return body.length > STICKY_LIMIT ? { body: "", rotated: true } : { body, rotated: false };
+}
+/** The hardened sticky lookup, shared by update and append modes (issue #53). */
+async function findStickyComment(octokit, owner, repo, issueNumber) {
     // Paginate everything: on a busy PR the sticky may sit past comment 100,
     // and stopping at the first page posted duplicate stickies (issue #53).
     const comments = await octokit.paginate(octokit.rest.issues.listComments, {
@@ -45911,13 +46045,52 @@ async function upsertStickyComment(octokit, owner, repo, issueNumber, body) {
     // Residual: a *different* bot planting the exact first-line marker would
     // still match — but that is overt sabotage with a loud 403, not silent
     // corruption, and authorship cannot be proven further via REST (dogfood #73).
-    const prev = comments.find((c) => c.user?.type === "Bot" && typeof c.body === "string" && c.body.startsWith(STICKY_MARKER));
+    return (comments.find((c) => c.user?.type === "Bot" && typeof c.body === "string" && c.body.startsWith(STICKY_MARKER)) ?? null);
+}
+async function upsertStickyComment(octokit, owner, repo, issueNumber, body) {
+    const prev = await findStickyComment(octokit, owner, repo, issueNumber);
     if (prev) {
         await octokit.rest.issues.updateComment({ owner, repo, comment_id: prev.id, body });
     }
     else {
         await octokit.rest.issues.createComment({ owner, repo, issue_number: issueNumber, body });
     }
+}
+/**
+ * Append-mode publish (issue #69): the sticky becomes a per-run history.
+ * First run creates a marker+logo+section body; later runs append sections.
+ * Past STICKY_LIMIT a fresh comment starts and the old one is marked
+ * superseded, so there is always one canonical comment.
+ *
+ * Two accepted residuals (dogfood on #75), both loud, neither silent:
+ * - Concurrent runs race read-modify-write (the REST API offers no
+ *   compare-and-swap, and update mode has always shared this): the loser’s
+ *   section is missing from history, but its findings remain in that run’s
+ *   inline review and logs. No retry can close it — only narrow it.
+ * - A single section is assumed under STICKY_LIMIT: renderer caps (50
+ *   findings rows, 10 file notes, 12 agents) bound it to ~16KB worst case,
+ *   4x headroom. If caps ever grow past the limit, creation 422s loudly.
+ */
+async function appendStickySection(octokit, owner, repo, issueNumber, section) {
+    const prev = await findStickyComment(octokit, owner, repo, issueNumber);
+    if (!prev?.body) {
+        await octokit.rest.issues.createComment({
+            owner, repo, issue_number: issueNumber, body: freshAppendBody(section),
+        });
+        return { rotated: false };
+    }
+    const { body, rotated } = appendToSticky(prev.body, section);
+    if (!rotated) {
+        await octokit.rest.issues.updateComment({ owner, repo, comment_id: prev.id, body });
+        return { rotated: false };
+    }
+    await octokit.rest.issues.createComment({
+        owner, repo, issue_number: issueNumber, body: freshAppendBody(section),
+    });
+    await octokit.rest.issues.updateComment({
+        owner, repo, comment_id: prev.id, body: markSuperseded(prev.body),
+    });
+    return { rotated: true };
 }
 async function createInlineReview(octokit, owner, repo, pullNumber, commitSha, verdict, findings, 
 /** Commentable line ranges per changed file (new-file coordinates). */
@@ -46588,6 +46761,10 @@ async function run() {
         const dryRun = (core.getInput("dry-run") || "false").toLowerCase() === "true";
         const { config, path } = await loadConfig(configPath);
         logInfo(`Loaded config: ${path} (${config.reviews.length} reviews)`);
+        // Fail fast on dotted provider refs that resolve to nothing (issue #67):
+        // a typo'd `opencode.flah` errors here naming both halves, before any
+        // budget is spent. Legacy plain-unknown names keep warn-and-skip per agent.
+        assertProviderRefs(config);
         if (config.requires_action) {
             const running = runningActionVersion(process.env);
             if (running && !satisfiesActionVersion(config.requires_action, running)) {
@@ -46680,10 +46857,16 @@ async function run() {
                 .map((a) => `${a.name}/${a.provider}`)
                 .join(", ")}] on ${scopedFiles.length} file(s), strategy=${review.strategy}`);
             for (const a of agentDefs) {
-                const provider = config.providers[a.provider];
+                let provider = config.providers[a.provider];
                 if (!provider) {
-                    logWarning(`Review ${review.id}: unknown provider '${a.provider}', skipped agent ${a.name}.`);
-                    continue;
+                    if (a.provider.includes(".")) {
+                        // Validated at load; throws naming both halves as a backstop.
+                        provider = resolveDottedProvider(config.providers, a.provider).config;
+                    }
+                    else {
+                        logWarning(`Review ${review.id}: unknown provider '${a.provider}', skipped agent ${a.name}.`);
+                        continue;
+                    }
                 }
                 tasks.push(() => runAgent({
                     agentName: a.name ?? "agent",
@@ -46708,6 +46891,7 @@ async function run() {
                     outcome: result.outcome,
                     agent: a.name ?? "agent",
                     providerName: a.provider,
+                    model: provider.model,
                 }))
                     .catch((e) => {
                     const msg = e.message;
@@ -46730,6 +46914,7 @@ async function run() {
                         outcome: "error",
                         agent: a.name ?? "agent",
                         providerName: a.provider,
+                        model: provider.model,
                     };
                 }));
             }
@@ -46768,6 +46953,8 @@ async function run() {
                     return "approve"; // placeholder, excluded below
                 // One ballot per distinct provider (issue #12). `any` reproduces the
                 // old pooled behavior exactly; `all`/`majority` resolve disagreement.
+                // Dotted refs (`opencode.flash`) vote under their full ref, so two
+                // models on one transport disagree as two ballots (issue #67).
                 const byProvider = new Map();
                 for (const f of findings) {
                     const list = byProvider.get(f.provider) ?? [];
@@ -46809,7 +46996,9 @@ async function run() {
                     .filter((r) => r.attempts > 0)
                     .map((r) => ({
                     agent: r.agent,
-                    model: config.providers[r.providerName]?.model ?? r.providerName,
+                    // Resolved model travels with the result: dotted refs
+                    // (`opencode.flash`) have no top-level entry to look up (issue #67).
+                    model: r.model,
                     usage: r.usage,
                     seconds: r.seconds,
                     attempts: r.attempts,
@@ -46846,20 +47035,22 @@ async function run() {
         core.setOutput("verdict", global);
         core.setOutput("review_status", status);
         const runUrl = `${process.env.GITHUB_SERVER_URL ?? "https://github.com"}/${owner}/${repo}/actions/runs/${process.env.GITHUB_RUN_ID ?? ""}`;
+        const reviewRows = perReview.map((r) => ({
+            id: r.id,
+            verdict: r.verdict,
+            count: r.findings.length,
+            counted: r.counted,
+        }));
+        const agentRows = perReview.flatMap((r) => r.agents.map((a) => ({
+            ...a,
+            provider: a.providerName,
+            review: r.id,
+        })));
         const stickyBase = renderStickyBody({
             verdict: global,
             status,
-            perReview: perReview.map((r) => ({
-                id: r.id,
-                verdict: r.verdict,
-                count: r.findings.length,
-                counted: r.counted,
-            })),
-            agents: perReview.flatMap((r) => r.agents.map((a) => ({
-                ...a,
-                provider: a.providerName,
-                review: r.id,
-            }))),
+            perReview: reviewRows,
+            agents: agentRows,
             findings: all,
             runUrl,
         });
@@ -46874,44 +47065,40 @@ async function run() {
         // concurrent agents the sum understates tok/s (two 60s calls of 1k tokens
         // each used to report 500 tok/s for 1k tokens in 60s).
         const { modelsLine, agentsLine } = summarizeUsage(perReview.flatMap((r) => r.usage));
-        let sticky = stickyBase;
+        // Per-run footer extras: shared by update mode (appended to the sticky)
+        // and append mode (inside the run's section) — issue #69.
+        const extras = [];
         if (truncated || omitted.length > 0) {
             const bits = [];
             if (truncated)
                 bits.push(`only the first ${MAX_DIFF_FILES} of ${totalFiles} changed files were reviewed`);
             if (omitted.length > 0)
                 bits.push(`${omitted.length} file(s) not reviewable (binary or diff too large): ${omitted.slice(0, 8).map((f) => `\`${f}\``).join(", ")}${omitted.length > 8 ? ", …" : ""}`);
-            sticky += `\n\n> ⚠️ ${bits.join(". ")}.`;
+            extras.push(`\n\n> ⚠️ ${bits.join(". ")}.`);
         }
         if (modelsLine) {
-            sticky += `\n<sub>Models: ${modelsLine}</sub>`;
+            extras.push(`\n<sub>Models: ${modelsLine}</sub>`);
             logInfo(`Usage: ${modelsLine}`);
         }
         if (agentsLine) {
-            sticky += `\n<sub>Agents: ${agentsLine}</sub>`;
+            extras.push(`\n<sub>Agents: ${agentsLine}</sub>`);
             logInfo(`Per-agent usage: ${agentsLine}`);
         }
         if (skippedNoKey.length > 0) {
             const names = [...new Set(skippedNoKey.map((a) => a.agent))].map((a) => `\`${a}\``).join(", ");
-            sticky +=
-                `\n\n> ⚠️ ${skippedNoKey.length} agent(s) skipped — no API key for their provider: ${names}. ` +
-                    `Add the secret each provider's \`key_from\` names (see \`.github/openreview.yml\`).`;
+            extras.push(`\n\n> ⚠️ ${skippedNoKey.length} agent(s) skipped — no API key for their provider: ${names}. ` +
+                `Add the secret each provider's \`key_from\` names (see \`.github/openreview.yml\`).`);
             logWarning(`${skippedNoKey.length} agent(s) skipped for a missing API key: ${names}`);
         }
         if (allErrors.length > 0) {
             const scope = status === "error"
                 ? "⚠️ All agents failed — no review completed"
                 : `⚠️ ${allErrors.length} agent error(s)`;
-            sticky += `\n\n<details><summary>${scope} — details</summary>\n\n${allErrors.join("\n")}\n\nCheck model IDs and base URLs against the provider docs. Secrets are never logged.</details>`;
-        }
-        if (dryRun) {
-            logInfo(`DRY RUN verdict=${global} status=${status}\n${sticky.slice(0, 2000)}`);
-            return;
+            extras.push(`\n\n<details><summary>${scope} — details</summary>\n\n${allErrors.join("\n")}\n\nCheck model IDs and base URLs against the provider docs. Secrets are never logged.</details>`);
         }
         // Inline review runs BEFORE the single sticky publish so a dropped-count
         // note can ride along in the sticky (issue #53). Skipped entirely on dry
         // runs — like the sticky publish below, it must never touch the API.
-        let inlineDropped = 0;
         if (!dryRun && selectInlineFindings(perReview).length > 0) {
             try {
                 // Commentable ranges from the full parsed diff (issue #53): a finding
@@ -46920,22 +47107,39 @@ async function run() {
                 const validLines = new Map(parsedDiff.map((p) => [p.file, parseHunkRanges(p.patch)]));
                 const inline = selectInlineFindings(perReview);
                 const res = await createInlineReview(octokit, owner, repo, prNumber, headSha, global, inline, validLines);
-                inlineDropped = res.dropped;
+                if (res.dropped > 0)
+                    extras.push(`\n<sub>ℹ️ ${res.dropped} finding(s) could not be placed inline (invalid position or over the 20-comment cap).</sub>`);
                 logInfo(`Published inline review (${global}): ${res.posted} posted, ${res.dropped} dropped.`);
             }
             catch (e) {
                 logWarning(`Inline review failed (non-fatal): ${e.message}`);
             }
         }
-        if (inlineDropped > 0)
-            sticky += `\n<sub>ℹ️ ${inlineDropped} finding(s) could not be placed inline (invalid position or over the 20-comment cap).</sub>`;
+        const mode = config.global_verdict.sticky_comment_mode ?? "update";
         if (dryRun) {
-            logInfo(`DRY RUN verdict=${global} status=${status}\n${sticky.slice(0, 2000)}`);
+            const preview = mode === "append" ? "(append section preview)" : stickyBase + extras.join("");
+            logInfo(`DRY RUN verdict=${global} status=${status} mode=${mode}\n${preview.slice(0, 2000)}`);
             return;
         }
         if (config.global_verdict.sticky_comment) {
-            await upsertStickyComment(octokit, owner, repo, prNumber, sticky);
-            logInfo(`Published sticky comment (verdict ${global}, ${all.length} findings).`);
+            if (mode === "append") {
+                const section = renderAppendSection({
+                    verdict: global,
+                    status,
+                    perReview: reviewRows,
+                    agents: agentRows,
+                    findings: all,
+                    headSha,
+                    runUrl,
+                    extras,
+                });
+                const { rotated } = await appendStickySection(octokit, owner, repo, prNumber, section);
+                logInfo(`Appended sticky section (verdict ${global}, ${all.length} findings${rotated ? ", rotated" : ""}).`);
+            }
+            else {
+                await upsertStickyComment(octokit, owner, repo, prNumber, stickyBase + extras.join(""));
+                logInfo(`Published sticky comment (verdict ${global}, ${all.length} findings).`);
+            }
         }
         if (global === "request_changes" && config.global_verdict.fail_check_on_request_changes)
             core.setFailed("OpenReview verdict: request_changes");

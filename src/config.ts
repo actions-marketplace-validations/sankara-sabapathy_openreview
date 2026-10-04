@@ -52,6 +52,26 @@ export const ProviderConfig = z.object({
   json_mode: z.boolean().default(true),
   // Extra JSON body fields merged into the request (provider-specific params).
   extra_body: z.record(z.unknown()).default({}),
+  // Named per-model overrides sharing this entry's transport + credential
+  // (issue #67): `provider: opencode.flash` merges `{...opencode,
+  // ...opencode.models.flash}`. Every field optional with NO defaults, so an
+  // entry carrying only `model:` cannot clobber the base's retries/timeout
+  // with default values. Overrides replace wholesale per key (shallow merge:
+  // an entry `headers` replaces the base `headers`, it does not extend it).
+  models: z.record(z.string(), z.object({
+    kind: ProviderKind.optional(),
+    protocol: ProviderProtocol.optional(),
+    model: z.string().optional(),
+    base_url: z.string().optional(),
+    key_from: z.string().optional(),
+    auth: AuthConfig.optional(),
+    headers: z.record(z.string()).optional(),
+    endpoint_path: z.string().optional(),
+    retries: z.number().int().min(0).max(5).optional(),
+    timeout_s: z.number().int().min(10).max(600).optional(),
+    json_mode: z.boolean().optional(),
+    extra_body: z.record(z.unknown()).optional(),
+  })).default({}),
 });
 export type ProviderConfig = z.infer<typeof ProviderConfig>;
 
@@ -130,6 +150,9 @@ export const OpenReviewConfig = z.object({
     .object({
       strategy: z.enum(["any_blocking", "max_severity", "majority"]).default("any_blocking"),
       sticky_comment: z.boolean().default(true),
+      // update: one mutable status slot (history replaced). append: each run
+      // adds a headed section to the same comment (history kept, see #69).
+      sticky_comment_mode: z.enum(["update", "append"]).default("update"),
       fail_check_on_request_changes: z.boolean().default(false),
     })
     .default({}),
