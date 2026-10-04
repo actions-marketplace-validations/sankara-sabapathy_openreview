@@ -198,6 +198,9 @@ function excerptAround(content: string, index: number, radius = 5): string {
  * Repo-wide file listing + read cache, built ONCE per run and shared by every
  * review's context builder (issue #55). The walk used to repeat per review
  * and every candidate file was re-read per review; now both happen once.
+ *
+ * The walk-time `ignore` is a floor: a later call may narrow with its own
+ * `input.ignore`, but files excluded at walk time cannot come back.
  */
 export type RepoIndex = {
   root: string;
@@ -293,9 +296,17 @@ export function buildContextBlock(input: ContextInput, repoIndex?: RepoIndex): {
   // Single repo walk reused by extras + callers (was up to 3 walks before,
   // and one walk per review before the shared index). Skipped entirely when
   // there is nothing to trace: no context_files and no defined names.
+  // The caller's own `ignore` always applies on top of the walk-time one, so
+  // a shared index never smuggles ignored files into a review (dogfood #74).
   const needWalk = input.contextFiles.length > 0 || definedNames.length > 0;
   const index = repoIndex ?? (needWalk ? buildRepoIndex(input.repoRoot, input.ignore) : undefined);
-  const all = index?.files ?? [];
+  // Seed a privately built index with the step-1 reads so later steps hit
+  // cache instead of re-reading the same files within this call.
+  if (index && index !== repoIndex) {
+    for (const [f, c] of changedContents) index.cache.set(`${f}|12000`, c);
+  }
+  const walked = index?.files ?? [];
+  const all = input.ignore.length > 0 ? walked.filter((f) => !matchesAny(f, input.ignore)) : walked;
 
   // 2. Extra context_files: explicit paths read directly (never silently dropped
   // by walk filters); globs resolved through the walk.
@@ -304,7 +315,7 @@ export function buildContextBlock(input: ContextInput, repoIndex?: RepoIndex): {
     for (const pattern of input.contextFiles) {
       const isGlob = /[*?[\]{}!]/.test(pattern);
       if (!isGlob) {
-        const direct = readCached(repoIndex, input.repoRoot, pattern, 8000);
+        const direct = readCached(index, input.repoRoot, pattern, 8000);
         if (direct !== null) {
           if (!pushed.has(pattern) && !matched.has(pattern)) {
             matched.add(pattern);
@@ -321,7 +332,7 @@ export function buildContextBlock(input: ContextInput, repoIndex?: RepoIndex): {
       for (const f of all) {
         if (matched.size >= 10) break;
         if (matchesAny(f, [pattern]) && !pushed.has(f) && !matched.has(f)) {
-          const content = readCached(repoIndex, input.repoRoot, f, 8000);
+          const content = readCached(index, input.repoRoot, f, 8000);
           if (content === null) continue;
           matched.add(f);
           if (push(`--- context file: ${f} ---\n${content}`)) {
@@ -348,8 +359,17 @@ export function buildContextBlock(input: ContextInput, repoIndex?: RepoIndex): {
       for (const other of candidates) {
         if (emitted.has(other)) continue;
         if (scannedBytes >= MAX_CALLER_SCAN_BYTES) break;
-        const otherContent = readCached(repoIndex, input.repoRoot, other, 60000) ?? "";
-        scannedBytes += otherContent.length;
+        const otherContent = readCached(index, input.repoRoot, other, 60000) ?? "";
+        // True UTF-8 bytes, minus the truncation suffix: `.length` counts
+        // UTF-16 units, so multibyte sources would undercount a byte budget
+        // by up to ~3x (dogfood on #74). One native pass, next to the regex
+        // passes that already cost far more.
+        scannedBytes += Buffer.byteLength(
+          otherContent.endsWith("\n...[file truncated]")
+            ? otherContent.slice(0, -"\n...[file truncated]".length)
+            : otherContent,
+          "utf8"
+        );
         const hits = findCodeMatches(otherContent, word, 2);
         if (hits.length > 0) {
           const excerpt = excerptAround(otherContent, hits[0]);

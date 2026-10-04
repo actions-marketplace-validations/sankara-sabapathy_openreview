@@ -328,3 +328,49 @@ describe("walk nesting (issue #55)", () => {
     }
   });
 });
+
+describe("dogfood round 2 (issue #55)", () => {
+  it("counts multibyte sources in true bytes", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "or-idx-"));
+    try {
+      writeFileSync(path.join(dir, "a.ts"), "export function alpha() { return 1; }\n");
+      // 1000 CJK chars ≈ 3000 bytes but only 1000 UTF-16 units.
+      writeFileSync(path.join(dir, "b.ts"), "const x = alpha(); // 注释填充\n" + "汉".repeat(1000) + "\n");
+      const r = buildContextBlock({
+        repoRoot: dir,
+        scopedFiles: ["a.ts"],
+        contextFiles: [],
+        includeFullFiles: true,
+        maxContextChars: 20000,
+        ignore: [],
+      });
+      const m = /scanned ~(\d+)KB\/\d+KB/.exec(r.stats);
+      assert.ok(m, `stats must report the scan: ${r.stats}`);
+      assert.ok(Number(m[1]) >= 3, `expected ~3KB+ of true bytes, got ${m[1]}KB`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("a shared index still honors the caller's own ignore", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "or-idx-"));
+    try {
+      writeFileSync(path.join(dir, "a.ts"), "export function alpha() { return 1; }\n");
+      writeFileSync(path.join(dir, "keep.ts"), "const x = alpha();\n");
+      writeFileSync(path.join(dir, "skip.gen.ts"), "const y = alpha();\n");
+      const index = buildRepoIndex(dir, []);
+      const r = buildContextBlock({
+        repoRoot: dir,
+        scopedFiles: ["a.ts"],
+        contextFiles: [],
+        includeFullFiles: true,
+        maxContextChars: 20000,
+        ignore: ["*.gen.ts"],
+      }, index);
+      assert.match(r.block, /keep\.ts/);
+      assert.ok(!r.block.includes("skip.gen.ts"), "ignored file leaked into excerpts");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
