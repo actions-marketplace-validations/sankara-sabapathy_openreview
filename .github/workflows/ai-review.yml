@@ -10,6 +10,13 @@ permissions:
   issues: write
   contents: read
 
+# A superseding push cancels the stale run (issue #71): without this, two runs
+# can overlap a push and the older one's file list mixes heads. Event name is
+# part of the key so a manual /review never cancels a pull_request run.
+concurrency:
+  group: openreview-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: true
+
 jobs:
   review:
     # issue_comment runs in the BASE repo, so the secrets are live. Gate the
@@ -32,7 +39,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: sankara-sabapathy/openreview@v1
+      # TEMPORARY (AGENTS.md convention): exercise this branch, not the last
+      # release. The final commit before merge restores @v1 below.
+      - uses: ./
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           config-path: .github/openreview.yml
