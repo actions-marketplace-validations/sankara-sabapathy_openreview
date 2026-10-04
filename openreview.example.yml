@@ -10,9 +10,9 @@ version: 1
 #   - openreview/security@0.7.0
 
 defaults:
-  on: [opened, synchronize, ready_for_review]
+  # Event triggers live in the WORKFLOW (on: pull_request: types:),
+  # not here — see .github/workflows/ai-review.yml.
   command: "/review"
-  draft: false
   lang: en
   ignore: ["**.lock", "dist/**", "*.snap", "package-lock.json"]
   max_diff_chars: 80000

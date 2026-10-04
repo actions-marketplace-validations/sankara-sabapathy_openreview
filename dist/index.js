@@ -44553,7 +44553,7 @@ const AgentConfig = objectType({
     name: stringType().optional(),
     provider: stringType(),
     instructions: stringType(),
-    max_files: numberType().int().positive().optional(),
+    // NOTE: no max_files (issue #57 removed the reserved-but-unused key).
 });
 const VerdictConfig = objectType({
     mode: enumType(["comment", "approve", "request_changes"]).default("comment"),
@@ -44590,9 +44590,10 @@ const OpenReviewConfig = objectType({
     requires_action: stringType().optional(),
     extends: arrayType(stringType()).default([]),
     defaults: objectType({
-        on: arrayType(stringType()).default(["opened", "synchronize", "ready_for_review"]),
+        // NOTE: event triggers (`on:`) and draft-PR handling live in the
+        // WORKFLOW file, not here — the action observes events, never subscribes
+        // (issue #57 removed the dead `on`/`draft` keys outright).
         command: stringType().default("/review"),
-        draft: booleanType().default(false),
         lang: stringType().default("en"),
         ignore: arrayType(stringType()).default([]),
         max_diff_chars: numberType().int().positive().default(80000),
@@ -45460,6 +45461,7 @@ async function runAgent(opts) {
                 confidence: typeof f.confidence === "number" ? f.confidence : 0.7,
                 agent: opts.agentName,
                 provider: opts.providerName,
+                model: opts.provider.model,
             });
         }
         return { findings: out, usage, seconds, attempts: attemptsMade, startedAt, endedAt, outcome: out.length > 0 ? "ok" : "no-findings" };
@@ -45951,7 +45953,7 @@ function renderRunBody(opts) {
         for (const f of findings.slice(0, 50)) {
             const loc = f.line ? `${f.file}:${f.line}` : f.file;
             const one = f.comment.replace(/\n+/g, " ").replace(/\|/g, "\\|").slice(0, 220);
-            lines.push(`| ${f.severity} | \`${loc}\` | ${one} | ${f.agent}/${f.provider} |`);
+            lines.push(`| ${f.severity} | \`${loc}\` | ${one} | ${f.agent}/${f.provider}/${f.model} |`);
         }
         if (findings.length > 50)
             lines.push(`\n… and ${findings.length - 50} more (see inline comments).`);
@@ -46643,6 +46645,11 @@ async function loadConfig(configPath) {
  * the rest — an invisible skip is worse than a visible one. */
 const MAX_DIFF_FILES = 300;
 async function getPrDiff(octokit, owner, repo, pr, payloadHeadSha) {
+    // Baseline head BEFORE listing: the payload's when available, else one
+    // pulls.get up front. The issue_comment path carries no payload sha, so
+    // without this its mid-pagination pushes are undetectable (dogfood on #78).
+    const baseline = payloadHeadSha ??
+        (await octokit.rest.pulls.get({ owner, repo, pull_number: pr })).data.head.sha;
     const files = await octokit.paginate(octokit.rest.pulls.listFiles, {
         owner, repo, pull_number: pr, per_page: 100,
     });
@@ -46662,11 +46669,19 @@ async function getPrDiff(octokit, owner, repo, pr, payloadHeadSha) {
         logWarning(`Diff truncated: PR touches ${files.length} files, reviewing the first ${MAX_DIFF_FILES}.`);
     if (omitted.length > 0)
         logWarning(`${omitted.length} file(s) have no renderable patch (binary or too large) and were not sent to reviewers: ${omitted.slice(0, 10).join(", ")}${omitted.length > 10 ? ", …" : ""}`);
-    // The pull_request payload already carries head.sha; only fall back to an
-    // extra pulls.get when it is missing (issue_comment path).
-    const headSha = payloadHeadSha ??
-        (await octokit.rest.pulls.get({ owner, repo, pull_number: pr })).data.head.sha;
-    return { fileNames: names, diff: parts.join("\n\n"), headSha, omitted, truncated, totalFiles: files.length };
+    // Revalidate the head AFTER listing (issue #71): a `synchronize` push
+    // landing mid-pagination leaves the file list and the baseline sha from
+    // different heads. pulls.get calls are worth it — on mismatch this run
+    // aborts: the newer push always triggers a fresh review, so shipping a
+    // possibly-mixed analysis is pure downside. Fail-closed per #46: error
+    // outputs, nothing published, never a pass.
+    const { data: pull } = await octokit.rest.pulls.get({ owner, repo, pull_number: pr });
+    const freshSha = pull.head.sha;
+    const stale = baseline !== freshSha;
+    if (stale)
+        logWarning(`PR head moved during diff fetch (${baseline.slice(0, 7)} -> ${freshSha.slice(0, 7)}); ` +
+            `file list may mix both heads, inline positions revalidated before posting.`);
+    return { fileNames: names, diff: parts.join("\n\n"), headSha: freshSha, omitted, truncated, totalFiles: files.length, stale };
 }
 /**
  * Footer lines for the sticky (issue #52). Models line groups true spend by
@@ -46804,7 +46819,16 @@ async function run() {
         // Stable session per workflow run (required by OpenCode Go/Zen routing).
         const sessionId = process.env.GITHUB_RUN_ID ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
         logInfo(`Reviewing PR #${prNumber} in ${owner}/${repo}`);
-        const { fileNames, diff, headSha, omitted, truncated, totalFiles } = await getPrDiff(octokit, owner, repo, prNumber, ctx.payload.pull_request?.head?.sha);
+        const { fileNames, diff, headSha, omitted, truncated, totalFiles, stale } = await getPrDiff(octokit, owner, repo, prNumber, ctx.payload.pull_request?.head?.sha);
+        if (stale) {
+            // Head moved mid-fetch: the file list may mix two pushes. Abort — the
+            // newer push triggers its own run. Outputs mirror the no-review path
+            // below so consumers never read this as a pass (issue #46).
+            core.setOutput("verdict", "comment");
+            core.setOutput("review_status", "error");
+            logWarning("Head moved during diff fetch; aborting — a fresh review runs on the new head.");
+            return;
+        }
         logInfo(`Diff: ${fileNames.length} files, ${diff.length} chars (head ${headSha.slice(0, 7)})`);
         logDebug(`Diff files: ${fileNames.join(", ")}`);
         if (truncated)

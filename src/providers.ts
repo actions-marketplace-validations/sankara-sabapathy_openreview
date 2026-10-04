@@ -35,6 +35,8 @@ export type Finding = {
   confidence: number; // 0-1
   agent: string;
   provider: string;
+  /** Resolved model ID (dotted refs have no top-level entry to look up). */
+  model: string;
 };
 
 const FINDINGS_SCHEMA =
@@ -744,6 +746,7 @@ export async function runAgent(opts: {
         confidence: typeof f.confidence === "number" ? f.confidence : 0.7,
         agent: opts.agentName,
         provider: opts.providerName,
+        model: opts.provider.model,
       });
     }
     return { findings: out, usage, seconds, attempts: attemptsMade, startedAt, endedAt, outcome: out.length > 0 ? "ok" : "no-findings" };

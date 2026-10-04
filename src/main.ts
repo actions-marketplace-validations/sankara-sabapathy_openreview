@@ -76,6 +76,8 @@ export type PrDiff = {
   truncated: boolean;
   /** Total files touched by the PR, before the MAX_DIFF_FILES cap. */
   totalFiles: number;
+  /** True when the head moved mid-fetch (file list may mix two heads). */
+  stale: boolean;
 };
 
 export async function getPrDiff(
@@ -85,6 +87,12 @@ export async function getPrDiff(
   pr: number,
   payloadHeadSha?: string
 ): Promise<PrDiff> {
+  // Baseline head BEFORE listing: the payload's when available, else one
+  // pulls.get up front. The issue_comment path carries no payload sha, so
+  // without this its mid-pagination pushes are undetectable (dogfood on #78).
+  const baseline =
+    payloadHeadSha ??
+    (await octokit.rest.pulls.get({ owner, repo, pull_number: pr })).data.head.sha;
   const files = await octokit.paginate(octokit.rest.pulls.listFiles, {
     owner, repo, pull_number: pr, per_page: 100,
   });
@@ -106,12 +114,21 @@ export async function getPrDiff(
     logWarning(
       `${omitted.length} file(s) have no renderable patch (binary or too large) and were not sent to reviewers: ${omitted.slice(0, 10).join(", ")}${omitted.length > 10 ? ", …" : ""}`
     );
-  // The pull_request payload already carries head.sha; only fall back to an
-  // extra pulls.get when it is missing (issue_comment path).
-  const headSha =
-    payloadHeadSha ??
-    (await octokit.rest.pulls.get({ owner, repo, pull_number: pr })).data.head.sha;
-  return { fileNames: names, diff: parts.join("\n\n"), headSha, omitted, truncated, totalFiles: files.length };
+  // Revalidate the head AFTER listing (issue #71): a `synchronize` push
+  // landing mid-pagination leaves the file list and the baseline sha from
+  // different heads. pulls.get calls are worth it — on mismatch this run
+  // aborts: the newer push always triggers a fresh review, so shipping a
+  // possibly-mixed analysis is pure downside. Fail-closed per #46: error
+  // outputs, nothing published, never a pass.
+  const { data: pull } = await octokit.rest.pulls.get({ owner, repo, pull_number: pr });
+  const freshSha = pull.head.sha;
+  const stale = baseline !== freshSha;
+  if (stale)
+    logWarning(
+      `PR head moved during diff fetch (${baseline.slice(0, 7)} -> ${freshSha.slice(0, 7)}); ` +
+        `file list may mix both heads, inline positions revalidated before posting.`
+    );
+  return { fileNames: names, diff: parts.join("\n\n"), headSha: freshSha, omitted, truncated, totalFiles: files.length, stale };
 }
 
 /** One agent's accounted spend: totals across all its attempts (issue #52). */
@@ -273,9 +290,18 @@ export async function run(): Promise<void> {
     const sessionId =
       process.env.GITHUB_RUN_ID ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
     logInfo(`Reviewing PR #${prNumber} in ${owner}/${repo}`);
-    const { fileNames, diff, headSha, omitted, truncated, totalFiles } = await getPrDiff(
+    const { fileNames, diff, headSha, omitted, truncated, totalFiles, stale } = await getPrDiff(
       octokit, owner, repo, prNumber, (ctx.payload as any).pull_request?.head?.sha
     );
+    if (stale) {
+      // Head moved mid-fetch: the file list may mix two pushes. Abort — the
+      // newer push triggers its own run. Outputs mirror the no-review path
+      // below so consumers never read this as a pass (issue #46).
+      core.setOutput("verdict", "comment");
+      core.setOutput("review_status", "error");
+      logWarning("Head moved during diff fetch; aborting — a fresh review runs on the new head.");
+      return;
+    }
     logInfo(`Diff: ${fileNames.length} files, ${diff.length} chars (head ${headSha.slice(0, 7)})`);
     logDebug(`Diff files: ${fileNames.join(", ")}`);
     if (truncated)

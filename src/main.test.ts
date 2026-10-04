@@ -55,7 +55,7 @@ describe("runPooled (issue #51)", () => {
 });
 
 describe("getPrDiff (issue #50)", () => {
-  const fake = (files: { filename: string; patch?: string }[], headSha = "abc1234") => ({
+  const fake = (files: { filename: string; patch?: string }[], headSha = "deadbee") => ({
     paginate: async () => files,
     rest: { pulls: { listFiles: () => {}, get: async () => ({ data: { head: { sha: headSha } } }) } },
   }) as any;
@@ -96,23 +96,52 @@ describe("getPrDiff (issue #50)", () => {
     assert.equal(out.truncated, true);
   });
 
-  it("falls back to pulls.get only when the payload sha is missing", async () => {
-    let getCalls = 0;
-    const ok = {
-      paginate: async () => [{ filename: "a.ts", patch: "@@ -1 +1 @@\n+x" }],
-      rest: {
-        pulls: {
-          listFiles: () => {},
-          get: async () => { getCalls++; return { data: { head: { sha: "from-api" } } }; },
+  it("revalidates the head after listing and reports a mid-fetch move", async () => {
+    const listing = [{ filename: "a.ts", patch: "@@ -1 +1 @@\n+x" }];
+    const mk = (shas: string[]) => {
+      let n = 0;
+      return {
+        paginate: async () => listing,
+        rest: {
+          pulls: {
+            listFiles: () => {},
+            get: async () => ({ data: { head: { sha: shas[Math.min(n++, shas.length - 1)] } } }),
+          },
         },
-      },
-    } as any;
-    const withPayload = await getPrDiff(ok, "o", "r", 1, "from-payload");
-    assert.equal(withPayload.headSha, "from-payload");
-    assert.equal(getCalls, 0);
-    const withoutPayload = await getPrDiff(ok, "o", "r", 1, undefined);
-    assert.equal(withoutPayload.headSha, "from-api");
-    assert.equal(getCalls, 1);
+      } as any;
+    };
+    // Head steady: fresh sha used, not stale.
+    const steady = await getPrDiff(mk(["same-sha"]), "o", "r", 1, "same-sha");
+    assert.equal(steady.headSha, "same-sha");
+    assert.equal(steady.stale, false);
+    // Push landed mid-fetch: anchor to the fresh sha and say so.
+    const moved = await getPrDiff(mk(["new-sha"]), "o", "r", 1, "old-sha");
+    assert.equal(moved.headSha, "new-sha");
+    assert.equal(moved.stale, true);
+  });
+
+  it("covers the issue_comment path: baseline fetched up front (dogfood on #78)", async () => {
+    const listing = [{ filename: "a.ts", patch: "@@ -1 +1 @@\n+x" }];
+    const mk = (shas: string[]) => {
+      let n = 0;
+      return {
+        paginate: async () => listing,
+        rest: {
+          pulls: {
+            listFiles: () => {},
+            get: async () => ({ data: { head: { sha: shas[Math.min(n++, shas.length - 1)] } } }),
+          },
+        },
+      } as any;
+    };
+    // No payload sha: steady across both calls, not stale.
+    const steady = await getPrDiff(mk(["s", "s"]), "o", "r", 1, undefined);
+    assert.equal(steady.headSha, "s");
+    assert.equal(steady.stale, false);
+    // Push between the two calls: detected.
+    const moved = await getPrDiff(mk(["old", "new"]), "o", "r", 1, undefined);
+    assert.equal(moved.headSha, "new");
+    assert.equal(moved.stale, true);
   });
 });
 

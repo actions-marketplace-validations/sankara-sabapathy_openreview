@@ -18,10 +18,12 @@ permissions:
   pull-requests: write
   issues: write
   contents: read
-# One review per PR at a time.
+# One review per PR at a time: a superseding push cancels the stale run instead
+# of reviewing an already-outdated head (its file list could mix two pushes).
+# Event name is part of the key so a manual /review never cancels a PR run.
 concurrency:
-  group: openreview-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}
-  cancel-in-progress: false
+  group: openreview-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}
+  cancel-in-progress: true
 jobs:
   review:
     # issue_comment runs in the BASE repo, so your secrets are live. Gate the

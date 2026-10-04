@@ -10,6 +10,15 @@ permissions:
   issues: write
   contents: read
 
+# A superseding push cancels the stale run (issue #71): without this, two runs
+# can overlap a push and the older one's file list mixes heads. Event name is
+# part of the key so a manual /review never cancels a pull_request run.
+# Overlap without a push is harmless: identical heads never trip the
+# mid-fetch abort, and each run publishes its own verdict.
+concurrency:
+  group: openreview-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: true
+
 jobs:
   review:
     # issue_comment runs in the BASE repo, so the secrets are live. Gate the
