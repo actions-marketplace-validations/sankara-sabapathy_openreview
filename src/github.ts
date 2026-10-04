@@ -192,6 +192,12 @@ export async function createInlineReview(
   // never made it inline (dogfood on #73).
   for (const f of findings) {
     if (!f.line || f.line <= 0) {
+      // File-level notes need a real path too (dogfood on #73): a
+      // model-invented file would otherwise publish unchecked.
+      if (!validLines.has(f.file)) {
+        dropped++;
+        continue;
+      }
       fileLevel.push({ file: f.file, comment: f.comment });
       continue;
     }

@@ -604,13 +604,9 @@ export async function run(): Promise<void> {
       logInfo(`DRY RUN verdict=${global} status=${status}\n${sticky.slice(0, 2000)}`);
       return;
     }
-    if (config.global_verdict.sticky_comment) {
-      await upsertStickyComment(octokit, owner, repo, prNumber, sticky);
-      logInfo(`Published sticky comment (verdict ${global}, ${all.length} findings).`);
-    }
-    // Inline review runs BEFORE the sticky publish so a dropped-count note can
-    // ride along in the sticky (issue #53). Skipped entirely on dry runs —
-    // like the sticky publish below, it must never touch the API (dogfood #73).
+    // Inline review runs BEFORE the single sticky publish so a dropped-count
+    // note can ride along in the sticky (issue #53). Skipped entirely on dry
+    // runs — like the sticky publish below, it must never touch the API.
     let inlineDropped = 0;
     if (!dryRun && selectInlineFindings(perReview).length > 0) {
       try {

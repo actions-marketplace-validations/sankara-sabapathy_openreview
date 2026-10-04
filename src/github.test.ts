@@ -220,3 +220,25 @@ describe("createInlineReview cap handling (dogfood on #73)", () => {
     assert.match(calls.review.body, /late file-level note/);
   });
 });
+
+describe("createInlineReview file-level validation (dogfood on #73)", () => {
+  const ranges = new Map([["src/a.ts", [{ start: 1, end: 100 }]]]);
+  const mock = (calls: any) => ({
+    rest: { pulls: { createReview: async (p: any) => { calls.review = p; } } },
+  }) as any;
+
+  it("a line-less finding with an invented path is dropped, not published", async () => {
+    const calls: any = {};
+    const res = await createInlineReview(
+      mock(calls), "o", "r", 1, "sha", "comment",
+      [
+        { file: "nope.ts", comment: "invented file note" },
+        { file: "src/a.ts", comment: "real file note" },
+      ],
+      ranges
+    );
+    assert.deepEqual(res, { posted: 0, dropped: 1 });
+    assert.match(calls.review.body, /real file note/);
+    assert.doesNotMatch(calls.review.body, /invented file note/);
+  });
+});
