@@ -109,6 +109,7 @@ describe("parseCase", () => {
     assert.throws(() => parseCase({ id: "x", bugs: [{ ...bug(), lines: [5, 2] }] }, "x/case.json"), /x\/case\.json: b1: lines/);
     assert.throws(() => parseCase({ id: "x", bugs: [bug(), bug()] }, "x/case.json"), /duplicate bug id/);
     assert.throws(() => parseCase({ id: "x", bugs: [{ ...bug(), severity: "suggestion" }] }, "x/case.json"), /severity/);
+    assert.throws(() => parseCase({ id: "x", bugs: [{ ...bug(), keywords: ["ok", 3] }] }, "x/case.json"), /keywords/);
   });
 });
 

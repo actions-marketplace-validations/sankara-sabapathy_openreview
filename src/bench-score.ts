@@ -209,7 +209,8 @@ export function parseCase(raw: any, where: string): BenchCase {
     if (!Array.isArray(b.lines) || b.lines.length !== 2 || !b.lines.every((n: unknown) => Number.isInteger(n) && (n as number) > 0) || b.lines[0] > b.lines[1])
       fail(`${b.id}: lines must be [start, end] with 1 <= start <= end`);
     if (b.severity !== "high" && b.severity !== "medium") fail(`${b.id}: severity must be high or medium`);
-    if (!Array.isArray(b.keywords) || b.keywords.length === 0) fail(`${b.id}: keywords must be a non-empty array`);
+    if (!Array.isArray(b.keywords) || b.keywords.length === 0 || !b.keywords.every((k: unknown) => typeof k === "string" && k.trim() !== ""))
+      fail(`${b.id}: keywords must be a non-empty array of non-empty strings`);
   }
   return {
     id: raw.id,
