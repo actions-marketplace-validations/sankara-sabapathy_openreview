@@ -51,10 +51,81 @@ function freshAppendBody(section: string): string {
   return [STICKY_MARKER, logoImg(), section, `\n${REREVIEW_LINE}`].join("\n");
 }
 
+/** One review's row in the sticky. `synthesis`/`dismissed` come from the
+ * main agent in `main_mode: synthesize`. */
+export type ReviewRow = {
+  id: string;
+  verdict: string;
+  count: number;
+  counted?: boolean;
+  synthesis?: { summary: string; walkthrough: { file: string; change: string }[] };
+  dismissed?: { file: string; line?: number; severity: string; agent: string; reason: string }[];
+};
+
+/** Table-cell safe: one line, pipes escaped. */
+const cell = (s: string, n: number) => s.replace(/\s+/g, " ").replace(/\|/g, "\\|").slice(0, n);
+
+/** Character budget for all reviews' summary/walkthrough/dismissed blocks
+ * together, so a many-review config cannot push one append section toward
+ * STICKY_LIMIT (see appendStickySection's size assumption). */
+export const SYNTHESIS_BUDGET = 16000;
+
+/** Summary, walkthrough and dismissed findings for every review that has
+ * them. Labels name the review only when more than one review is shown. */
+export function renderSynthesis(rows: ReviewRow[]): string[] {
+  const withData = rows.filter(
+    (r) => (r.synthesis && (r.synthesis.summary || r.synthesis.walkthrough.length > 0)) || (r.dismissed?.length ?? 0) > 0
+  );
+  if (withData.length === 0) return [];
+  const label = (r: ReviewRow) => (rows.length > 1 ? ` — \`${r.id}\`` : "");
+  const out: string[] = [];
+  let used = 0;
+  for (let i = 0; i < withData.length; i++) {
+    const r = withData[i];
+    const block: string[] = [];
+    if (r.synthesis?.summary) {
+      block.push(`**Summary${label(r)}**`, "", r.synthesis.summary.replace(/\s+/g, " ").slice(0, 1200), "");
+    }
+    const walk = r.synthesis?.walkthrough ?? [];
+    if (walk.length > 0) {
+      const shown = walk.slice(0, 25);
+      block.push(`<details><summary>📋 Walkthrough${label(r)} (${walk.length} file${walk.length === 1 ? "" : "s"})</summary>`, "");
+      block.push("| File | Change |", "|---|---|");
+      for (const w of shown) block.push(`| \`${cell(w.file, 160)}\` | ${cell(w.change, 240)} |`);
+      if (walk.length > shown.length) block.push("", `… and ${walk.length - shown.length} more.`);
+      block.push("", "</details>", "");
+    }
+    const dis = r.dismissed ?? [];
+    if (dis.length > 0) {
+      const shown = dis.slice(0, 15);
+      block.push(
+        `<details><summary>🧹 ${dis.length} finding(s) dismissed by the synthesizer${label(r)}</summary>`,
+        "",
+        "| Severity | File | Reported by | Why dismissed |",
+        "|---|---|---|---|"
+      );
+      for (const d of shown) {
+        const loc = d.line ? `${d.file}:${d.line}` : d.file;
+        block.push(`| ${d.severity} | \`${cell(loc, 160)}\` | ${cell(d.agent, 80)} | ${cell(d.reason, 240)} |`);
+      }
+      if (dis.length > shown.length) block.push("", `… and ${dis.length - shown.length} more.`);
+      block.push("", "</details>", "");
+    }
+    const text = block.join("\n");
+    if (used + text.length > SYNTHESIS_BUDGET && out.length > 0) {
+      out.push(`<sub>Summary for ${withData.length - i} more review(s) omitted for length.</sub>`, "");
+      break;
+    }
+    out.push(...block);
+    used += text.length;
+  }
+  return out;
+}
+
 type RunContentOpts = {
   verdict: string;
   status?: RunStatus;
-  perReview: { id: string; verdict: string; count: number; counted?: boolean }[];
+  perReview: ReviewRow[];
   agents?: {
     review: string;
     agent: string;
@@ -105,6 +176,7 @@ function renderRunBody(opts: RunContentOpts): string[] {
       `- \`${r.id}\`: **${r.counted === false ? "not reviewed" : r.verdict}** (${r.count} findings)`
     );
   lines.push("");
+  lines.push(...renderSynthesis(opts.perReview));
   if (status === "error") {
     lines.push("**No review completed.** The verdict below is not a pass — see the agent results.");
     lines.push("");
@@ -152,7 +224,7 @@ const REREVIEW_LINE = "<sub>Re-review with `/review`. Config: `.github/openrevie
 export function renderStickyBody(opts: {
   verdict: string;
   status?: RunStatus;
-  perReview: { id: string; verdict: string; count: number; counted?: boolean }[];
+  perReview: ReviewRow[];
   agents?: {
     review: string;
     agent: string;
