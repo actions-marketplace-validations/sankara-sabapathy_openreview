@@ -32,6 +32,9 @@ describe("findingMatchesBug", () => {
     assert.equal(findingMatchesBug(f(11, "x", "src/b.ts"), bug(), 3), false);
     assert.equal(findingMatchesBug(f(11, "x", "b/src/a.ts"), bug(), 3), true);
     assert.equal(findingMatchesBug(f(11, "x", "./src/a.ts"), bug(), 3), true);
+    // A real top-level b/ directory must not be stripped from the expectation.
+    assert.equal(findingMatchesBug(f(11, "x", "b/lib.ts"), bug({ file: "b/lib.ts" }), 3), true);
+    assert.equal(findingMatchesBug(f(11, "x", "lib.ts"), bug({ file: "b/lib.ts" }), 3), false);
   });
 
   it("uses keywords only when the finding has no line", () => {
@@ -82,6 +85,12 @@ describe("totals", () => {
     assert.equal(t.precision, null);
     assert.equal(t.recall, null);
     assert.equal(t.f1, null);
+  });
+
+  it("reports F1 = 0, not n/a, when every finding is wrong and every bug missed", () => {
+    const c: BenchCase = { id: "c", language: "ts", description: "", bugs: [bug()] };
+    const t = totals([scoreCase(c, [f(50)], opts)]);
+    assert.deepEqual([t.precision, t.recall, t.f1], [0, 0, 0]);
   });
 
   it("computes precision, recall and F1 across cases", () => {

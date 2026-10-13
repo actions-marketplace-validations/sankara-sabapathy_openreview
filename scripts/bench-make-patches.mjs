@@ -12,8 +12,9 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const casesDir = new URL("../benchmark/cases/", import.meta.url).pathname;
+const casesDir = fileURLToPath(new URL("../benchmark/cases/", import.meta.url));
 
 function walk(root, dir = root, out = []) {
   if (!existsSync(dir)) return out;
@@ -32,7 +33,7 @@ function fileDiff(caseDir, file) {
     existsSync(before) ? before : "/dev/null", existsSync(after) ? after : "/dev/null"];
   let out;
   try {
-    out = execFileSync("git", args, { encoding: "utf8" });
+    out = execFileSync("git", args, { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
   } catch (e) {
     // git diff --no-index exits 1 when the files differ.
     if (e.status !== 1) throw e;

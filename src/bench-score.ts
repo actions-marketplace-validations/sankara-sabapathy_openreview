@@ -51,7 +51,7 @@ const RANK: Record<Severity, number> = { high: 0, medium: 1, suggestion: 2 };
  * "SQL injection on line 40" is not credit for a bug on line 14.
  */
 export function findingMatchesBug(f: ScoredFinding, bug: ExpectedBug, tolerance: number): boolean {
-  if (normalizePath(f.file) !== normalizePath(bug.file)) return false;
+  if (!samePath(f.file, bug.file)) return false;
   if (typeof f.line === "number" && f.line > 0) {
     return f.line >= bug.lines[0] - tolerance && f.line <= bug.lines[1] + tolerance;
   }
@@ -59,8 +59,14 @@ export function findingMatchesBug(f: ScoredFinding, bug: ExpectedBug, tolerance:
   return bug.keywords.some((k) => text.includes(k.toLowerCase()));
 }
 
-function normalizePath(p: string): string {
-  return p.replace(/^\.?\//, "").replace(/^[ab]\//, "");
+/** Models sometimes echo the diff header's `b/` (or a `./`) on the path. Only
+ * the finding's side is lenient: a case whose real top-level directory is
+ * `a/` or `b/` still matches exactly. */
+function samePath(found: string, expected: string): boolean {
+  const clean = (p: string) => p.replace(/^(\.\/)+/, "");
+  const f = clean(found);
+  const e = clean(expected);
+  return f === e || f.replace(/^[ab]\//, "") === e;
 }
 
 export type CaseScore = {
@@ -150,7 +156,8 @@ export function totals(scores: CaseScore[]): Totals {
   const bugs = sum("bugs");
   const precision = tp + fp > 0 ? tp / (tp + fp) : null;
   const recall = bugs > 0 ? tp / bugs : null;
-  const f1 = precision !== null && recall !== null && precision + recall > 0 ? (2 * precision * recall) / (precision + recall) : null;
+  // P = R = 0 is a defined (bad) score, not an undefined one.
+  const f1 = precision === null || recall === null ? null : precision + recall > 0 ? (2 * precision * recall) / (precision + recall) : 0;
   return {
     cases: scores.length,
     bugs,
