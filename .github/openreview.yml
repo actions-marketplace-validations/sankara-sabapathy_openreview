@@ -37,10 +37,11 @@ defaults:
   # max_findings: 10
 
 providers:
-  # --- Active: OpenCode Go, free tier ---
-  # This repo reviews itself with `space-bunny-free`. Go ships exactly two free
-  # models; the other one, `longcat-2.5-preview-free`, was tried first and
-  # REJECTED for review work:
+  # --- Active: OpenCode Go subscription ---
+  # This repo reviews itself with `deepseek-v4-flash` (Go subscription). It
+  # previously used the free `space-bunny-free`, until opencode started
+  # answering "Model is unavailable" for it (2026-10, #81). The other free
+  # model, `longcat-2.5-preview-free`, was tried first and REJECTED for review work:
   #   * it answers a full-size diff with 7-8k chars of markdown prose and no
   #     JSON at all, so every agent reported "unusable response" -> zero findings
   #   * it ignores `response_format: {type: json_object}`, so `json_mode` cannot
@@ -57,7 +58,7 @@ providers:
     # Prefer protocol below; both are shown here for reference.
     kind: opencode
     protocol: openai-chat # openai-chat | anthropic-messages
-    model: space-bunny-free
+    model: deepseek-v4-flash
     base_url: https://opencode.ai/zen/go/v1
     key_from: secrets.OPENCODE_API_KEY # any $NAME: "secrets.FOO" | "env.FOO"
     # json_mode stays TRUE (the default). Turning it off removes
@@ -69,7 +70,9 @@ providers:
     # endpoint_path: /chat/completions # default per protocol (/chat/completions, /v1/messages)
     # json_mode: true # set false ONLY for providers that reject response_format
     # extra_body: { temperature: 0.1 } # extra JSON body fields merged into requests
-    # Reasoning models spend their thinking from the 2000-token output budget:
+    # Reasoning models spend their thinking from the 2000-token output budget
+    # (deepseek-v4-flash billed 100k+ reasoning tokens uncapped, see
+    # website/docs/providers/opencode-go.md). Measured on space-bunny-free:
     # on a large diff space-bunny-free thinks ~9.5k chars, hits
     # finish_reason=length with empty content, and both agents end unparseable
     # (measured 0/5 parseable; a bigger cap does NOT help — thinking expands to
