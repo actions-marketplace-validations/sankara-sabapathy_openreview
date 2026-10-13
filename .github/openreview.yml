@@ -78,7 +78,11 @@ providers:
     # (measured 0/5 parseable; a bigger cap does NOT help — thinking expands to
     # fill it, 0/2 at 8000). Capping the thinking fixes it (2/2 parseable with
     # real findings on the same 80k-char diff), so this stays active.
-    extra_body: { reasoning_effort: "low" }
+    # deepseek-v4-flash is different: it reasons as plain prose in `content`
+    # and only then emits the JSON, so the fixed 2000-token cap cut both agents
+    # off mid-analysis on #81 (2.0k out each, "unusable response").
+    # extra_body is merged last, so max_tokens here overrides that cap.
+    extra_body: { reasoning_effort: "low", max_tokens: 8000 }
     # retries: 2 # attempts after the first for empty/5xx/429/network (0-5)
     # timeout_s: 420 # per-attempt TOTAL cap in seconds (10-600); 90s idle + 60s/1KB trickle guards always on
     # Named per-model overrides sharing this entry's transport + credential
