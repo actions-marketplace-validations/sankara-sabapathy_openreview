@@ -39,19 +39,22 @@ defaults:
   # max_findings: 10
 
 providers:
-  # --- Active: OpenCode Go, free tier ---
-  # This repo reviews itself with `space-bunny-free`. Go ships exactly two free
-  # models; the other one, `longcat-2.5-preview-free`, was tried first and
-  # REJECTED for review work:
+  # --- Active: OpenCode Go subscription, deepseek-v4-flash ---
+  # This repo reviews itself with `deepseek-v4-flash` on the Go subscription
+  # ($30 monthly included usage). It replaced `space-bunny-free`, which OpenCode
+  # answered with "Upstream request failed: Model is unavailable" on 2026-10-13
+  # (PR #83). The other free model, `longcat-2.5-preview-free`, stays REJECTED
+  # for review work:
   #   * it answers a full-size diff with 7-8k chars of markdown prose and no
   #     JSON at all, so every agent reported "unusable response" -> zero findings
   #   * it ignores `response_format: {type: json_object}`, so `json_mode` cannot
   #     save it, and neither could a much harder prompt instruction
-  # Both are reasoning models; the difference is that space-bunny-free honours
-  # the JSON contract on a real diff while longcat does not. Verify a model
-  # before trusting it: `npm run probe:model <id>` (needs OPENCODE_API_KEY).
+  # deepseek-v4-flash is a heavy reasoner: uncapped it billed 100k+ thinking
+  # tokens on one PR and sometimes returned empty content (see extra_body below).
+  # Verify a model before trusting it: `npm run probe:model <id>` (needs
+  # OPENCODE_API_KEY).
   #
-  # Deepseek/GLM/Kimi etc. are available on the same subscription — see
+  # GLM/Kimi/Qwen etc. are available on the same subscription — see
   # website/docs/providers/opencode-go.md and openreview.example.yml for the
   # full provider matrix. Only the model this repo actually uses is configured.
   opencode:
@@ -59,7 +62,7 @@ providers:
     # Prefer protocol below; both are shown here for reference.
     kind: opencode
     protocol: openai-chat # openai-chat | anthropic-messages
-    model: space-bunny-free
+    model: deepseek-v4-flash
     base_url: https://opencode.ai/zen/go/v1
     key_from: secrets.OPENCODE_API_KEY # any $NAME: "secrets.FOO" | "env.FOO"
     # json_mode stays TRUE (the default). Turning it off removes
@@ -71,12 +74,13 @@ providers:
     # endpoint_path: /chat/completions # default per protocol (/chat/completions, /v1/messages)
     # json_mode: true # set false ONLY for providers that reject response_format
     # extra_body: { temperature: 0.1 } # extra JSON body fields merged into requests
-    # Reasoning models spend their thinking from the 2000-token output budget:
-    # on a large diff space-bunny-free thinks ~9.5k chars, hits
-    # finish_reason=length with empty content, and both agents end unparseable
-    # (measured 0/5 parseable; a bigger cap does NOT help — thinking expands to
-    # fill it, 0/2 at 8000). Capping the thinking fixes it (2/2 parseable with
-    # real findings on the same 80k-char diff), so this stays active.
+    # Reasoning models spend their thinking from the 2000-token output budget.
+    # Measured on space-bunny-free: an 80k-char diff thought ~9.5k chars, hit
+    # finish_reason=length with empty content, and both agents ended
+    # unparseable (0/5; a bigger cap does NOT help, thinking expands to fill
+    # it, 0/2 at 8000). Capping the thinking fixed it (2/2 parseable). Uncapped
+    # deepseek-v4-flash is worse (100k+ thinking tokens, empty answers), so the
+    # cap stays on for it.
     extra_body: { reasoning_effort: "low" }
     # retries: 2 # attempts after the first for empty/5xx/429/network (0-5)
     # timeout_s: 420 # per-attempt TOTAL cap in seconds (10-600); 90s idle + 60s/1KB trickle guards always on
@@ -85,7 +89,7 @@ providers:
     # only set keys win, so `{ model: ... }` alone keeps base retries/timeout.
     # models:
     #   flash:
-    #     model: deepseek-v4-flash
+    #     model: deepseek-v4.1-flash
     #   free:
     #     model: longcat-2.5-preview-free
     #     json_mode: false

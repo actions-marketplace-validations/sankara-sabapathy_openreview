@@ -70,7 +70,10 @@ free and both reason, but on a full-size diff `longcat-2.5-preview-free` answers
 `unusable response` and the run reports zero findings. It also ignores
 `response_format: {type: json_object}`, so `json_mode` cannot fix it and neither
 could a much harder prompt instruction. `space-bunny-free` honours the JSON
-contract on real diffs and is what this repo reviews itself with.
+contract on real diffs. This repo reviewed itself with it until OpenCode began
+answering it with `Upstream request failed: Model is unavailable` (2026-10-13);
+it now uses `deepseek-v4-flash` on the Go subscription with
+`reasoning_effort: "low"`.
 
 Verify before you trust a model on a real diff, not a toy prompt:
 
@@ -114,8 +117,8 @@ every agent. OpenReview's parser tolerates prose *around* JSON, not prose
 > content with `finish_reason=length` (0/5 parseable across both prompt styles;
 > raising the cap to 8000 does not help — thinking expands to fill it, 0/2).
 > With `extra_body: { reasoning_effort: "low" }` the same diff parses 2/2 with
-> real findings. This repo sets that on its own provider; do the same for any
-> reasoning reviewer on a busy repo.
+> real findings. This repo sets that on its own `deepseek-v4-flash` provider; do the same for
+> any reasoning reviewer on a busy repo.
 
 > **Known flake (2026-09-30, [issue #30](https://github.com/sankara-sabapathy/openreview/issues/30)):**
 > `glm-5.3-flash` intermittently returns **empty content** (upstream thinking
