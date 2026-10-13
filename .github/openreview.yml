@@ -37,8 +37,12 @@ defaults:
   # max_findings: 10
 
 providers:
-  # --- Active: OpenCode Go, free tier ---
-  # This repo reviews itself with `space-bunny-free`. Go ships exactly two free
+  # --- Active: OpenCode Go subscription, deepseek-v4-flash ---
+  # space-bunny-free started answering "Model is unavailable" (dogfood on #82),
+  # so this repo now reviews itself with deepseek-v4-flash on the paid Go plan.
+  # reasoning_effort stays "low" below: uncapped, this model burned 100k+
+  # reasoning tokens per agent (#26). History of the free-tier choice:
+  # This repo reviewed itself with `space-bunny-free`. Go ships exactly two free
   # models; the other one, `longcat-2.5-preview-free`, was tried first and
   # REJECTED for review work:
   #   * it answers a full-size diff with 7-8k chars of markdown prose and no
@@ -57,7 +61,7 @@ providers:
     # Prefer protocol below; both are shown here for reference.
     kind: opencode
     protocol: openai-chat # openai-chat | anthropic-messages
-    model: space-bunny-free
+    model: deepseek-v4-flash
     base_url: https://opencode.ai/zen/go/v1
     key_from: secrets.OPENCODE_API_KEY # any $NAME: "secrets.FOO" | "env.FOO"
     # json_mode stays TRUE (the default). Turning it off removes
