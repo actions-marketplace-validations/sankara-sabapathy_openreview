@@ -40,6 +40,10 @@ verdicts, and posts a sticky comment + inline review.
   package/validate + dist-fresh check), `release.yml` (release-please + move `v0`
   tag), `docs.yml` (Pages deploy).
 - `website/` — Docusaurus v3 docs site, deployed to GitHub Pages from `main`.
+- `benchmark/` — bug benchmark: `cases/<id>/` (before/after trees, generated
+  `patch.diff`, `case.json` with seeded bugs). `src/bench.ts` reviews every case
+  with a real config and `src/bench-score.ts` scores precision/recall. See
+  `benchmark/README.md`. Not part of the action bundle.
 
 ## Invariants (do not break)
 

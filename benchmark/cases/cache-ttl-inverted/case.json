@@ -1,0 +1,26 @@
+{
+  "id": "cache-ttl-inverted",
+  "language": "TypeScript",
+  "description": "Caches FX rates for a minute.",
+  "bugs": [
+    {
+      "id": "ttl-comparison",
+      "file": "src/price.ts",
+      "lines": [
+        9,
+        9
+      ],
+      "severity": "medium",
+      "summary": "The TTL comparison is inverted: fresh entries are refetched and only expired entries are served from cache.",
+      "keywords": [
+        "invert",
+        "stale",
+        "expired",
+        "ttl",
+        "> TTL",
+        "comparison",
+        "backwards"
+      ]
+    }
+  ]
+}

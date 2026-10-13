@@ -1,0 +1,6 @@
+{
+  "id": "clean-feature",
+  "language": "Python",
+  "description": "Adds truncate_words with input validation. No bugs.",
+  "bugs": []
+}

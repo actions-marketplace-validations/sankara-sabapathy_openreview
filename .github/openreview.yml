@@ -20,7 +20,9 @@ defaults:
   # not here.
   command: "/review"
   lang: en
-  ignore: ["**.lock", "dist/**", "website/build/**"]
+  # benchmark/cases holds deliberately buggy fixtures (see benchmark/README.md);
+  # reviewing them on every PR would only re-find the seeded bugs.
+  ignore: ["**.lock", "dist/**", "website/build/**", "benchmark/cases/**"]
   max_diff_chars: 80000
   # Wall-clock budget for the whole run (30-14400, default 1200). Once spent, no
   # new agent call starts and the rest report `budget-exhausted` instead of

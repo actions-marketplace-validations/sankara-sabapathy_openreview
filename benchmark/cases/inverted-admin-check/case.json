@@ -1,0 +1,26 @@
+{
+  "id": "inverted-admin-check",
+  "language": "TypeScript",
+  "description": "Adds requireAdmin middleware.",
+  "bugs": [
+    {
+      "id": "inverted-role-check",
+      "file": "src/admin.ts",
+      "lines": [
+        14,
+        15
+      ],
+      "severity": "high",
+      "summary": "The role check is inverted: non-admins call next() and admins get 403.",
+      "keywords": [
+        "invert",
+        "non-admin",
+        "negat",
+        "reversed",
+        "backwards",
+        "opposite",
+        "!user.roles"
+      ]
+    }
+  ]
+}

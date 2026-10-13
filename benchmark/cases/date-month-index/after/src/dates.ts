@@ -1,0 +1,12 @@
+export function isWeekend(d: Date): boolean {
+  const day = d.getDay();
+  return day === 0 || day === 6;
+}
+
+/** Parse an ISO calendar date like "2026-03-14" into a local Date at midnight. */
+export function parseIsoDate(s: string): Date {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+  if (!m) throw new Error(`not an ISO date: ${s}`);
+  const [, y, mo, d] = m;
+  return new Date(Number(y), Number(mo), Number(d));
+}

@@ -1,0 +1,25 @@
+{
+  "id": "sql-injection",
+  "language": "TypeScript",
+  "description": "Adds a user search endpoint.",
+  "bugs": [
+    {
+      "id": "ilike-interpolation",
+      "file": "src/routes/users.ts",
+      "lines": [
+        13,
+        17
+      ],
+      "severity": "high",
+      "summary": "req.query.name is interpolated straight into the SQL string; it must be a bound parameter.",
+      "keywords": [
+        "sql injection",
+        "injection",
+        "parameter",
+        "interpolat",
+        "sanitiz",
+        "escape"
+      ]
+    }
+  ]
+}
