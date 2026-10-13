@@ -79,7 +79,10 @@ providers:
     # (measured 0/5 parseable; a bigger cap does NOT help — thinking expands to
     # fill it, 0/2 at 8000). Capping the thinking fixes it (2/2 parseable with
     # real findings on the same 80k-char diff), so this stays active.
-    extra_body: { reasoning_effort: "low" }
+    # deepseek-v4-flash writes its analysis as prose before the JSON, and at
+    # the default output cap (2000; 4000 for a synthesizing main) both agents
+    # were cut off mid-prose on #82. 8000 leaves room for the JSON at the end.
+    extra_body: { reasoning_effort: "low", max_tokens: 8000 }
     # retries: 2 # attempts after the first for empty/5xx/429/network (0-5)
     # timeout_s: 420 # per-attempt TOTAL cap in seconds (10-600); 90s idle + 60s/1KB trickle guards always on
     # Named per-model overrides sharing this entry's transport + credential

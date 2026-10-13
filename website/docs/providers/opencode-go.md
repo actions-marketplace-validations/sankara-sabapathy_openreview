@@ -116,6 +116,11 @@ every agent. OpenReview's parser tolerates prose *around* JSON, not prose
 > With `extra_body: { reasoning_effort: "low" }` the same diff parses 2/2 with
 > real findings. This repo sets that on its own provider; do the same for any
 > reasoning reviewer on a busy repo.
+> The output cap is 2000 tokens per agent, or 4000 for a synthesizing `main`
+> (it also writes the summary and walkthrough); `extra_body: { max_tokens: N }`
+> overrides both. `deepseek-v4-flash` with `reasoning_effort: "low"` writes its
+> analysis as prose *before* the JSON, so at the default cap it is cut off
+> mid-prose; this repo sets `max_tokens: 8000` for it.
 
 > **Known flake (2026-09-30, [issue #30](https://github.com/sankara-sabapathy/openreview/issues/30)):**
 > `glm-5.3-flash` intermittently returns **empty content** (upstream thinking

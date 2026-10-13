@@ -286,6 +286,20 @@ describe("runAgent as synthesizer", () => {
     assert.deepEqual(r.synthesis.dismissed, [{ id: "F2", reason: "handled" }]);
   });
 
+  it("gives the synthesizer a larger output budget, still overridable by extra_body", async () => {
+    const seen: number[] = [];
+    const fetchOk = async (_u: any, init: any) => {
+      seen.push(JSON.parse(init.body).max_tokens);
+      return new Response(JSON.stringify({ choices: [{ message: { content: '{"findings":[]}' } }] }));
+    };
+    await withFetch(fetchOk, () => runAgent(base));
+    await withFetch(fetchOk, () => runAgent({ ...base, priorFindings: "x" }));
+    await withFetch(fetchOk, () =>
+      runAgent({ ...base, priorFindings: "x", provider: { ...base.provider, extra_body: { max_tokens: 8000 } } })
+    );
+    assert.deepEqual(seen, [2000, 4000, 8000]);
+  });
+
   it("a plain review carries no synthesis and keeps the findings-only prompt", async () => {
     let body: any;
     const r = await withFetch(

@@ -45154,7 +45154,7 @@ async function callAnthropic(opts) {
             headers: opts.headers,
             body: JSON.stringify({
                 model: opts.model,
-                max_tokens: 2000,
+                max_tokens: opts.maxTokens,
                 system: opts.system,
                 messages: [{ role: "user", content: opts.user }],
                 ...opts.extraBody,
@@ -45269,7 +45269,7 @@ async function callOpenAICompatible(opts) {
             { role: "user", content: opts.user },
         ],
         temperature: 0.2,
-        max_tokens: 2000,
+        max_tokens: opts.maxTokens,
         ...opts.extraBody,
     };
     if (opts.jsonMode)
@@ -45424,6 +45424,10 @@ function isRetryableError(message) {
 }
 async function runAgent(opts) {
     const synth = opts.priorFindings !== undefined;
+    // The synthesizer also writes a summary and a per-file walkthrough, so it
+    // gets twice the plain reviewer's output budget. extra_body.max_tokens
+    // still overrides either (it is spread after this default).
+    const maxTokens = synth ? 4000 : 2000;
     const system = synth ? SYNTH_SYSTEM(opts.lang, opts.instructions) : SYSTEM_WRAPPER(opts.lang, opts.instructions);
     let user = `Review this unified diff (truncated):\n\n${truncate(opts.diff, opts.maxDiffChars)}`;
     if (opts.contextBlock) {
@@ -45495,6 +45499,7 @@ async function runAgent(opts) {
                     user,
                     extraBody: rp.extraBody,
                     timeoutMs,
+                    maxTokens,
                 });
             }
             else {
@@ -45509,6 +45514,7 @@ async function runAgent(opts) {
                     jsonMode: rp.jsonMode,
                     extraBody: rp.extraBody,
                     timeoutMs,
+                    maxTokens,
                 });
             }
             raw = out.text;
