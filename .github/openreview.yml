@@ -80,8 +80,10 @@ providers:
     # unparseable (0/5; a bigger cap does NOT help, thinking expands to fill
     # it, 0/2 at 8000). Capping the thinking fixed it (2/2 parseable). Uncapped
     # deepseek-v4-flash is worse (100k+ thinking tokens, empty answers), so the
-    # cap stays on for it.
-    extra_body: { reasoning_effort: "low" }
+    # cap stays on for it. Even at "low" it is still thinking when it reaches
+    # 2000 tokens on a 73k-char diff (0/2 parseable on PR #83: ~6.5k chars of
+    # reasoning, no JSON), so it also gets a larger output budget.
+    extra_body: { reasoning_effort: "low", max_tokens: 8000 }
     # retries: 2 # attempts after the first for empty/5xx/429/network (0-5)
     # timeout_s: 420 # per-attempt TOTAL cap in seconds (10-600); 90s idle + 60s/1KB trickle guards always on
     # Named per-model overrides sharing this entry's transport + credential
