@@ -44,8 +44,8 @@ providers:
   #   - step-5-preview-free      : untested here, probe before trusting
   #     (deepseek-v4-flash and space-bunny-free failed earlier and are no
   #      longer configured; see website/docs/providers/opencode-go.md).
-  # Free-tier models are reasoning-heavy, so the active config caps their
-  # thinking at 8000 tokens while leaving the answer budget intact.
+  # Free-tier models are reasoning-heavy, so the active config keeps
+  # reasoning_effort low and raises max_tokens (thinking + answer) to 8000.
   opencode:
     # kind: is a deprecated shorthand (anthropic|openai|opencode|openai-compatible).
     # Prefer protocol below; both are shown here for reference.
@@ -67,7 +67,6 @@ providers:
     # budget with thinking instead of findings; max_tokens: 8000 gives enough
     # room for the answer while leaving room for reasoning. On cat-jam-free
     # the review completes in a few seconds with a few kilobytes of output.
-    # extra_body is merged last, so max_tokens here overrides the built-in
     # extra_body is merged last, so max_tokens here overrides the built-in
     # 2000-token cap; cat-jam-free answers in ~1.5k, so 8000 is only headroom.
     extra_body: { reasoning_effort: "low", max_tokens: 8000 }
