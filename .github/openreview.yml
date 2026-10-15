@@ -37,12 +37,13 @@ defaults:
   # max_findings: 10
 
 providers:
-  # --- Active: OpenCode Go subscription, deepseek-v4-flash ---
-  # space-bunny-free started answering "Model is unavailable" (dogfood on #82),
-  # so this repo now reviews itself with deepseek-v4-flash on the paid Go plan.
-  # reasoning_effort stays "low" below: uncapped, this model burned 100k+
-  # reasoning tokens per agent (#26). History of the free-tier choice:
-  # This repo reviewed itself with `space-bunny-free`. Go ships exactly two free
+  # --- Active: OpenCode Go, cat-jam-free ---
+  # space-bunny-free started answering "Model is unavailable" (dogfood on #82).
+  # deepseek-v4-flash was tried next and REJECTED: it writes its thinking as
+  # prose in the answer until it hits the output cap (2000, then 8000 tokens),
+  # so no agent reached its JSON. cat-jam-free returned parseable findings,
+  # a summary and a walkthrough on the same diff. History of the free-tier
+  # choice: this repo reviewed itself with `space-bunny-free`. Go ships exactly two free
   # models; the other one, `longcat-2.5-preview-free`, was tried first and
   # REJECTED for review work:
   #   * it answers a full-size diff with 7-8k chars of markdown prose and no
@@ -63,7 +64,8 @@ providers:
     protocol: openai-chat # openai-chat | anthropic-messages
     model: cat-jam-free
     base_url: https://opencode.ai/zen/go/v1
-    key_from: secrets.OPENCODE_API_KEY # any $NAME: "secrets.FOO" | "env.FOO"    # json_mode stays TRUE (the default). Turning it off removes
+    key_from: secrets.OPENCODE_API_KEY # any $NAME: "secrets.FOO" | "env.FOO"
+    # json_mode stays TRUE (the default). Turning it off removes
     # `response_format: {type: json_object}`, and a model that ignores the
     # "JSON only" instruction then answers in markdown, which is unusable. Only
     # disable it for a provider that genuinely rejects response_format.
@@ -78,9 +80,8 @@ providers:
     # (measured 0/5 parseable; a bigger cap does NOT help — thinking expands to
     # fill it, 0/2 at 8000). Capping the thinking fixes it (2/2 parseable with
     # real findings on the same 80k-char diff), so this stays active.
-    # deepseek-v4-flash writes its analysis as prose before the JSON, and at
-    # the default output cap (2000; 4000 for a synthesizing main) both agents
-    # were cut off mid-prose on #82. 8000 leaves room for the JSON at the end.
+    # max_tokens raises the output cap (default 2000; 4000 for a synthesizing
+    # main) as headroom for reasoning models that think before the JSON.
     extra_body: { reasoning_effort: "low", max_tokens: 8000 }
     # retries: 2 # attempts after the first for empty/5xx/429/network (0-5)
     # timeout_s: 420 # per-attempt TOTAL cap in seconds (10-600); 90s idle + 60s/1KB trickle guards always on
