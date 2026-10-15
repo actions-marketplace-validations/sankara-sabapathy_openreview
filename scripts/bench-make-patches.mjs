@@ -40,7 +40,10 @@ function fileDiff(caseDir, file) {
     out = e.stdout;
   }
   if (!out) return null;
-  const hunks = out.slice(out.indexOf("\n@@") + 1).replace(/\n$/, "");
+  const at = out.indexOf("\n@@");
+  // No hunk header means git could not render a text diff (e.g. a binary file).
+  if (at < 0) throw new Error(`${relative(casesDir, caseDir)}/${file}: no text hunks in git diff output`);
+  const hunks = out.slice(at + 1).replace(/\n$/, "");
   return `--- a/${file}\n+++ b/${file}\n${hunks}`;
 }
 
