@@ -30,12 +30,14 @@ runs-on: arc-openreview-x64
 ## What the runner needs
 
 - **Egress** to your providers' `base_url`s plus `api.github.com` (diff, comments,
-  checks). Nothing else phones home.
-- **Toolchain:** stock GitHub runners work as-is. Only extra need is `python3` if
-  you later enable graph-based indexing (see issue #25); the review engine itself
-  needs nothing beyond the runner.
-- **Sizing:** two LLM calls run concurrently per review; a 2-CPU runner is plenty.
-  The billable cost driver is provider tokens, not compute.
+  checks) and `github.com` (checkout). Nothing else phones home.
+- **Toolchain:** the action runs on `node24` (`action.yml`), so the runner just
+  needs to be recent enough to execute `node24` actions — keep self-hosted
+  runners updated. No Python, no Docker, no extra toolchain: context indexing is
+  pure TypeScript in the bundle.
+- **Sizing:** agents fan out per review bounded by `defaults.max_concurrency`
+  (default 4); a 2-CPU runner is plenty. The billable cost driver is provider
+  tokens, not compute.
 
 ## Secrets hygiene (read this before fork PRs)
 
