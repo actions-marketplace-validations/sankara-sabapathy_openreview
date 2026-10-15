@@ -37,26 +37,16 @@ defaults:
   # max_findings: 10
 
 providers:
-  # --- Active: OpenCode Go, cat-jam-free ---
-  # space-bunny-free started answering "Model is unavailable" (dogfood on #82).
-  # deepseek-v4-flash was tried next and REJECTED: it writes its thinking as
-  # prose in the answer until it hits the output cap (2000, then 8000 tokens),
-  # so no agent reached its JSON. cat-jam-free returned parseable findings,
-  # a summary and a walkthrough on the same diff. History of the free-tier
-  # choice: this repo reviewed itself with `space-bunny-free`. Go ships exactly two free
-  # models; the other one, `longcat-2.5-preview-free`, was tried first and
-  # REJECTED for review work:
-  #   * it answers a full-size diff with 7-8k chars of markdown prose and no
-  #     JSON at all, so every agent reported "unusable response" -> zero findings
-  #   * it ignores `response_format: {type: json_object}`, so `json_mode` cannot
-  #     save it, and neither could a much harder prompt instruction
-  # Both are reasoning models; the difference is that space-bunny-free honours
-  # the JSON contract on a real diff while longcat does not. Verify a model
-  # before trusting it: `npm run probe:model <id>` (needs OPENCODE_API_KEY).
-  #
-  # Deepseek/GLM/Kimi etc. are available on the same subscription — see
-  # website/docs/providers/opencode-go.md and openreview.example.yml for the
-  # full provider matrix. Only the model this repo actually uses is configured.
+  # --- Active: OpenCode Go, free tier ---
+  # This repo reviews itself with the free `cat-jam-free` model.
+  # Other free-tier candidates are not usable in our tests:
+  #   - longcat-2.5-preview-free : returns prose instead of JSON
+  #   - space-bunny-free        : started reporting "Model is unavailable"
+  #   - deepseek-v4-flash       : writes its thinking as prose until it hits
+  #                              the output cap, so no agent reached JSON
+  # step-5-preview-free is untested here; probe before trusting.
+  # paid models on the same subscription: Deepseek/GLM/Kimi/Qwen.
+  # See website/docs/providers/opencode-go.md for the full provider matrix.
   opencode:
     # kind: is a deprecated shorthand (anthropic|openai|opencode|openai-compatible).
     # Prefer protocol below; both are shown here for reference.
@@ -74,12 +64,9 @@ providers:
     # endpoint_path: /chat/completions # default per protocol (/chat/completions, /v1/messages)
     # json_mode: true # set false ONLY for providers that reject response_format
     # extra_body: { temperature: 0.1 } # extra JSON body fields merged into requests
-    # Reasoning models spend their thinking from the 2000-token output budget:
-    # on a large diff space-bunny-free thinks ~9.5k chars, hits
-    # finish_reason=length with empty content, and both agents end unparseable
-    # (measured 0/5 parseable; a bigger cap does NOT help — thinking expands to
-    # fill it, 0/2 at 8000). Capping the thinking fixes it (2/2 parseable with
-    # real findings on the same 80k-char diff), so this stays active.
+    # Reasoning models can spend their whole capped output budget thinking,
+    # leaving no room for findings JSON. The reasoning_effort cap plus
+    # 8000 max_tokens leaves room for both.
     # max_tokens raises the output cap (default 2000; 4000 for a synthesizing
     # main) as headroom for reasoning models that think before the JSON.
     extra_body: { reasoning_effort: "low", max_tokens: 8000 }
