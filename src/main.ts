@@ -566,7 +566,8 @@ export async function run(): Promise<void> {
         // A synthesized finding merging several agents' reports votes in
         // each source provider's ballot.
         for (const f of findings) {
-          for (const v of f.voters?.length ? f.voters : [f.provider]) {            const list = byProvider.get(v) ?? [];
+          for (const v of f.voters?.length ? f.voters : [f.provider]) {
+            const list = byProvider.get(v) ?? [];
             list.push(f);
             byProvider.set(v, list);
           }
