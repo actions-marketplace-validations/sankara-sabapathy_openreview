@@ -35,7 +35,7 @@ requires for routing/prompt-caching. Only `chat/completions`-listed models work
 
 | Model ID | Monthly included usage |
 |---|---|
-| `space-bunny-free`, `longcat-2.5-preview-free` | **Free / unlimited (limited time)** — only `space-bunny-free` is review-capable, see below |
+| `cat-jam-free`, `space-bunny-free`, `longcat-2.5-preview-free` | **Free / unlimited (limited time)**. `cat-jam-free` is what this repo uses; `space-bunny-free` has answered "Model is unavailable" since 2026-10-13; `longcat-2.5-preview-free` is not review-capable. See below |
 | `glm-5.3-flash` | $60 — good all-round reviewer |
 | `kimi-k2.7-code` | $60 — coding specialist, good subagent/main |
 | `kimi-k2.6`, `kimi-k3` | $60 |
@@ -50,8 +50,9 @@ Usage beyond limits blocks unless **Use balance** (Zen credits) is enabled in th
 
 ## Free tier
 
-Go lists exactly **two** free models: `longcat-2.5-preview-free` and
-`space-bunny-free`. For a PR on every push, free models are the sensible default
+Go's free models change without notice: the table above was checked on
+2026-10-02, and `cat-jam-free` (used by this repo since 2026-10-15) appeared
+after it. For a PR on every push, free models are the sensible default
 — usage is only a few thousand tokens per review, and subscription minutes add up
 fast over a busy repo:
 
@@ -59,18 +60,23 @@ fast over a busy repo:
 providers:
   go:
     protocol: openai-chat
-    model: space-bunny-free
+    model: cat-jam-free
     base_url: https://opencode.ai/zen/go/v1
     key_from: secrets.OPENCODE_API_KEY
 ```
 
-**Use `space-bunny-free` for reviews, not `longcat-2.5-preview-free`.** Both are
+**Do not use `longcat-2.5-preview-free` for reviews.** Before it became
+unavailable, `space-bunny-free` was compared against it. Both are
 free and both reason, but on a full-size diff `longcat-2.5-preview-free` answers
 7-8k characters of **markdown prose with no JSON at all**, so every agent ends as
 `unusable response` and the run reports zero findings. It also ignores
 `response_format: {type: json_object}`, so `json_mode` cannot fix it and neither
 could a much harder prompt instruction. `space-bunny-free` honours the JSON
-contract on real diffs and is what this repo reviews itself with.
+contract on real diffs. This repo reviewed itself with it until OpenCode began
+answering it with `Upstream request failed: Model is unavailable` (2026-10-13).
+It now uses `cat-jam-free`, which reviewed 2/2 in a few seconds. A trial of
+`deepseek-v4-flash` finished only 2 of 10 agent calls: it kept thinking until
+it hit even a 16000-token output budget.
 
 Verify before you trust a model on a real diff, not a toy prompt:
 

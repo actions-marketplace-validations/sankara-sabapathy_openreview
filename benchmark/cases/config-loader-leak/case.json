@@ -1,0 +1,41 @@
+{
+  "id": "config-loader-leak",
+  "language": "Python",
+  "description": "Validates the settings file and lets APP_TIMEOUT override the timeout.",
+  "bugs": [
+    {
+      "id": "file-handle-leak",
+      "file": "app/settings.py",
+      "lines": [
+        8,
+        12
+      ],
+      "severity": "medium",
+      "summary": "open() without a context manager: the ValueError (or a JSON error) path returns before f.close(), leaking the handle.",
+      "keywords": [
+        "close",
+        "leak",
+        "context manager",
+        "with open"
+      ]
+    },
+    {
+      "id": "timeout-env-none",
+      "file": "app/settings.py",
+      "lines": [
+        14,
+        14
+      ],
+      "severity": "high",
+      "summary": "int(os.environ.get(\"APP_TIMEOUT\")) raises TypeError when the variable is unset, and always overrides the file's timeout.",
+      "keywords": [
+        "typeerror",
+        "none",
+        "unset",
+        "missing",
+        "default",
+        "APP_TIMEOUT"
+      ]
+    }
+  ]
+}

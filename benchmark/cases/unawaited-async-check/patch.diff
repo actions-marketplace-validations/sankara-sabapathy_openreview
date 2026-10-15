@@ -1,0 +1,46 @@
+--- a/src/accounts.ts
++++ b/src/accounts.ts
+@@ -2,6 +2,8 @@ import { redis, users } from "./store.js";
+ 
+ export type Account = { id: string; email: string; hash: string };
+ 
++const MAX_FAILURES = 5;
++
+ export async function findAccount(email: string): Promise<Account | null> {
+   return users.findOne({ email });
+ }
+@@ -13,3 +15,14 @@ export async function verifyPassword(a: Account, password: string): Promise<bool
+ export async function issueSession(a: Account): Promise<string> {
+   return redis.createSession(a.id);
+ }
++
++export async function isLockedOut(a: Account): Promise<boolean> {
++  const failures = Number(await redis.get(`login-failures:${a.id}`)) || 0;
++  return failures >= MAX_FAILURES;
++}
++
++export async function recordFailure(a: Account): Promise<void> {
++  const key = `login-failures:${a.id}`;
++  await redis.incr(key);
++  await redis.expire(key, 15 * 60);
++}
+
+--- a/src/login.ts
++++ b/src/login.ts
+@@ -1,8 +1,14 @@
+-import { findAccount, verifyPassword, issueSession } from "./accounts.js";
++import { findAccount, verifyPassword, issueSession, isLockedOut, recordFailure } from "./accounts.js";
+ 
+ export async function login(email: string, password: string) {
+   const account = await findAccount(email);
+   if (!account) throw new Error("invalid credentials");
+-  if (!(await verifyPassword(account, password))) throw new Error("invalid credentials");
++  if (isLockedOut(account)) {
++    throw new Error("account temporarily locked, try again later");
++  }
++  if (!(await verifyPassword(account, password))) {
++    await recordFailure(account);
++    throw new Error("invalid credentials");
++  }
+   return issueSession(account);
+ }

@@ -1,0 +1,24 @@
+--- a/src/format.ts
++++ b/src/format.ts
+@@ -1,7 +1,7 @@
+-export function fmt(n: number): string {
++export function formatNumber(n: number): string {
+   return n.toLocaleString("en-US", { maximumFractionDigits: 2 });
+ }
+ 
+-export function fmtPct(ratio: number): string {
+-  return `${fmt(ratio * 100)}%`;
++export function formatPercent(ratio: number): string {
++  return `${formatNumber(ratio * 100)}%`;
+ }
+
+--- a/src/report.ts
++++ b/src/report.ts
+@@ -1,5 +1,5 @@
+-import { fmt, fmtPct } from "./format.js";
++import { formatNumber, formatPercent } from "./format.js";
+ 
+ export function summaryLine(done: number, total: number): string {
+-  return `${fmt(done)} of ${fmt(total)} (${fmtPct(total ? done / total : 0)})`;
++  return `${formatNumber(done)} of ${formatNumber(total)} (${formatPercent(total ? done / total : 0)})`;
+ }

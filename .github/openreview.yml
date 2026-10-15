@@ -20,7 +20,9 @@ defaults:
   # not here.
   command: "/review"
   lang: en
-  ignore: ["**.lock", "dist/**", "website/build/**"]
+  # benchmark/cases holds deliberately buggy fixtures (see benchmark/README.md);
+  # reviewing them on every PR would only re-find the seeded bugs.
+  ignore: ["**.lock", "dist/**", "website/build/**", "benchmark/cases/**"]
   max_diff_chars: 80000
   # Wall-clock budget for the whole run (30-14400, default 1200). Once spent, no
   # new agent call starts and the rest report `budget-exhausted` instead of
@@ -39,8 +41,10 @@ defaults:
 providers:
   # --- Active: OpenCode Go, free tier ---
   # This repo reviews itself with the free `cat-jam-free` model.
-  # Other free-tier candidates are not usable in our tests (see the Go
-  # provider doc); paid models on the same subscription include GLM/Kimi/Qwen.
+  # Other free-tier candidates are not usable in our tests:
+  #   - longcat-2.5-preview-free : returns prose instead of JSON
+  # deepseek-v4-flash / space-bunny-free failed earlier.
+  # See website/docs/providers/opencode-go.md for model details.
   opencode:
     # kind: is a deprecated shorthand (anthropic|openai|opencode|openai-compatible).
     # Prefer protocol below; both are shown here for reference.
@@ -58,10 +62,7 @@ providers:
     # endpoint_path: /chat/completions # default per protocol (/chat/completions, /v1/messages)
     # json_mode: true # set false ONLY for providers that reject response_format
     # extra_body: { temperature: 0.1 } # extra JSON body fields merged into requests
-    # Some free-tier models are reasoning-heavy and can fill a capped output
-    # budget with thinking instead of findings. Increase max_tokens to leave
-    # room for both thinking and the answer JSON.
-    extra_body: { reasoning_effort: "low", max_tokens: 8000 }
+    extra_body: { reasoning_effort: "low", max_tokens: 16000 }
     # retries: 2 # attempts after the first for empty/5xx/429/network (0-5)
     # timeout_s: 420 # per-attempt TOTAL cap in seconds (10-600); 90s idle + 60s/1KB trickle guards always on
     # Named per-model overrides sharing this entry's transport + credential
@@ -69,7 +70,7 @@ providers:
     # only set keys win, so `{ model: ... }` alone keeps base retries/timeout.
     # models:
     #   flash:
-    #     model: deepseek-v4-flash
+    #     model: deepseek-v4.1-flash
     #   free:
     #     model: longcat-2.5-preview-free
     #     json_mode: false

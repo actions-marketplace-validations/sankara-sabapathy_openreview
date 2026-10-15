@@ -1,0 +1,24 @@
+{
+  "id": "mutable-default-arg",
+  "language": "Python",
+  "description": "Adds tag merging and a tag cloud.",
+  "bugs": [
+    {
+      "id": "mutable-default",
+      "file": "app/tags.py",
+      "lines": [
+        5,
+        10
+      ],
+      "severity": "medium",
+      "summary": "existing=[] is a shared mutable default, so tags leak across calls and tag_cloud counts every earlier post's tags again.",
+      "keywords": [
+        "mutable default",
+        "default argument",
+        "shared",
+        "existing=[]",
+        "none"
+      ]
+    }
+  ]
+}

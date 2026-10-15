@@ -1,0 +1,21 @@
+--- a/app/settings.py
++++ b/app/settings.py
+@@ -1,9 +1,15 @@
+ import json
++import os
+ 
+ DEFAULTS = {"timeout": 30, "retries": 3}
+ 
+ 
+ def load(path):
+-    with open(path) as f:
+-        data = json.load(f)
+-    return {**DEFAULTS, **data}
++    f = open(path)
++    data = json.load(f)
++    if not isinstance(data, dict):
++        raise ValueError(f"{path}: expected a JSON object")
++    f.close()
++    merged = {**DEFAULTS, **data}
++    merged["timeout"] = int(os.environ.get("APP_TIMEOUT"))
++    return merged

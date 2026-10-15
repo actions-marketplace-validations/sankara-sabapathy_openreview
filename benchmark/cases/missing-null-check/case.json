@@ -1,0 +1,24 @@
+{
+  "id": "missing-null-check",
+  "language": "TypeScript",
+  "description": "Adds notifyWatchers.",
+  "bugs": [
+    {
+      "id": "null-watcher",
+      "file": "src/notify.ts",
+      "lines": [
+        12,
+        16
+      ],
+      "severity": "high",
+      "summary": "getMany returns null for deleted accounts (the comment says so), but watcher is dereferenced without a null check.",
+      "keywords": [
+        "null",
+        "undefined",
+        "deleted",
+        "typeerror",
+        "check"
+      ]
+    }
+  ]
+}

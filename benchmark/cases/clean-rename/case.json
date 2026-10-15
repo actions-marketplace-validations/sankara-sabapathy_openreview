@@ -1,0 +1,6 @@
+{
+  "id": "clean-rename",
+  "language": "TypeScript",
+  "description": "Renames fmt/fmtPct to formatNumber/formatPercent and updates the caller. No bugs.",
+  "bugs": []
+}

@@ -1,0 +1,25 @@
+{
+  "id": "date-month-index",
+  "language": "TypeScript",
+  "description": "Adds an ISO date parser.",
+  "bugs": [
+    {
+      "id": "month-zero-based",
+      "file": "src/dates.ts",
+      "lines": [
+        11,
+        11
+      ],
+      "severity": "high",
+      "summary": "Date's month argument is 0-based; passing Number(mo) shifts every date one month forward (and December overflows to next year).",
+      "keywords": [
+        "0-based",
+        "zero-based",
+        "month",
+        "- 1",
+        "off by one",
+        "off-by-one"
+      ]
+    }
+  ]
+}
