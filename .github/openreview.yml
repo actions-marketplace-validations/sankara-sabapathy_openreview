@@ -62,8 +62,6 @@ providers:
     # endpoint_path: /chat/completions # default per protocol (/chat/completions, /v1/messages)
     # json_mode: true # set false ONLY for providers that reject response_format
     # extra_body: { temperature: 0.1 } # extra JSON body fields merged into requests
-    # Reasoning models may spend their output budget on thinking before findings;
-    # capped reasoning_effort plus 8000 max_tokens leaves room for the JSON.
     extra_body: { reasoning_effort: "low", max_tokens: 16000 }
     # retries: 2 # attempts after the first for empty/5xx/429/network (0-5)
     # timeout_s: 420 # per-attempt TOTAL cap in seconds (10-600); 90s idle + 60s/1KB trickle guards always on
@@ -125,6 +123,10 @@ reviews:
     # context_files: ["src/config.ts"]
     # include_full_files: true
     # max_context_chars: 20000
+    # synthesize (default): main runs after the subagents, merges or dismisses
+    # their findings, and writes the PR summary + walkthrough on the sticky.
+    # parallel: main is one more independent reviewer (pre-0.13 behavior).
+    # main_mode: synthesize
     main:
       # name: defaults to "<review-id>:main"
       provider: opencode

@@ -507,6 +507,10 @@ export const ReviewConfig = z.object({
   profile: z.enum(["quiet", "balanced", "assertive"]).optional(),
   min_confidence: z.number().min(0).max(1).optional(),
   max_findings: z.number().int().positive().optional(),
+  // synthesize (default): subagents run first, then `main` sees the diff plus
+  // their findings, merges/dismisses them and writes the PR summary and
+  // walkthrough. parallel: the pre-0.13 behavior, main is one more reviewer.
+  main_mode: z.enum(["synthesize", "parallel"]).default("synthesize"),
   // Decided items: rebutted patterns suppressed before verdict math (win over
   // defaults.suppress when set).
   suppress: SuppressPatterns.optional(),

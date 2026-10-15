@@ -91,6 +91,7 @@
           "id": { "type": "string" },
           "if_paths": { "type": "array", "items": { "type": "string" } },
           "strategy": { "enum": ["any", "all", "majority"] },
+          "main_mode": { "enum": ["synthesize", "parallel"], "default": "synthesize" },
           "main": { "$ref": "#/definitions/agent" },
           "subagents": { "type": "array", "items": { "$ref": "#/definitions/agent" } },
           "context_files": { "type": "array", "items": { "type": "string" } },

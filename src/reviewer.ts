@@ -71,10 +71,11 @@ export function splitDiff(diff: string): DiffFile[] {
     cur = null;
     curBody = [];
   };
-  for (const line of diff.split("\n")) {
+  for (const rawLine of diff.split("\n")) {
+    const line = rawLine.replace(/\r$/, "");
     if (line.startsWith("+++ b/")) {
       flush();
-      cur = { file: line.slice(6), patch: "" };
+      cur = { file: line.slice(6).trim(), patch: "" };
       continue;
     }
     if (cur && !line.startsWith("--- a/")) curBody.push(line);

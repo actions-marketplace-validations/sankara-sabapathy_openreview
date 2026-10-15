@@ -1,3 +1,4 @@
+import { SYNTH_SYSTEM, SYNTH_REMINDER, parseSynthesis, type Synthesis } from "./synthesis.js";
 import type { ProviderConfig, ProviderProtocol, OpenReviewConfig } from "./config.js";
 import * as core from "@actions/core";
 import { logInfo, logWarning, logDebug, redactHeaders } from "./logger.js";
@@ -37,6 +38,9 @@ export type Finding = {
   provider: string;
   /** Resolved model ID (dotted refs have no top-level entry to look up). */
   model: string;
+  /** Provider refs this finding votes under. Absent means `[provider]`; a
+   * synthesized finding merging several agents' reports votes for each. */
+  voters?: string[];
 };
 
 const FINDINGS_SCHEMA =
@@ -210,6 +214,8 @@ export type AgentResult = {
   startedAt: number;
   endedAt: number;
   outcome: Exclude<AgentOutcome, "error">;
+  /** Present only for a synthesizer run that returned a parseable reply. */
+  synthesis?: Synthesis;
 };
 
 /** Thrown when an agent exhausts its attempts without a usable result. Carries
@@ -246,6 +252,7 @@ async function callAnthropic(opts: {
   user: string;
   extraBody: Record<string, unknown>;
   timeoutMs: number;
+  maxTokens: number;
 }): Promise<{ text: string; usage: Usage; shape: string }> {
   const base = opts.baseUrl.replace(/\/$/, "");
   const ctrl = new AbortController();
@@ -256,7 +263,7 @@ async function callAnthropic(opts: {
       headers: opts.headers,
       body: JSON.stringify({
         model: opts.model,
-        max_tokens: 2000,
+        max_tokens: opts.maxTokens,
         system: opts.system,
         messages: [{ role: "user", content: opts.user }],
         ...opts.extraBody,
@@ -367,6 +374,7 @@ async function callOpenAICompatible(opts: {
   jsonMode: boolean;
   extraBody: Record<string, unknown>;
   timeoutMs: number;
+  maxTokens: number;
 }): Promise<{ text: string; usage: Usage; shape: string }> {
   const base = opts.baseUrl.replace(/\/$/, "");
   const body: Record<string, unknown> = {
@@ -376,7 +384,7 @@ async function callOpenAICompatible(opts: {
       { role: "user", content: opts.user },
     ],
     temperature: 0.2,
-    max_tokens: 2000,
+    max_tokens: opts.maxTokens,
     ...opts.extraBody,
   };
   if (opts.jsonMode) body.response_format = { type: "json_object" };
@@ -570,14 +578,22 @@ export async function runAgent(opts: {
   contextBlock?: string;
   /** Epoch ms after which no call may be started (issue #51). */
   deadlineAt?: number;
+  /** Rendered <prior_findings> block. Present = run as the synthesizer. */
+  priorFindings?: string;
 }): Promise<AgentResult> {
-  const system = SYSTEM_WRAPPER(opts.lang, opts.instructions);
+  const synth = opts.priorFindings !== undefined;
+  // The synthesizer also writes a summary and a per-file walkthrough, so it
+  // gets twice the plain reviewer's output budget. extra_body.max_tokens
+  // still overrides either (it is spread after this default).
+  const maxTokens = synth ? 4000 : 2000;
+  const system = synth ? SYNTH_SYSTEM(opts.lang, opts.instructions) : SYSTEM_WRAPPER(opts.lang, opts.instructions);
   let user = `Review this unified diff (truncated):\n\n${truncate(opts.diff, opts.maxDiffChars)}`;
   if (opts.contextBlock) {
     user += `\n\n${opts.contextBlock}\nGround every finding in the diff above; use <context> only as cross-file evidence (callers, types, contracts). Never flag context-only code.`;
   }
+  if (synth) user += `\n\nFindings from the other reviewers:\n${opts.priorFindings}`;
   // Restate the output contract last, after a long diff + context block.
-  user += SCHEMA_REMINDER;
+  user += synth ? SYNTH_REMINDER : SCHEMA_REMINDER;
   const rp = resolveProvider(opts.provider, opts.keys, process.env as any, opts.sessionId);
   // missing BYOK key -> report it as a skip so it can never read as a clean
   // review, and the caller can name the missing secret (issue #46)
@@ -642,6 +658,7 @@ export async function runAgent(opts: {
           user,
           extraBody: rp.extraBody,
           timeoutMs,
+          maxTokens,
         });
       } else {
         out = await callOpenAICompatible({
@@ -655,6 +672,7 @@ export async function runAgent(opts: {
           jsonMode: rp.jsonMode,
           extraBody: rp.extraBody,
           timeoutMs,
+          maxTokens,
         });
       }
       raw = out.text;
@@ -722,7 +740,7 @@ export async function runAgent(opts: {
       endedAt
     );
   }
-  const parsed = extractFindingsJson(raw);
+  const parsed = extractReviewJson(raw);
   if (!parsed) {
     // Raw heads can be megabytes of reasoning trace; keep the log useful.
     logWarning(
@@ -733,7 +751,10 @@ export async function runAgent(opts: {
   }
   try {
     const out: Finding[] = [];
-    for (const f of parsed.findings ?? []) {
+    const rawFindings: any[] = Array.isArray(parsed.findings) ? parsed.findings : [];
+    const kept: boolean[] = [];
+    for (const f of rawFindings) {
+      kept.push(Boolean(f?.file && f?.comment));
       if (!f?.file || !f?.comment) continue;
       const sev =
         f.severity === "high" || f.severity === "medium" ? f.severity : "suggestion";
@@ -749,7 +770,12 @@ export async function runAgent(opts: {
         model: opts.provider.model,
       });
     }
-    return { findings: out, usage, seconds, attempts: attemptsMade, startedAt, endedAt, outcome: out.length > 0 ? "ok" : "no-findings" };
+    const synthesis = synth ? parseSynthesis(parsed, rawFindings, kept) : undefined;
+    return {
+      findings: out, usage, seconds, attempts: attemptsMade, startedAt, endedAt,
+      outcome: out.length > 0 ? "ok" : "no-findings",
+      ...(synthesis ? { synthesis } : {}),
+    };
   } catch (e) {
     // Validation of individual findings failed — warn, don't silently drop everything.
     logWarning(
@@ -765,11 +791,20 @@ export async function runAgent(opts: {
 // which breaks the moment prose with braces follows the JSON — a live run lost
 // two complete reviews (131k reasoning tokens) to exactly that.
 export function extractFindingsJson(raw: string): { findings?: any[] } | null {
+  const holder = extractReviewJson(raw);
+  if (!holder) return null;
+  return Array.isArray(holder.findings) ? { findings: holder.findings } : holder;
+}
+
+/** Like extractFindingsJson, but returns the whole object that carries the
+ * findings array, so a synthesizer's sibling keys (summary, walkthrough,
+ * dismissed) survive the parse. */
+export function extractReviewJson(raw: string): { findings?: any[]; [k: string]: any } | null {
   const cleaned = raw.replace(/^```(?:json)?\s*/i, "").replace(/```$/i, "").trim();
   // 1. The whole thing is usually the JSON.
   const direct = tryParse(cleaned);
-  const directFindings = pickFindings(direct);
-  if (directFindings) return { findings: directFindings };
+  const directHolder = pickFindings(direct);
+  if (directHolder) return directHolder;
   // 2. Scan balanced objects left to right and take the first that really
   //    carries a findings array. Lazy on purpose: a 130k-token reasoning trace
   //    holds thousands of `{...}` fragments from quoted code, and materializing
@@ -777,7 +812,7 @@ export function extractFindingsJson(raw: string): { findings?: any[] } | null {
   for (const cand of balancedObjects(cleaned)) {
     if (!cand.includes("findings")) continue; // cheap pre-filter
     const found = pickFindings(tryParse(cand));
-    if (found) return { findings: found };
+    if (found) return found;
   }
   // 3. Tolerate a differently-shaped object rather than losing the response.
   return direct;
@@ -787,9 +822,9 @@ export function extractFindingsJson(raw: string): { findings?: any[] } | null {
  * can be `{"analysis": "...", "result": {"findings": [...]}}`. Look a couple of
  * levels down before giving up, so we don't skip past the outer balanced
  * object and never reach the nested array. */
-function pickFindings(o: unknown, depth = 3): any[] | null {
+function pickFindings(o: unknown, depth = 3): { findings: any[]; [k: string]: any } | null {
   if (!o || typeof o !== "object") return null;
-  if (Array.isArray((o as any).findings)) return (o as any).findings;
+  if (Array.isArray((o as any).findings)) return o as { findings: any[] };
   if (depth <= 0) return null;
   for (const v of Object.values(o as Record<string, unknown>)) {
     if (v && typeof v === "object") {

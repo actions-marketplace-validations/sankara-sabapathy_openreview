@@ -25,6 +25,7 @@ import { renderStickyBody, upsertStickyComment, appendStickySection, renderAppen
 import { initLogger, logInfo, logWarning, logDebug } from "./logger.js";
 import { buildContextBlock, buildRepoIndex } from "./context.js";
 import { authorizeTrigger } from "./authorize.js";
+import { labelFindings, renderPriorFindings, mergeSynthesis, type Synthesis } from "./synthesis.js";
 
 const CONFIG_CANDIDATES = [
   ".github/openreview.yml",
@@ -199,6 +200,44 @@ export function selectInlineFindings(
   return reviews.filter((r) => r.postInline).flatMap((r) => r.findings);
 }
 
+/**
+ * Run one review's agents according to `main_mode`.
+ * - synthesize: subagents in a bounded pool, then `main` over their findings;
+ *   its merge/dismiss decisions apply via mergeSynthesis. A main that returns
+ *   no usable synthesis (failed, unparseable, budget gone) falls back to the
+ *   plain union of subagent findings — a bad synthesizer never erases them.
+ * - parallel (or no runnable main): every agent in one pool, findings unioned.
+ * `results` always lists main first, then subagents, matching declaration order.
+ */
+export async function runReviewAgents<R extends { findings: Finding[]; synthesis?: Synthesis }>(opts: {
+  main: ((priorFindings?: string) => Promise<R>) | null;
+  subs: (() => Promise<R>)[];
+  synthesize: boolean;
+  maxConcurrency: number;
+}): Promise<{
+  results: R[];
+  findings: Finding[];
+  dismissed: { finding: Finding; reason: string }[];
+  synthesis?: Synthesis;
+  /** Subagent findings handed to the synthesizer (0 in parallel mode). */
+  reported: number;
+}> {
+  const { main, subs, synthesize, maxConcurrency } = opts;
+  if (!synthesize || !main) {
+    const results = await runPooled(main ? [() => main(), ...subs] : subs, maxConcurrency);
+    return { results, findings: results.flatMap((r) => r.findings), dismissed: [], reported: 0 };
+  }
+  const subResults = await runPooled(subs, maxConcurrency);
+  const labeled = labelFindings(subResults.flatMap((r) => r.findings));
+  const mainResult = await main(renderPriorFindings(labeled));
+  const results = [mainResult, ...subResults];
+  if (!mainResult.synthesis) {
+    return { results, findings: subResults.flatMap((r) => r.findings), dismissed: [], reported: labeled.length };
+  }
+  const merged = mergeSynthesis(labeled, mainResult.findings, mainResult.synthesis);
+  return { results, ...merged, synthesis: mainResult.synthesis, reported: labeled.length };
+}
+
 /** Run thunks with at most `limit` in flight, preserving result order.
  * Takes thunks, NOT promises: an already-started promise is in flight before
  * the pool can see it, so passing promises caps nothing. */
@@ -332,6 +371,10 @@ export async function run(): Promise<void> {
       id: string;
       verdict: Verdict;
       findings: Finding[];
+      /** Summary + walkthrough from the synthesizer, when it produced one. */
+      synthesis?: Synthesis;
+      /** Subagent findings the synthesizer dismissed, with its reasons. */
+      dismissed: { finding: Finding; reason: string }[];
       errors: string[];
       /** Agents that actually reviewed (issue #46: only these may vote). */
       counted: boolean;
@@ -366,9 +409,7 @@ export async function run(): Promise<void> {
           review.max_context_chars ?? config.defaults.max_context_chars ?? 20000,
         ignore: config.defaults.ignore ?? [],
       }, repoIndex);
-      // Thunks, not promises: runAgent must not start until the pool allows it
-      // (an eager promise is already in flight, so the cap would be a no-op).
-      const tasks: (() => Promise<{
+      type TaskResult = {
         findings: Finding[];
         usage: { in: number; out: number } | null;
         seconds: number;
@@ -380,17 +421,24 @@ export async function run(): Promise<void> {
         agent: string;
         providerName: string;
         model: string;
-      }>)[] = [];
-      const agentDefs = [
-        { ...review.main, name: review.main.name ?? `${review.id}:main` },
-        ...review.subagents.map((s, i) => ({ ...s, name: s.name ?? `${review.id}:sub${i}` })),
-      ];
+        synthesis?: Synthesis;
+      };
+      const mainDef = { ...review.main, name: review.main.name ?? `${review.id}:main` };
+      const subDefs = review.subagents.map((s, i) => ({ ...s, name: s.name ?? `${review.id}:sub${i}` }));
+      const synthesize = review.main_mode !== "parallel";
       logInfo(
-        `Review ${review.id}: launching ${agentDefs.length} agent(s) [${agentDefs
+        `Review ${review.id}: launching ${1 + subDefs.length} agent(s) [${[mainDef, ...subDefs]
           .map((a) => `${a.name}/${a.provider}`)
-          .join(", ")}] on ${scopedFiles.length} file(s), strategy=${review.strategy}`
+          .join(", ")}] on ${scopedFiles.length} file(s), strategy=${review.strategy}, ` +
+          `main_mode=${synthesize ? "synthesize" : "parallel"}`
       );
-      for (const a of agentDefs) {
+      // Thunks, not promises: runAgent must not start until the pool allows it
+      // (an eager promise is already in flight, so the cap would be a no-op).
+      // The optional argument is the synthesizer's <prior_findings> block,
+      // known only once the subagents have finished.
+      const makeTask = (
+        a: { name: string; provider: string; instructions: string }
+      ): ((priorFindings?: string) => Promise<TaskResult>) | null => {
         let provider = config.providers[a.provider];
         if (!provider) {
           if (a.provider.includes(".")) {
@@ -398,14 +446,15 @@ export async function run(): Promise<void> {
             provider = resolveDottedProvider(config.providers, a.provider).config;
           } else {
             logWarning(`Review ${review.id}: unknown provider '${a.provider}', skipped agent ${a.name}.`);
-            continue;
+            return null;
           }
         }
-        tasks.push(() =>
+        const p = provider;
+        return (priorFindings?: string) =>
           runAgent({
-            agentName: a.name ?? "agent",
+            agentName: a.name,
             providerName: a.provider,
-            provider,
+            provider: p,
             instructions: a.instructions,
             diff: scopedDiff,
             lang: config.defaults.lang ?? "en",
@@ -414,8 +463,9 @@ export async function run(): Promise<void> {
             sessionId,
             contextBlock,
             deadlineAt,
+            priorFindings,
           })
-            .then((result) => ({
+            .then((result): TaskResult => ({
               findings: result.findings,
               usage: result.usage,
               seconds: result.seconds,
@@ -423,11 +473,12 @@ export async function run(): Promise<void> {
               startedAt: result.startedAt,
               endedAt: result.endedAt,
               outcome: result.outcome,
-              agent: a.name ?? "agent",
+              agent: a.name,
               providerName: a.provider,
-              model: provider.model,
+              model: p.model,
+              synthesis: result.synthesis,
             }))
-            .catch((e) => {
+            .catch((e): TaskResult => {
               const msg = (e as Error).message;
               logWarning(`Agent ${a.name} failed: ${msg}`);
               // A failed agent still spent tokens on its attempts (issue #52):
@@ -446,18 +497,37 @@ export async function run(): Promise<void> {
                 endedAt: failed?.endedAt ?? now,
                 error: msg,
                 outcome: "error" as const,
-                agent: a.name ?? "agent",
+                agent: a.name,
                 providerName: a.provider,
-                model: provider.model,
+                model: p.model,
               };
-            })
-        );
-      }
+            });
+      };
+      const subTasks = subDefs
+        .map((a) => makeTask(a))
+        .filter((t): t is (p?: string) => Promise<TaskResult> => t !== null)
+        .map((t) => () => t());
+      const mainTask = makeTask(mainDef);
       // Bounded fan-out (issue #51): run at most `max_concurrency` agents at a
       // time instead of bursting every agent at the provider at once. The
       // thunk is what makes the cap real — see runPooled.
-      const results = await runPooled(tasks, maxConcurrency);
-      let findings = results.flatMap((r) => r.findings);
+      const { results, findings: merged, dismissed, synthesis, reported } = await runReviewAgents({
+        main: mainTask,
+        subs: subTasks,
+        synthesize,
+        maxConcurrency,
+      });
+      let findings = merged;
+      if (synthesis) {
+        logInfo(
+          `Review ${review.id}: synthesizer kept ${findings.length} finding(s) from ${reported} reported, ` +
+            `dismissed ${dismissed.length}.`
+        );
+      } else if (synthesize && mainTask && reported > 0) {
+        logWarning(
+          `Review ${review.id}: synthesizer produced no usable result; keeping all ${reported} subagent finding(s).`
+        );
+      }
       const agentErrors = results.filter((r) => r.error).map((r) => `- \`${r.agent}\`: ${r.error}`);
       if (review.verdict.deduplicate) findings = dedupeFindings(findings);
       // Decided items: rebutted patterns suppressed before verdict math —
@@ -506,10 +576,14 @@ export async function run(): Promise<void> {
         // Dotted refs (`opencode.flash`) vote under their full ref, so two
         // models on one transport disagree as two ballots (issue #67).
         const byProvider = new Map<string, typeof findings>();
+        // A synthesized finding merging several agents' reports votes in
+        // each source provider's ballot.
         for (const f of findings) {
-          const list = byProvider.get(f.provider) ?? [];
-          list.push(f);
-          byProvider.set(f.provider, list);
+          for (const v of f.voters?.length ? f.voters : [f.provider]) {
+            const list = byProvider.get(v) ?? [];
+            list.push(f);
+            byProvider.set(v, list);
+          }
         }
         const ballots = [...byProvider.entries()].map(([name, fs]) => {
           const v = decideReviewVerdict(review.verdict.mode, review.verdict.min_severity, fs);
@@ -529,6 +603,8 @@ export async function run(): Promise<void> {
         id: review.id,
         verdict,
         findings,
+        synthesis,
+        dismissed,
         errors: agentErrors,
         counted: counted > 0,
         // verdict.post_inline finally honored (issue #53): a review that opts
@@ -603,6 +679,8 @@ export async function run(): Promise<void> {
       verdict: r.verdict,
       count: r.findings.length,
       counted: r.counted,
+      synthesis: r.synthesis,
+      dismissed: r.dismissed.map((d) => ({ ...d.finding, reason: d.reason })),
     }));
     const agentRows = perReview.flatMap((r) =>
       r.agents.map((a) => ({

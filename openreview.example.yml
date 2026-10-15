@@ -107,6 +107,10 @@ reviews:
     # context_files: ["src/types.ts", "db/schema.sql"]
     # include_full_files: true
     # max_context_chars: 20000
+    # synthesize (default): subagents run first, then main merges/dismisses
+    # their findings and writes the PR summary + walkthrough. parallel: main is
+    # one more independent reviewer, no summary.
+    main_mode: synthesize
     main:
       provider: claude
       instructions: "Synthesize sub-agent findings. Strict on bugs and correctness, lenient on style. Deduplicate."
