@@ -27,7 +27,7 @@ import { buildContextBlock, buildRepoIndex } from "./context.js";
 import { runPooled } from "./main.js";
 import {
   parseCase, scoreCase, totals, renderReport, DEFAULT_SCORE_OPTIONS,
-  type BenchCase, type ScoreOptions, type Severity,
+  type BenchCase, type CaseScore, type ScoreOptions, type Severity,
 } from "./bench-score.js";
 
 type AgentRecord = { review: string; agent: string; provider: string; outcome: AgentOutcome; seconds: number; error?: string };
@@ -121,7 +121,7 @@ async function reviewCase(config: OpenReviewConfig, caseDir: string, id: string,
 
 function score(run: RunFile, cases: BenchCase[], opts: ScoreOptions): { report: string; incomplete: string[] } {
   const byId = new Map(run.cases.map((r) => [r.id, r]));
-  const scores = [];
+  const scores: CaseScore[] = [];
   const incomplete: string[] = [];
   for (const c of cases) {
     const r = byId.get(c.id);
