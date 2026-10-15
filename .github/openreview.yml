@@ -62,10 +62,9 @@ providers:
     # Prefer protocol below; both are shown here for reference.
     kind: opencode
     protocol: openai-chat # openai-chat | anthropic-messages
-    model: deepseek-v4-flash
+    model: cat-jam-free
     base_url: https://opencode.ai/zen/go/v1
-    key_from: secrets.OPENCODE_API_KEY # any $NAME: "secrets.FOO" | "env.FOO"
-    # json_mode stays TRUE (the default). Turning it off removes
+    key_from: secrets.OPENCODE_API_KEY # any $NAME: "secrets.FOO" | "env.FOO"    # json_mode stays TRUE (the default). Turning it off removes
     # `response_format: {type: json_object}`, and a model that ignores the
     # "JSON only" instruction then answers in markdown, which is unusable. Only
     # disable it for a provider that genuinely rejects response_format.
