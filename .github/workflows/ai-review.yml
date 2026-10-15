@@ -41,9 +41,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      # TEMPORARY (AGENTS.md convention): exercise this branch, not the last
-      # release. The final commit before merge restores @v1 below.
-      - uses: ./
+      - uses: sankara-sabapathy/openreview@v1
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           config-path: .github/openreview.yml
