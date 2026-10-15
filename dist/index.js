@@ -46927,7 +46927,7 @@ function readCapped(root, rel, cap) {
 // Top-level defined names: export function|const|class|interface|type X,
 // def X / class X (python), ^func X (go), ^(public|private)? (class|function) X (php/java-ish).
 const DEF_RES = [
-    /export\s+(?:async\s+)?(?:function|const|let|class|interface|type|enum)\s+([A-Za-z_$][\w$]*)/g,
+    /^export\s+(?:async\s+)?(?:function|const|let|class|interface|type|enum)\s+([A-Za-z_$][\w$]*)/gm,
     /^(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)/gm,
     /^(?:export\s+)?(?:default\s+)?class\s+([A-Za-z_$][\w$]*)/gm,
     /^def\s+([A-Za-z_]\w*)/gm,
@@ -47134,14 +47134,20 @@ function buildContextBlock(input, repoIndex) {
                 }
                 continue;
             }
+            let addedForPattern = 0;
+            let seenForPattern = 0;
             for (const f of all) {
-                if (matched.size >= 10)
+                if (addedForPattern >= 10)
                     break;
-                if (matchesAny(f, [pattern]) && !pushed.has(f) && !matched.has(f)) {
+                if (!matchesAny(f, [pattern]))
+                    continue;
+                seenForPattern++;
+                if (!pushed.has(f) && !matched.has(f)) {
                     const content = readCached(index, input.repoRoot, f, 8000);
                     if (content === null)
                         continue;
                     matched.add(f);
+                    addedForPattern++;
                     if (push(`--- context file: ${f} ---\n${content}`)) {
                         extraCount++;
                         pushed.add(f);
@@ -47149,6 +47155,9 @@ function buildContextBlock(input, repoIndex) {
                     else
                         break;
                 }
+            }
+            if (seenForPattern === 0) {
+                warnings.push(`context_files: pattern '${pattern}' matched no files`);
             }
         }
     }
