@@ -38,10 +38,11 @@ defaults:
 
 providers:
   # --- Active: OpenCode Go subscription ---
-  # This repo reviews itself with `deepseek-v4-flash` (Go subscription). It
-  # previously used the free `space-bunny-free`, until opencode started
-  # answering "Model is unavailable" for it (2026-10, #81). The other free
-  # model, `longcat-2.5-preview-free`, was tried first and REJECTED for review work:
+  # This repo reviews itself with the free `cat-jam-free`. History (#81):
+  # `space-bunny-free` started answering "Model is unavailable" (2026-10), and
+  # `deepseek-v4-flash` reasons as prose in `content` until it fills any output
+  # cap (2000 and 8000 tokens both tried), so it never emits the findings JSON.
+  # The free `longcat-2.5-preview-free` was tried first and REJECTED for review work:
   #   * it answers a full-size diff with 7-8k chars of markdown prose and no
   #     JSON at all, so every agent reported "unusable response" -> zero findings
   #   * it ignores `response_format: {type: json_object}`, so `json_mode` cannot
@@ -60,7 +61,8 @@ providers:
     protocol: openai-chat # openai-chat | anthropic-messages
     model: cat-jam-free
     base_url: https://opencode.ai/zen/go/v1
-    key_from: secrets.OPENCODE_API_KEY # any $NAME: "secrets.FOO" | "env.FOO"    # json_mode stays TRUE (the default). Turning it off removes
+    key_from: secrets.OPENCODE_API_KEY # any $NAME: "secrets.FOO" | "env.FOO"
+    # json_mode stays TRUE (the default). Turning it off removes
     # `response_format: {type: json_object}`, and a model that ignores the
     # "JSON only" instruction then answers in markdown, which is unusable. Only
     # disable it for a provider that genuinely rejects response_format.
@@ -77,10 +79,8 @@ providers:
     # (measured 0/5 parseable; a bigger cap does NOT help — thinking expands to
     # fill it, 0/2 at 8000). Capping the thinking fixes it (2/2 parseable with
     # real findings on the same 80k-char diff), so this stays active.
-    # deepseek-v4-flash is different: it reasons as plain prose in `content`
-    # and only then emits the JSON, so the fixed 2000-token cap cut both agents
-    # off mid-analysis on #81 (2.0k out each, "unusable response").
-    # extra_body is merged last, so max_tokens here overrides that cap.
+    # extra_body is merged last, so max_tokens here overrides the built-in
+    # 2000-token cap; cat-jam-free answers in ~1.5k, so 8000 is only headroom.
     extra_body: { reasoning_effort: "low", max_tokens: 8000 }
     # retries: 2 # attempts after the first for empty/5xx/429/network (0-5)
     # timeout_s: 420 # per-attempt TOTAL cap in seconds (10-600); 90s idle + 60s/1KB trickle guards always on
