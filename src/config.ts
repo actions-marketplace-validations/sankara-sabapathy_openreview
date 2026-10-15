@@ -253,8 +253,9 @@ function firstOf(branch: string): First | null {
           if (e === "d") for (const c of DIGITS) set.add(c);
           else if (e === "s") for (const c of SPACES) set.add(c);
           else if (e === "w") for (const c of WORDS) set.add(c);
-          else if (/[DSW]/.test(e)) return ANY;
-          else set.add(fold(e));
+          else if (e === "D") return { kind: "not", chars: new Set(DIGITS) };
+          else if (e === "S") return { kind: "not", chars: new Set(SPACES) };
+          else if (e === "W") return { kind: "not", chars: new Set(WORDS) };          else set.add(fold(e));
           j += 2;
           continue;
         }
