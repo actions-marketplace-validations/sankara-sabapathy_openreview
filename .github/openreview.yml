@@ -39,13 +39,8 @@ defaults:
 providers:
   # --- Active: OpenCode Go, free tier ---
   # This repo reviews itself with the free `cat-jam-free` model.
-  # Other free-tier candidates are not usable for reviews in our tests:
-  #   - longcat-2.5-preview-free : returns prose instead of JSON
-  #   - step-5-preview-free      : untested here, probe before trusting
-  #     (deepseek-v4-flash and space-bunny-free failed earlier and are no
-  #      longer configured; see website/docs/providers/opencode-go.md).
-  # Free-tier models are reasoning-heavy, so the active config keeps
-  # reasoning_effort low and raises max_tokens (thinking + answer) to 8000.
+  # Other free-tier candidates are not usable in our tests (see the Go
+  # provider doc); paid models on the same subscription include GLM/Kimi/Qwen.
   opencode:
     # kind: is a deprecated shorthand (anthropic|openai|opencode|openai-compatible).
     # Prefer protocol below; both are shown here for reference.
@@ -64,11 +59,8 @@ providers:
     # json_mode: true # set false ONLY for providers that reject response_format
     # extra_body: { temperature: 0.1 } # extra JSON body fields merged into requests
     # Some free-tier models are reasoning-heavy and can fill a capped output
-    # budget with thinking instead of findings; max_tokens: 8000 gives enough
-    # room for the answer while leaving room for reasoning. On cat-jam-free
-    # the review completes in a few seconds with a few kilobytes of output.
-    # extra_body is merged last, so max_tokens here overrides the built-in
-    # 2000-token cap; cat-jam-free answers in ~1.5k, so 8000 is only headroom.
+    # budget with thinking instead of findings. Increase max_tokens to leave
+    # room for both thinking and the answer JSON.
     extra_body: { reasoning_effort: "low", max_tokens: 8000 }
     # retries: 2 # attempts after the first for empty/5xx/429/network (0-5)
     # timeout_s: 420 # per-attempt TOTAL cap in seconds (10-600); 90s idle + 60s/1KB trickle guards always on
@@ -130,6 +122,10 @@ reviews:
     # context_files: ["src/config.ts"]
     # include_full_files: true
     # max_context_chars: 20000
+    # synthesize (default): main runs after the subagents, merges or dismisses
+    # their findings, and writes the PR summary + walkthrough on the sticky.
+    # parallel: main is one more independent reviewer (pre-0.13 behavior).
+    # main_mode: synthesize
     main:
       # name: defaults to "<review-id>:main"
       provider: opencode

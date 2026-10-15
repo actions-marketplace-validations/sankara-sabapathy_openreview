@@ -15,7 +15,7 @@ minutes, your keys. You pay your LLM provider directly, no per-seat SaaS.
 - **Any provider**: `protocol: openai-chat` (OpenAI, Groq, Ollama, OpenRouter, OpenCode
   Zen/Go, …) or `protocol: anthropic-messages`, with `base_url` + `key_from` + `model`.
   No restricted provider list; legacy `kind:` still works as a shorthand.
-- **Main + subagents**: each review has a `main` synthesizer + custom `subagents[]`
+- **Main + subagents**: each review has custom `subagents[]` plus a `main` synthesizer that runs after them, merges and verifies their findings, and writes a PR summary + per-file walkthrough
   with their own instructions and providers.
 - **Verdict**: `comment|approve|request_changes` per review, merged by
   `global_verdict` into a sticky PR comment + inline findings + `verdict` output.
