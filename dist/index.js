@@ -44576,10 +44576,6 @@ const ReviewConfig = objectType({
     profile: enumType(["quiet", "balanced", "assertive"]).optional(),
     min_confidence: numberType().min(0).max(1).optional(),
     max_findings: numberType().int().positive().optional(),
-    // synthesize (default): subagents run first, then `main` sees the diff plus
-    // their findings, merges/dismisses them and writes the PR summary and
-    // walkthrough. parallel: the pre-0.13 behavior, main is one more reviewer.
-    main_mode: enumType(["synthesize", "parallel"]).default("synthesize"),
     main: AgentConfig,
     subagents: arrayType(AgentConfig).default([]),
     verdict: VerdictConfig.default({}),
@@ -44850,129 +44846,7 @@ async function resolveExtends(entries, ctx, seen = [], depth = 0) {
     return { merged, sources };
 }
 
-;// CONCATENATED MODULE: ./dist-src/synthesis.js
-function labelFindings(findings) {
-    return findings.map((finding, i) => ({ id: `F${i + 1}`, finding }));
-}
-const SYNTH_SCHEMA = '{"summary":string,"walkthrough":[{"file":string,"change":string}],' +
-    '"findings":[{"file":string,"line":number|null,"severity":"high|medium|suggestion","category":string,"comment":string,"confidence":0-1,"sources":["F1"]}],' +
-    '"dismissed":[{"id":"F2","reason":string}]}';
-const SYNTH_SYSTEM = (lang, instructions) => `You are the lead code reviewer synthesizing a multi-agent review. Language: ${lang}.
-Custom instructions: ${instructions}
-
-You get the diff and the findings other reviewers reported, each with an id (F1, F2, ...). Your job:
-1. Verify every prior finding against the diff. Keep the real ones. Merge duplicates into ONE finding whose "sources" lists every merged id. Put false positives in "dismissed" with a one-line reason. Dismiss only what the diff clearly disproves; when unsure, keep it.
-2. Add real issues the others missed, with "sources": [].
-3. "summary": 2-4 sentences on what this PR does and where its risk is.
-4. "walkthrough": one entry per changed file (group trivial files), one sentence each on what changed.
-
-OUTPUT FORMAT — mandatory, and your reply is checked against it:
-Reply with ONE JSON object and NOTHING else. The first character must be "{" and the last must be "}".
-No markdown, no headings, no bullets, no code fences, no preamble.
-Schema: ${SYNTH_SCHEMA}
-
-Be strict on bugs/security, lenient on style.`;
-const SYNTH_REMINDER = `\n\nReminder: your entire reply must be one JSON object of this exact shape, nothing else:\n${SYNTH_SCHEMA}`;
-/**
- * Prior findings as one JSON object per line, bounded by `maxChars`. Findings
- * past the budget are left out of the prompt — and, because the synthesizer
- * cannot name them, kept unchanged by mergeSynthesis.
- */
-function renderPriorFindings(labeled, maxChars = 30000) {
-    if (labeled.length === 0)
-        return "<prior_findings>\nNone. The other reviewers reported nothing (or none ran).\n</prior_findings>";
-    const lines = [];
-    let used = 0;
-    for (const { id, finding: f } of labeled) {
-        const line = JSON.stringify({
-            id,
-            file: f.file,
-            line: f.line ?? null,
-            severity: f.severity,
-            category: f.category,
-            comment: f.comment,
-            confidence: f.confidence,
-            agent: f.agent,
-        });
-        if (used + line.length > maxChars)
-            break;
-        lines.push(line);
-        used += line.length + 1;
-    }
-    const omitted = labeled.length - lines.length;
-    const note = omitted > 0 ? `\n(${omitted} more finding(s) omitted for length; they are kept as reported.)` : "";
-    return `<prior_findings>\n${lines.join("\n")}${note}\n</prior_findings>`;
-}
-const clip = (s, n) => String(s ?? "").replace(/\s+/g, " ").trim().slice(0, n);
-/**
- * Pull the synthesis fields out of the parsed reply object. `rawFindings` is
- * the reply's findings array; only entries the caller kept (`kept[i]` true)
- * contribute a sources row, so `sources` stays aligned with the Finding[] the
- * caller built.
- */
-function parseSynthesis(holder, rawFindings, kept) {
-    const walk = Array.isArray(holder?.walkthrough) ? holder.walkthrough : [];
-    const dis = Array.isArray(holder?.dismissed) ? holder.dismissed : [];
-    return {
-        summary: clip(holder?.summary, 1200),
-        walkthrough: walk
-            .filter((w) => w && w.file && w.change)
-            .slice(0, 40)
-            .map((w) => ({ file: clip(w.file, 200), change: clip(w.change, 300) })),
-        dismissed: dis
-            .filter((d) => d && typeof d.id === "string")
-            .map((d) => ({ id: d.id.trim(), reason: clip(d.reason, 300) || "no reason given" })),
-        sources: rawFindings
-            .filter((_, i) => kept[i])
-            .map((f) => Array.isArray(f?.sources) ? f.sources.filter((s) => typeof s === "string").map((s) => s.trim()) : []),
-    };
-}
-/**
- * Merge the synthesizer's verdict on the prior findings into one list.
- * - A synthesized finding citing known ids inherits their attribution and
- *   votes under every source provider (so `strategy: all|majority` keeps
- *   meaning one ballot per provider). One citing none is the main agent's own.
- * - A prior id named in `dismissed` (and cited by no finding) is removed and
- *   reported with its reason, never dropped silently.
- * - A prior id the synthesizer never mentions is kept unchanged.
- */
-function mergeSynthesis(labeled, synthFindings, synth) {
-    const byId = new Map(labeled.map((l) => [l.id, l.finding]));
-    const cited = new Set();
-    const out = [];
-    synthFindings.forEach((f, i) => {
-        const srcs = [...new Set(synth.sources[i] ?? [])].filter((id) => byId.has(id));
-        srcs.forEach((id) => cited.add(id));
-        if (srcs.length === 0) {
-            out.push(f);
-            return;
-        }
-        const origins = srcs.map((id) => byId.get(id));
-        const agents = [...new Set(origins.map((o) => o.agent))];
-        out.push({
-            ...f,
-            agent: agents.join("+"),
-            provider: origins[0].provider,
-            model: origins[0].model,
-            voters: [...new Set(origins.flatMap((o) => o.voters ?? [o.provider]))],
-        });
-    });
-    const reasons = new Map(synth.dismissed.map((d) => [d.id, d.reason]));
-    const dismissed = [];
-    for (const { id, finding } of labeled) {
-        if (cited.has(id))
-            continue;
-        const reason = reasons.get(id);
-        if (reason !== undefined)
-            dismissed.push({ finding, reason });
-        else
-            out.push(finding);
-    }
-    return { findings: out, dismissed };
-}
-
 ;// CONCATENATED MODULE: ./dist-src/providers.js
-
 
 function resolveKeysFromEnv(env) {
     return {
@@ -45154,7 +45028,7 @@ async function callAnthropic(opts) {
             headers: opts.headers,
             body: JSON.stringify({
                 model: opts.model,
-                max_tokens: opts.maxTokens,
+                max_tokens: 2000,
                 system: opts.system,
                 messages: [{ role: "user", content: opts.user }],
                 ...opts.extraBody,
@@ -45269,7 +45143,7 @@ async function callOpenAICompatible(opts) {
             { role: "user", content: opts.user },
         ],
         temperature: 0.2,
-        max_tokens: opts.maxTokens,
+        max_tokens: 2000,
         ...opts.extraBody,
     };
     if (opts.jsonMode)
@@ -45423,20 +45297,13 @@ function isRetryableError(message) {
     return /empty (content|response)|timeout after|idle timeout|trickle timeout| 429[:\s]| 5\d\d[:\s]|fetch failed|timeout|ECONNRESET|ENOTFOUND|socket hang up/i.test(message);
 }
 async function runAgent(opts) {
-    const synth = opts.priorFindings !== undefined;
-    // The synthesizer also writes a summary and a per-file walkthrough, so it
-    // gets twice the plain reviewer's output budget. extra_body.max_tokens
-    // still overrides either (it is spread after this default).
-    const maxTokens = synth ? 4000 : 2000;
-    const system = synth ? SYNTH_SYSTEM(opts.lang, opts.instructions) : SYSTEM_WRAPPER(opts.lang, opts.instructions);
+    const system = SYSTEM_WRAPPER(opts.lang, opts.instructions);
     let user = `Review this unified diff (truncated):\n\n${truncate(opts.diff, opts.maxDiffChars)}`;
     if (opts.contextBlock) {
         user += `\n\n${opts.contextBlock}\nGround every finding in the diff above; use <context> only as cross-file evidence (callers, types, contracts). Never flag context-only code.`;
     }
-    if (synth)
-        user += `\n\nFindings from the other reviewers:\n${opts.priorFindings}`;
     // Restate the output contract last, after a long diff + context block.
-    user += synth ? SYNTH_REMINDER : SCHEMA_REMINDER;
+    user += SCHEMA_REMINDER;
     const rp = resolveProvider(opts.provider, opts.keys, process.env, opts.sessionId);
     // missing BYOK key -> report it as a skip so it can never read as a clean
     // review, and the caller can name the missing secret (issue #46)
@@ -45499,7 +45366,6 @@ async function runAgent(opts) {
                     user,
                     extraBody: rp.extraBody,
                     timeoutMs,
-                    maxTokens,
                 });
             }
             else {
@@ -45514,7 +45380,6 @@ async function runAgent(opts) {
                     jsonMode: rp.jsonMode,
                     extraBody: rp.extraBody,
                     timeoutMs,
-                    maxTokens,
                 });
             }
             raw = out.text;
@@ -45574,7 +45439,7 @@ async function runAgent(opts) {
         throw new AgentFailedError(`Agent ${opts.agentName} failed after ${attemptsMade} attempt(s): ${lastError || "run budget exhausted"}` +
             (lastShape ? ` [response ${lastShape}]` : ""), attemptsMade, spentAny ? { ...spent } : null, seconds, startedAt, endedAt);
     }
-    const parsed = extractReviewJson(raw);
+    const parsed = extractFindingsJson(raw);
     if (!parsed) {
         // Raw heads can be megabytes of reasoning trace; keep the log useful.
         logWarning(`Agent ${opts.agentName}: could not parse findings JSON; raw head: ${raw.slice(0, 200)}` +
@@ -45583,10 +45448,7 @@ async function runAgent(opts) {
     }
     try {
         const out = [];
-        const rawFindings = Array.isArray(parsed.findings) ? parsed.findings : [];
-        const kept = [];
-        for (const f of rawFindings) {
-            kept.push(Boolean(f?.file && f?.comment));
+        for (const f of parsed.findings ?? []) {
             if (!f?.file || !f?.comment)
                 continue;
             const sev = f.severity === "high" || f.severity === "medium" ? f.severity : "suggestion";
@@ -45602,12 +45464,7 @@ async function runAgent(opts) {
                 model: opts.provider.model,
             });
         }
-        const synthesis = synth ? parseSynthesis(parsed, rawFindings, kept) : undefined;
-        return {
-            findings: out, usage, seconds, attempts: attemptsMade, startedAt, endedAt,
-            outcome: out.length > 0 ? "ok" : "no-findings",
-            ...(synthesis ? { synthesis } : {}),
-        };
+        return { findings: out, usage, seconds, attempts: attemptsMade, startedAt, endedAt, outcome: out.length > 0 ? "ok" : "no-findings" };
     }
     catch (e) {
         // Validation of individual findings failed — warn, don't silently drop everything.
@@ -45621,21 +45478,12 @@ async function runAgent(opts) {
 // which breaks the moment prose with braces follows the JSON — a live run lost
 // two complete reviews (131k reasoning tokens) to exactly that.
 function extractFindingsJson(raw) {
-    const holder = extractReviewJson(raw);
-    if (!holder)
-        return null;
-    return Array.isArray(holder.findings) ? { findings: holder.findings } : holder;
-}
-/** Like extractFindingsJson, but returns the whole object that carries the
- * findings array, so a synthesizer's sibling keys (summary, walkthrough,
- * dismissed) survive the parse. */
-function extractReviewJson(raw) {
     const cleaned = raw.replace(/^```(?:json)?\s*/i, "").replace(/```$/i, "").trim();
     // 1. The whole thing is usually the JSON.
     const direct = tryParse(cleaned);
-    const directHolder = pickFindings(direct);
-    if (directHolder)
-        return directHolder;
+    const directFindings = pickFindings(direct);
+    if (directFindings)
+        return { findings: directFindings };
     // 2. Scan balanced objects left to right and take the first that really
     //    carries a findings array. Lazy on purpose: a 130k-token reasoning trace
     //    holds thousands of `{...}` fragments from quoted code, and materializing
@@ -45645,7 +45493,7 @@ function extractReviewJson(raw) {
             continue; // cheap pre-filter
         const found = pickFindings(tryParse(cand));
         if (found)
-            return found;
+            return { findings: found };
     }
     // 3. Tolerate a differently-shaped object rather than losing the response.
     return direct;
@@ -45658,7 +45506,7 @@ function pickFindings(o, depth = 3) {
     if (!o || typeof o !== "object")
         return null;
     if (Array.isArray(o.findings))
-        return o;
+        return o.findings;
     if (depth <= 0)
         return null;
     for (const v of Object.values(o)) {
@@ -46065,60 +45913,6 @@ function logoImg() {
 function freshAppendBody(section) {
     return [STICKY_MARKER, logoImg(), section, `\n${REREVIEW_LINE}`].join("\n");
 }
-/** Table-cell safe: one line, pipes escaped. */
-const cell = (s, n) => s.replace(/\s+/g, " ").replace(/\|/g, "\\|").slice(0, n);
-/** Character budget for all reviews' summary/walkthrough/dismissed blocks
- * together, so a many-review config cannot push one append section toward
- * STICKY_LIMIT (see appendStickySection's size assumption). */
-const SYNTHESIS_BUDGET = 16000;
-/** Summary, walkthrough and dismissed findings for every review that has
- * them. Labels name the review only when more than one review is shown. */
-function renderSynthesis(rows) {
-    const withData = rows.filter((r) => (r.synthesis && (r.synthesis.summary || r.synthesis.walkthrough.length > 0)) || (r.dismissed?.length ?? 0) > 0);
-    if (withData.length === 0)
-        return [];
-    const label = (r) => (rows.length > 1 ? ` — \`${r.id}\`` : "");
-    const out = [];
-    let used = 0;
-    for (let i = 0; i < withData.length; i++) {
-        const r = withData[i];
-        const block = [];
-        if (r.synthesis?.summary) {
-            block.push(`**Summary${label(r)}**`, "", r.synthesis.summary.replace(/\s+/g, " ").slice(0, 1200), "");
-        }
-        const walk = r.synthesis?.walkthrough ?? [];
-        if (walk.length > 0) {
-            const shown = walk.slice(0, 25);
-            block.push(`<details><summary>📋 Walkthrough${label(r)} (${walk.length} file${walk.length === 1 ? "" : "s"})</summary>`, "");
-            block.push("| File | Change |", "|---|---|");
-            for (const w of shown)
-                block.push(`| \`${cell(w.file, 160)}\` | ${cell(w.change, 240)} |`);
-            if (walk.length > shown.length)
-                block.push("", `… and ${walk.length - shown.length} more.`);
-            block.push("", "</details>", "");
-        }
-        const dis = r.dismissed ?? [];
-        if (dis.length > 0) {
-            const shown = dis.slice(0, 15);
-            block.push(`<details><summary>🧹 ${dis.length} finding(s) dismissed by the synthesizer${label(r)}</summary>`, "", "| Severity | File | Reported by | Why dismissed |", "|---|---|---|---|");
-            for (const d of shown) {
-                const loc = d.line ? `${d.file}:${d.line}` : d.file;
-                block.push(`| ${d.severity} | \`${cell(loc, 160)}\` | ${cell(d.agent, 80)} | ${cell(d.reason, 240)} |`);
-            }
-            if (dis.length > shown.length)
-                block.push("", `… and ${dis.length - shown.length} more.`);
-            block.push("", "</details>", "");
-        }
-        const text = block.join("\n");
-        if (used + text.length > SYNTHESIS_BUDGET && out.length > 0) {
-            out.push(`<sub>Summary for ${withData.length - i} more review(s) omitted for length.</sub>`, "");
-            break;
-        }
-        out.push(...block);
-        used += text.length;
-    }
-    return out;
-}
 /** Verdict heading text shared by update (`##`) and append (`###`) modes. */
 function verdictTitle(verdict, status) {
     return status === "error" ? "REVIEW FAILED" : verdict.replace(/_/g, " ").toUpperCase();
@@ -46144,7 +45938,6 @@ function renderRunBody(opts) {
     for (const r of opts.perReview)
         lines.push(`- \`${r.id}\`: **${r.counted === false ? "not reviewed" : r.verdict}** (${r.count} findings)`);
     lines.push("");
-    lines.push(...renderSynthesis(opts.perReview));
     if (status === "error") {
         lines.push("**No review completed.** The verdict below is not a pass — see the agent results.");
         lines.push("");
@@ -46817,7 +46610,6 @@ function authorizeTrigger(input) {
 
 
 
-
 const CONFIG_CANDIDATES = [
     ".github/openreview.yml",
     ".github/openreview.yaml",
@@ -46942,31 +46734,6 @@ function summarizeUsage(records) {
  * via verdict.post_inline (issue #53). Pure helper, unit-tested. */
 function selectInlineFindings(reviews) {
     return reviews.filter((r) => r.postInline).flatMap((r) => r.findings);
-}
-/**
- * Run one review's agents according to `main_mode`.
- * - synthesize: subagents in a bounded pool, then `main` over their findings;
- *   its merge/dismiss decisions apply via mergeSynthesis. A main that returns
- *   no usable synthesis (failed, unparseable, budget gone) falls back to the
- *   plain union of subagent findings — a bad synthesizer never erases them.
- * - parallel (or no runnable main): every agent in one pool, findings unioned.
- * `results` always lists main first, then subagents, matching declaration order.
- */
-async function runReviewAgents(opts) {
-    const { main, subs, synthesize, maxConcurrency } = opts;
-    if (!synthesize || !main) {
-        const results = await runPooled(main ? [() => main(), ...subs] : subs, maxConcurrency);
-        return { results, findings: results.flatMap((r) => r.findings), dismissed: [], reported: 0 };
-    }
-    const subResults = await runPooled(subs, maxConcurrency);
-    const labeled = labelFindings(subResults.flatMap((r) => r.findings));
-    const mainResult = await main(renderPriorFindings(labeled));
-    const results = [mainResult, ...subResults];
-    if (!mainResult.synthesis) {
-        return { results, findings: subResults.flatMap((r) => r.findings), dismissed: [], reported: labeled.length };
-    }
-    const merged = mergeSynthesis(labeled, mainResult.findings, mainResult.synthesis);
-    return { results, ...merged, synthesis: mainResult.synthesis, reported: labeled.length };
 }
 /** Run thunks with at most `limit` in flight, preserving result order.
  * Takes thunks, NOT promises: an already-started promise is in flight before
@@ -47103,18 +46870,17 @@ async function run() {
                 maxContextChars: review.max_context_chars ?? config.defaults.max_context_chars ?? 20000,
                 ignore: config.defaults.ignore ?? [],
             }, repoIndex);
-            const mainDef = { ...review.main, name: review.main.name ?? `${review.id}:main` };
-            const subDefs = review.subagents.map((s, i) => ({ ...s, name: s.name ?? `${review.id}:sub${i}` }));
-            const synthesize = review.main_mode !== "parallel";
-            logInfo(`Review ${review.id}: launching ${1 + subDefs.length} agent(s) [${[mainDef, ...subDefs]
-                .map((a) => `${a.name}/${a.provider}`)
-                .join(", ")}] on ${scopedFiles.length} file(s), strategy=${review.strategy}, ` +
-                `main_mode=${synthesize ? "synthesize" : "parallel"}`);
             // Thunks, not promises: runAgent must not start until the pool allows it
             // (an eager promise is already in flight, so the cap would be a no-op).
-            // The optional argument is the synthesizer's <prior_findings> block,
-            // known only once the subagents have finished.
-            const makeTask = (a) => {
+            const tasks = [];
+            const agentDefs = [
+                { ...review.main, name: review.main.name ?? `${review.id}:main` },
+                ...review.subagents.map((s, i) => ({ ...s, name: s.name ?? `${review.id}:sub${i}` })),
+            ];
+            logInfo(`Review ${review.id}: launching ${agentDefs.length} agent(s) [${agentDefs
+                .map((a) => `${a.name}/${a.provider}`)
+                .join(", ")}] on ${scopedFiles.length} file(s), strategy=${review.strategy}`);
+            for (const a of agentDefs) {
                 let provider = config.providers[a.provider];
                 if (!provider) {
                     if (a.provider.includes(".")) {
@@ -47123,14 +46889,13 @@ async function run() {
                     }
                     else {
                         logWarning(`Review ${review.id}: unknown provider '${a.provider}', skipped agent ${a.name}.`);
-                        return null;
+                        continue;
                     }
                 }
-                const p = provider;
-                return (priorFindings) => runAgent({
-                    agentName: a.name,
+                tasks.push(() => runAgent({
+                    agentName: a.name ?? "agent",
                     providerName: a.provider,
-                    provider: p,
+                    provider,
                     instructions: a.instructions,
                     diff: scopedDiff,
                     lang: config.defaults.lang ?? "en",
@@ -47139,7 +46904,6 @@ async function run() {
                     sessionId,
                     contextBlock,
                     deadlineAt,
-                    priorFindings,
                 })
                     .then((result) => ({
                     findings: result.findings,
@@ -47149,10 +46913,9 @@ async function run() {
                     startedAt: result.startedAt,
                     endedAt: result.endedAt,
                     outcome: result.outcome,
-                    agent: a.name,
+                    agent: a.name ?? "agent",
                     providerName: a.provider,
-                    model: p.model,
-                    synthesis: result.synthesis,
+                    model: provider.model,
                 }))
                     .catch((e) => {
                     const msg = e.message;
@@ -47173,34 +46936,17 @@ async function run() {
                         endedAt: failed?.endedAt ?? now,
                         error: msg,
                         outcome: "error",
-                        agent: a.name,
+                        agent: a.name ?? "agent",
                         providerName: a.provider,
-                        model: p.model,
+                        model: provider.model,
                     };
-                });
-            };
-            const subTasks = subDefs
-                .map((a) => makeTask(a))
-                .filter((t) => t !== null)
-                .map((t) => () => t());
-            const mainTask = makeTask(mainDef);
+                }));
+            }
             // Bounded fan-out (issue #51): run at most `max_concurrency` agents at a
             // time instead of bursting every agent at the provider at once. The
             // thunk is what makes the cap real — see runPooled.
-            const { results, findings: merged, dismissed, synthesis, reported } = await runReviewAgents({
-                main: mainTask,
-                subs: subTasks,
-                synthesize,
-                maxConcurrency,
-            });
-            let findings = merged;
-            if (synthesis) {
-                logInfo(`Review ${review.id}: synthesizer kept ${findings.length} finding(s) from ${reported} reported, ` +
-                    `dismissed ${dismissed.length}.`);
-            }
-            else if (synthesize && mainTask && reported > 0) {
-                logWarning(`Review ${review.id}: synthesizer produced no usable result; keeping all ${reported} subagent finding(s).`);
-            }
+            const results = await runPooled(tasks, maxConcurrency);
+            let findings = results.flatMap((r) => r.findings);
             const agentErrors = results.filter((r) => r.error).map((r) => `- \`${r.agent}\`: ${r.error}`);
             if (review.verdict.deduplicate)
                 findings = dedupeFindings(findings);
@@ -47234,14 +46980,10 @@ async function run() {
                 // Dotted refs (`opencode.flash`) vote under their full ref, so two
                 // models on one transport disagree as two ballots (issue #67).
                 const byProvider = new Map();
-                // A synthesized finding merging several agents' reports votes in
-                // each source provider's ballot.
                 for (const f of findings) {
-                    for (const v of f.voters?.length ? f.voters : [f.provider]) {
-                        const list = byProvider.get(v) ?? [];
-                        list.push(f);
-                        byProvider.set(v, list);
-                    }
+                    const list = byProvider.get(f.provider) ?? [];
+                    list.push(f);
+                    byProvider.set(f.provider, list);
                 }
                 const ballots = [...byProvider.entries()].map(([name, fs]) => {
                     const v = decideReviewVerdict(review.verdict.mode, review.verdict.min_severity, fs);
@@ -47259,8 +47001,6 @@ async function run() {
                 id: review.id,
                 verdict,
                 findings,
-                synthesis,
-                dismissed,
                 errors: agentErrors,
                 counted: counted > 0,
                 // verdict.post_inline finally honored (issue #53): a review that opts
@@ -47324,8 +47064,6 @@ async function run() {
             verdict: r.verdict,
             count: r.findings.length,
             counted: r.counted,
-            synthesis: r.synthesis,
-            dismissed: r.dismissed.map((d) => ({ ...d.finding, reason: d.reason })),
         }));
         const agentRows = perReview.flatMap((r) => r.agents.map((a) => ({
             ...a,
