@@ -192,11 +192,12 @@ function union(a: First, b: First): First {
     for (const c of a.chars) if (b.chars.has(c)) shared.add(c);
     return { kind: "not", chars: shared };
   }
+  // Everything outside N, plus S: still a complement, excluding N minus S.
   const [not, set] = a.kind === "not" ? [a, b] : [b, a];
-  const rest = new Set<string>();
-  for (const c of (set as { chars: Set<string> }).chars)
-    if (!(not as { chars: Set<string> }).chars.has(c)) rest.add(c);
-  return { kind: "set", chars: rest };
+  const excluded = new Set<string>();
+  for (const c of (not as { chars: Set<string> }).chars)
+    if (!(set as { chars: Set<string> }).chars.has(c)) excluded.add(c);
+  return { kind: "not", chars: excluded };
 }
 
 function intersects(a: First, b: First): boolean {
@@ -246,6 +247,8 @@ function firstOf(branch: string): First | null {
       }
       if (branch[j] === "]") j++;
       const set = new Set<string>();
+      // In-class complements (`[\S]`, `[a\D]`) union in as `not` sets.
+      let cls: First = { kind: "set", chars: set };
       while (j < n && branch[j] !== "]") {
         if (branch[j] === "\\") {
           const e = branch[j + 1];
@@ -253,9 +256,10 @@ function firstOf(branch: string): First | null {
           if (e === "d") for (const c of DIGITS) set.add(c);
           else if (e === "s") for (const c of SPACES) set.add(c);
           else if (e === "w") for (const c of WORDS) set.add(c);
-          else if (e === "D") return { kind: "not", chars: new Set(DIGITS) };
-          else if (e === "S") return { kind: "not", chars: new Set(SPACES) };
-          else if (e === "W") return { kind: "not", chars: new Set(WORDS) };          else set.add(fold(e));
+          else if (e === "D") cls = union(cls, { kind: "not", chars: new Set(DIGITS) });
+          else if (e === "S") cls = union(cls, { kind: "not", chars: new Set(SPACES) });
+          else if (e === "W") cls = union(cls, { kind: "not", chars: new Set(WORDS) });
+          else set.add(fold(e));
           j += 2;
           continue;
         }
@@ -269,8 +273,10 @@ function firstOf(branch: string): First | null {
         set.add(fold(branch[j]));
         j++;
       }
-      if (neg) return { kind: "not", chars: set };
-      return { kind: "set", chars: set };
+      cls = union(cls, { kind: "set", chars: set });
+      if (!neg) return cls;
+      if (cls.kind === "any") return { kind: "set", chars: new Set() };
+      return cls.kind === "set" ? { kind: "not", chars: cls.chars } : { kind: "set", chars: cls.chars };
     }
     if (ch === "\\") {
       const e = branch[i + 1];

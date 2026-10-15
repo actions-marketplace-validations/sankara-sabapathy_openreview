@@ -44661,12 +44661,13 @@ function union(a, b) {
                 shared.add(c);
         return { kind: "not", chars: shared };
     }
+    // Everything outside N, plus S: still a complement, excluding N minus S.
     const [not, set] = a.kind === "not" ? [a, b] : [b, a];
-    const rest = new Set();
-    for (const c of set.chars)
-        if (!not.chars.has(c))
-            rest.add(c);
-    return { kind: "set", chars: rest };
+    const excluded = new Set();
+    for (const c of not.chars)
+        if (!set.chars.has(c))
+            excluded.add(c);
+    return { kind: "not", chars: excluded };
 }
 function intersects(a, b) {
     if (a.kind === "any" || b.kind === "any")
@@ -44724,6 +44725,8 @@ function firstOf(branch) {
             if (branch[j] === "]")
                 j++;
             const set = new Set();
+            // In-class complements (`[\S]`, `[a\D]`) union in as `not` sets.
+            let cls = { kind: "set", chars: set };
             while (j < n && branch[j] !== "]") {
                 if (branch[j] === "\\") {
                     const e = branch[j + 1];
@@ -44738,8 +44741,12 @@ function firstOf(branch) {
                     else if (e === "w")
                         for (const c of WORDS)
                             set.add(c);
-                    else if (/[DSW]/.test(e))
-                        return ANY;
+                    else if (e === "D")
+                        cls = union(cls, { kind: "not", chars: new Set(DIGITS) });
+                    else if (e === "S")
+                        cls = union(cls, { kind: "not", chars: new Set(SPACES) });
+                    else if (e === "W")
+                        cls = union(cls, { kind: "not", chars: new Set(WORDS) });
                     else
                         set.add(fold(e));
                     j += 2;
@@ -44756,9 +44763,12 @@ function firstOf(branch) {
                 set.add(fold(branch[j]));
                 j++;
             }
-            if (neg)
-                return { kind: "not", chars: set };
-            return { kind: "set", chars: set };
+            cls = union(cls, { kind: "set", chars: set });
+            if (!neg)
+                return cls;
+            if (cls.kind === "any")
+                return { kind: "set", chars: new Set() };
+            return cls.kind === "set" ? { kind: "not", chars: cls.chars } : { kind: "set", chars: cls.chars };
         }
         if (ch === "\\") {
             const e = branch[i + 1];
