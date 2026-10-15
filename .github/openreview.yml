@@ -39,26 +39,12 @@ defaults:
   # max_findings: 10
 
 providers:
-  # --- Active: OpenCode Go, free tier, cat-jam-free ---
-  # This repo reviews itself with `cat-jam-free`. History, all on PR #83:
-  #   * `space-bunny-free` (the previous default) started answering
-  #     "Upstream request failed: Model is unavailable" on 2026-10-13.
-  #   * `deepseek-v4-flash` (Go subscription) reviewed well when it finished,
-  #     but only 2 of 10 agent calls finished: even at reasoning_effort low it
-  #     spent 2000, 8000 and then 16000 output tokens thinking without writing
-  #     the findings JSON (~2 min and ~32k output tokens per run).
-  #   * `cat-jam-free` reviewed 2/2 in 4-6s with ~1.3k output tokens per agent.
-  # `longcat-2.5-preview-free` stays REJECTED for review work:
-  #   * it answers a full-size diff with 7-8k chars of markdown prose and no
-  #     JSON at all, so every agent reported "unusable response" -> zero findings
-  #   * it ignores `response_format: {type: json_object}`, so `json_mode` cannot
-  #     save it, and neither could a much harder prompt instruction
-  # Verify a model before trusting it: `npm run probe:model <id>` (needs
-  # OPENCODE_API_KEY).
-  #
-  # GLM/Kimi/Qwen etc. are available on the same subscription — see
-  # website/docs/providers/opencode-go.md and openreview.example.yml for the
-  # full provider matrix. Only the model this repo actually uses is configured.
+  # --- Active: OpenCode Go, free tier ---
+  # This repo reviews itself with the free `cat-jam-free` model.
+  # Other free-tier candidates are not usable in our tests:
+  #   - longcat-2.5-preview-free : returns prose instead of JSON
+  # deepseek-v4-flash / space-bunny-free failed earlier.
+  # See website/docs/providers/opencode-go.md for model details.
   opencode:
     # kind: is a deprecated shorthand (anthropic|openai|opencode|openai-compatible).
     # Prefer protocol below; both are shown here for reference.
