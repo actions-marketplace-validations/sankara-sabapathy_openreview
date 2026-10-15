@@ -44954,7 +44954,7 @@ function mergeSynthesis(labeled, synthFindings, synth) {
             agent: agents.join("+"),
             provider: origins[0].provider,
             model: origins[0].model,
-            voters: [...new Set(origins.flatMap((o) => o.voters ?? [o.provider]))],
+            voters: [...new Set(origins.flatMap((o) => (o.voters?.length ? o.voters : [o.provider])))],
         });
     });
     const reasons = new Map(synth.dismissed.map((d) => [d.id, d.reason]));
