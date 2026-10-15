@@ -422,3 +422,57 @@ describe("dogfood round 3 (issue #55)", () => {
     }
   });
 });
+
+describe("context follow-ups (issue #35)", () => {
+  it("caps glob matches per pattern, not shared across patterns", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "or-ctx35-"));
+    try {
+      for (let i = 0; i < 12; i++) {
+        writeFileSync(path.join(dir, `pa-${i}.txt`), `pa file ${i}\n`);
+        writeFileSync(path.join(dir, `pb-${i}.txt`), `pb file ${i}\n`);
+      }
+      const r = buildContextBlock({
+        repoRoot: dir,
+        scopedFiles: [],
+        contextFiles: ["pa-*.txt", "pb-*.txt"],
+        includeFullFiles: false,
+        maxContextChars: 500000,
+        ignore: [],
+      });
+      const paCount = (r.block.match(/context file: pa-/g) ?? []).length;
+      const pbCount = (r.block.match(/context file: pb-/g) ?? []).length;
+      assert.equal(paCount, 10);
+      assert.equal(pbCount, 10);
+      assert.match(r.stats, /20 extra files/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("warns on zero-match globs", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "or-ctx35-"));
+    try {
+      writeFileSync(path.join(dir, "real.txt"), "hello\n");
+      const r = buildContextBlock({
+        repoRoot: dir,
+        scopedFiles: [],
+        contextFiles: ["no-such-*.xyz"],
+        includeFullFiles: false,
+        maxContextChars: 20000,
+        ignore: [],
+      });
+      assert.match(r.stats, /no-such-\*\.xyz.*matched no files/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("anchored export regex ignores export inside comments/strings", () => {
+    assert.ok(extractDefinedNames("export function realone() {}\n").includes("realone"));
+    assert.ok(!extractDefinedNames("// export function ghosted() {}\n").includes("ghosted"));
+    assert.ok(!extractDefinedNames('const s = "export function fakery()";\n').includes("fakery"));
+    assert.ok(
+      !extractDefinedNames("/* export class Sneaky */\nconst x = 1;\n").includes("Sneaky")
+    );
+  });
+});
