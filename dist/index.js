@@ -44555,6 +44555,450 @@ const AgentConfig = objectType({
     instructions: stringType(),
     // NOTE: no max_files (issue #57 removed the reserved-but-unused key).
 });
+/**
+ * Decided-item suppression patterns (rebutted findings that must not
+ * resurrect). Each entry is a case-insensitive regex tested against
+ * "<file> <comment>". Invalid regex fails config parsing naming the entry —
+ * a silently non-matching pattern would be the exact bug class this kills.
+ * Catastrophically slow patterns (nested quantifiers like `(a+)+$`, which
+ * would stall the synchronous filter) fail the same way.
+ */
+const SuppressPatterns = arrayType(stringType()).superRefine((arr, ctx) => {
+    arr.forEach((s, i) => {
+        try {
+            new RegExp(s, "i");
+        }
+        catch {
+            ctx.addIssue({
+                code: ZodIssueCode.custom,
+                message: `suppress[${i}] is not a valid regex: ${s}`,
+                path: [i],
+            });
+            return;
+        }
+        if (hasNestedQuantifier(s)) {
+            ctx.addIssue({
+                code: ZodIssueCode.custom,
+                message: `suppress[${i}] looks catastrophically slow (nested quantifiers): ${s} — ` +
+                    `simplify the pattern; it runs synchronously against every finding`,
+                path: [i],
+            });
+        }
+    });
+});
+/**
+ * True when a regex risks catastrophic backtracking and would stall the
+ * synchronous suppress filter (dogfood on #81). Three shapes, checked
+ * recursively at every level (new RegExp has already validated the input):
+ * 1. nested unbounded quantifiers — `(a+)+$`, `((a+){2})+$`;
+ * 2. quantified alternation with overlapping starts — `(a|ab)+$`
+ *    (compared case-insensitively, since patterns compile with `i`);
+ * 3. adjacent quantified atoms with overlapping starts — `a*a*b*$`.
+ * Provably-linear shapes pass: disjoint branches (`(foo|bar)+$`),
+ * disjoint sequences (`a+b+$`, `\\s+\\S+$`), bounded repetition
+ * (`(ab){2}`, `x{2}`, `(a?)+`). Anything unprovable flags with a message
+ * telling the author to simplify.
+ */
+function hasCatastrophicPattern(src) {
+    for (const branch of splitTop(src))
+        if (checkBranch(branch))
+            return true;
+    return false;
+}
+/** Alias kept for the earlier name; prefer hasCatastrophicPattern. */
+const hasNestedQuantifier = hasCatastrophicPattern;
+/** Split on top-level `|` (depth 0), respecting escapes, classes, groups. */
+function splitTop(text) {
+    const parts = [];
+    let cur = "";
+    let depth = 0;
+    let esc = false;
+    let inClass = false;
+    for (let i = 0; i < text.length; i++) {
+        const ch = text[i];
+        if (esc) {
+            cur += ch;
+            esc = false;
+            continue;
+        }
+        if (ch === "\\") {
+            cur += ch;
+            esc = true;
+            continue;
+        }
+        if (ch === "[")
+            inClass = true;
+        if (ch === "]")
+            inClass = false;
+        if (!inClass && ch === "(")
+            depth++;
+        if (!inClass && ch === ")")
+            depth--;
+        if (!inClass && ch === "|" && depth === 0) {
+            parts.push(cur);
+            cur = "";
+            continue;
+        }
+        cur += ch;
+    }
+    parts.push(cur);
+    return parts;
+}
+const ANY = { kind: "any" };
+const DIGITS = new Set("0123456789".split(""));
+const SPACES = new Set([" ", "\t", "\n", "\r", "\f", "\v"]);
+const WORDS = new Set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_".split(""));
+const fold = (c) => c.toLowerCase();
+function union(a, b) {
+    if (a.kind === "any" || b.kind === "any")
+        return ANY;
+    if (a.kind === "set" && b.kind === "set")
+        return { kind: "set", chars: new Set([...a.chars, ...b.chars]) };
+    if (a.kind === "not" && b.kind === "not") {
+        const shared = new Set();
+        for (const c of a.chars)
+            if (b.chars.has(c))
+                shared.add(c);
+        return { kind: "not", chars: shared };
+    }
+    // Everything outside N, plus S: still a complement, excluding N minus S.
+    const [not, set] = a.kind === "not" ? [a, b] : [b, a];
+    const excluded = new Set();
+    for (const c of not.chars)
+        if (!set.chars.has(c))
+            excluded.add(c);
+    return { kind: "not", chars: excluded };
+}
+function intersects(a, b) {
+    if (a.kind === "any" || b.kind === "any")
+        return true;
+    if (a.kind === "set" && b.kind === "set") {
+        for (const c of a.chars)
+            if (b.chars.has(c))
+                return true;
+        return false;
+    }
+    if (a.kind === "not" && b.kind === "not")
+        return true;
+    const [not, set] = a.kind === "not" ? [a, b] : [b, a];
+    for (const c of set.chars)
+        if (!not.chars.has(c))
+            return true;
+    return false;
+}
+/** First-char set of one branch, honouring group modifiers and zero-width. */
+function firstOf(branch) {
+    let i = 0;
+    const n = branch.length;
+    // Group modifiers: transparent ones (`?:`, `?<name>`) are skipped so the
+    // content decides; lookarounds (`?=`, `?!`, `?<=`, `?<!`) match empty and
+    // their content must not count as a first char — treat as anything.
+    const mod = /^\(\?(?:[:=!]|<[=!]|<[^>]+>)/.exec(branch);
+    if (mod) {
+        const m = mod[0];
+        if (m === "(?:" || (m.startsWith("(?<") && !m.endsWith("=") && !m.endsWith("!")))
+            i = m.length;
+        else
+            return ANY;
+    }
+    for (;;) {
+        if (i >= n)
+            return null;
+        const ch = branch[i];
+        if (ch === "^" || ch === "$") {
+            i++;
+            continue;
+        }
+        if (ch === "\\" && branch[i + 1] === "b") {
+            i += 2;
+            continue;
+        }
+        if (ch === ".")
+            return ANY;
+        if (ch === "[") {
+            let j = i + 1;
+            let neg = false;
+            if (branch[j] === "^") {
+                neg = true;
+                j++;
+            }
+            if (branch[j] === "]")
+                j++;
+            const set = new Set();
+            // In-class complements (`[\S]`, `[a\D]`) union in as `not` sets.
+            let cls = { kind: "set", chars: set };
+            while (j < n && branch[j] !== "]") {
+                if (branch[j] === "\\") {
+                    const e = branch[j + 1];
+                    if (e === undefined)
+                        break;
+                    if (e === "d")
+                        for (const c of DIGITS)
+                            set.add(c);
+                    else if (e === "s")
+                        for (const c of SPACES)
+                            set.add(c);
+                    else if (e === "w")
+                        for (const c of WORDS)
+                            set.add(c);
+                    else if (e === "D")
+                        cls = union(cls, { kind: "not", chars: new Set(DIGITS) });
+                    else if (e === "S")
+                        cls = union(cls, { kind: "not", chars: new Set(SPACES) });
+                    else if (e === "W")
+                        cls = union(cls, { kind: "not", chars: new Set(WORDS) });
+                    else
+                        set.add(fold(e));
+                    j += 2;
+                    continue;
+                }
+                if (branch[j + 1] === "-" && branch[j + 2] !== undefined && branch[j + 2] !== "]") {
+                    const a = branch.charCodeAt(j);
+                    const b = branch.charCodeAt(j + 2);
+                    for (let c = Math.min(a, b); c <= Math.max(a, b); c++)
+                        set.add(fold(String.fromCharCode(c)));
+                    j += 3;
+                    continue;
+                }
+                set.add(fold(branch[j]));
+                j++;
+            }
+            cls = union(cls, { kind: "set", chars: set });
+            if (!neg)
+                return cls;
+            if (cls.kind === "any")
+                return { kind: "set", chars: new Set() };
+            return cls.kind === "set" ? { kind: "not", chars: cls.chars } : { kind: "set", chars: cls.chars };
+        }
+        if (ch === "\\") {
+            const e = branch[i + 1];
+            if (e === undefined)
+                return null;
+            if (e === "d")
+                return { kind: "set", chars: new Set(DIGITS) };
+            if (e === "s")
+                return { kind: "set", chars: new Set(SPACES) };
+            if (e === "w")
+                return { kind: "set", chars: new Set(WORDS) };
+            if (e === "D")
+                return { kind: "not", chars: new Set(DIGITS) };
+            if (e === "S")
+                return { kind: "not", chars: new Set(SPACES) };
+            if (e === "W")
+                return { kind: "not", chars: new Set(WORDS) };
+            return { kind: "set", chars: new Set([fold(e)]) };
+        }
+        if (ch === "(") {
+            const close = matchParen(branch, i);
+            const inner = branch.slice(i + 1, close);
+            let out = { kind: "set", chars: new Set() };
+            for (const alt of splitTop(inner)) {
+                const f = firstOf(alt);
+                if (f === null)
+                    return null;
+                out = union(out, f);
+            }
+            return out;
+        }
+        return { kind: "set", chars: new Set([fold(ch)]) };
+    }
+}
+/** Index of the `)` matching the `(` at pos (nest- and class-aware). */
+function matchParen(text, pos) {
+    let depth = 0;
+    let esc = false;
+    let inClass = false;
+    for (let i = pos; i < text.length; i++) {
+        const ch = text[i];
+        if (esc) {
+            esc = false;
+            continue;
+        }
+        if (ch === "\\") {
+            esc = true;
+            continue;
+        }
+        if (ch === "[")
+            inClass = true;
+        if (ch === "]")
+            inClass = false;
+        if (inClass)
+            continue;
+        if (ch === "(")
+            depth++;
+        if (ch === ")") {
+            depth--;
+            if (depth === 0)
+                return i;
+        }
+    }
+    return text.length;
+}
+/** Quantifier starting at pos: exact `{n}` is bounded, everything else open. */
+function readQuant(text, pos) {
+    const ch = text[pos];
+    if (ch === "+" || ch === "*")
+        return { unbounded: true, end: pos + 1, text: ch };
+    if (ch === "?")
+        return { unbounded: false, end: pos + 1, text: ch };
+    if (ch === "{") {
+        const m = /^\{(\d+)(,(\d*)?)?\}/.exec(text.slice(pos));
+        if (!m)
+            return null;
+        const openEnded = m[2] !== undefined && (m[3] ?? "") === "";
+        return { unbounded: openEnded, end: pos + m[0].length, text: m[0] };
+    }
+    return null;
+}
+/** Top-level atoms of a branch; groups carry inner source + quantifier text. */
+function tokenize(branch) {
+    const atoms = [];
+    let i = 0;
+    const n = branch.length;
+    const skipZeroWidth = () => {
+        for (;;) {
+            if (i < n && (branch[i] === "^" || branch[i] === "$")) {
+                i++;
+                continue;
+            }
+            if (branch[i] === "\\" && branch[i + 1] === "b") {
+                i += 2;
+                continue;
+            }
+            break;
+        }
+    };
+    while (i < n) {
+        skipZeroWidth();
+        if (i >= n)
+            break;
+        if (branch[i] === "|") {
+            i++;
+            continue; // nested-level pipes belong to splitTop callers
+        }
+        let first;
+        let inner;
+        if (branch[i] === "(") {
+            const close = matchParen(branch, i);
+            inner = branch.slice(i + 1, close);
+            let out = { kind: "set", chars: new Set() };
+            for (const alt of splitTop(inner)) {
+                const f = firstOf(alt);
+                if (f === null) {
+                    out = ANY;
+                    break;
+                }
+                out = union(out, f);
+            }
+            first = out;
+            i = close + 1;
+        }
+        else {
+            const f = firstOf(branch.slice(i));
+            first = f ?? ANY;
+            if (branch[i] === "[") {
+                let j = i + 1;
+                let esc2 = false;
+                while (j < n) {
+                    if (esc2) {
+                        esc2 = false;
+                        j++;
+                        continue;
+                    }
+                    if (branch[j] === "\\") {
+                        esc2 = true;
+                        j++;
+                        continue;
+                    }
+                    j++;
+                    if (branch[j - 1] === "]" && j > i + 2)
+                        break;
+                }
+                i = j;
+            }
+            else if (branch[i] === "\\") {
+                i += 2;
+            }
+            else {
+                i++;
+            }
+        }
+        const q = readQuant(branch, i);
+        atoms.push({ first, unbounded: q !== null && q.unbounded, inner, quant: q?.text });
+        if (q)
+            i = q.end;
+    }
+    return atoms;
+}
+/** `?`, `*`, `{0}`, `{0,}`, `{0,m}` match empty; `+`, `{n}`, `{n,m}` do not. */
+function nullableQuant(q) {
+    if (q === undefined)
+        return false;
+    if (q === "?" || q === "*")
+        return true;
+    const m = /^\{(\d+)(,(\d*)?)?\}$/.exec(q);
+    return !!m && m[1] === "0";
+}
+/** A branch is nullable when every atom can match empty. */
+function nullableBranch(branch) {
+    return tokenize(branch).every((a) => nullableQuant(a.quant) || (a.inner !== undefined && splitTop(a.inner).some(nullableBranch)));
+}
+function checkBranch(branch) {
+    const atoms = tokenize(branch);
+    for (let k = 0; k + 1 < atoms.length; k++) {
+        if (atoms[k].unbounded && atoms[k + 1].unbounded && intersects(atoms[k].first, atoms[k + 1].first))
+            return true;
+    }
+    for (const a of atoms) {
+        if (a.inner !== undefined && checkGroup(a.inner, a.quant))
+            return true;
+    }
+    return false;
+}
+function checkGroup(inner, quant) {
+    const branches = splitTop(inner);
+    const unbounded = quant !== undefined && isUnboundedQuant(quant);
+    if (branches.length > 1 && unbounded) {
+        const firsts = branches.map((b) => firstOf(b));
+        for (let i = 0; i < firsts.length; i++)
+            for (let j = i + 1; j < firsts.length; j++) {
+                const [x, y] = [firsts[i], firsts[j]];
+                if (x === null || y === null || intersects(x, y))
+                    return true;
+            }
+        if (branches.some((b) => nullableBranch(b)))
+            return true;
+    }
+    if (unbounded && subtreeUnbounded(inner))
+        return true;
+    for (const b of branches)
+        if (checkBranch(b))
+            return true;
+    return false;
+}
+/** `+`, `*`, `{n,}` repeat without bound; `?`, `{n}`, `{n,m}` do not. */
+function isUnboundedQuant(q) {
+    if (q === "+" || q === "*")
+        return true;
+    if (q === "?")
+        return false;
+    const m = /^\{(\d+)(,(\d*)?)?\}$/.exec(q);
+    if (!m)
+        return true; // malformed (validated earlier) — stay conservative
+    return m[2] !== undefined && (m[3] ?? "") === "";
+}
+/** Any unbounded quantifier anywhere in the (sub)pattern. */
+function subtreeUnbounded(text) {
+    for (const branch of splitTop(text)) {
+        for (const a of tokenize(branch)) {
+            if (a.unbounded)
+                return true;
+            if (a.inner !== undefined && subtreeUnbounded(a.inner))
+                return true;
+        }
+    }
+    return false;
+}
 const VerdictConfig = objectType({
     mode: enumType(["comment", "approve", "request_changes"]).default("comment"),
     min_severity: enumType(["suggestion", "medium", "high"]).default("medium"),
@@ -44576,6 +45020,13 @@ const ReviewConfig = objectType({
     profile: enumType(["quiet", "balanced", "assertive"]).optional(),
     min_confidence: numberType().min(0).max(1).optional(),
     max_findings: numberType().int().positive().optional(),
+    // synthesize (default): subagents run first, then `main` sees the diff plus
+    // their findings, merges/dismisses them and writes the PR summary and
+    // walkthrough. parallel: the pre-0.13 behavior, main is one more reviewer.
+    main_mode: enumType(["synthesize", "parallel"]).default("synthesize"),
+    // Decided items: rebutted patterns suppressed before verdict math (win over
+    // defaults.suppress when set).
+    suppress: SuppressPatterns.optional(),
     main: AgentConfig,
     subagents: arrayType(AgentConfig).default([]),
     verdict: VerdictConfig.default({}),
@@ -44610,6 +45061,8 @@ const OpenReviewConfig = objectType({
         profile: enumType(["quiet", "balanced", "assertive"]).default("balanced"),
         min_confidence: numberType().min(0).max(1).optional(),
         max_findings: numberType().int().positive().optional(),
+        // Suppression defaults; per-review `suppress` wins when set.
+        suppress: SuppressPatterns.optional(),
     })
         .default({}),
     providers: recordType(stringType(), ProviderConfig),
@@ -44846,7 +45299,129 @@ async function resolveExtends(entries, ctx, seen = [], depth = 0) {
     return { merged, sources };
 }
 
+;// CONCATENATED MODULE: ./dist-src/synthesis.js
+function labelFindings(findings) {
+    return findings.map((finding, i) => ({ id: `F${i + 1}`, finding }));
+}
+const SYNTH_SCHEMA = '{"summary":string,"walkthrough":[{"file":string,"change":string}],' +
+    '"findings":[{"file":string,"line":number|null,"severity":"high|medium|suggestion","category":string,"comment":string,"confidence":0-1,"sources":["F1"]}],' +
+    '"dismissed":[{"id":"F2","reason":string}]}';
+const SYNTH_SYSTEM = (lang, instructions) => `You are the lead code reviewer synthesizing a multi-agent review. Language: ${lang}.
+Custom instructions: ${instructions}
+
+You get the diff and the findings other reviewers reported, each with an id (F1, F2, ...). Your job:
+1. Verify every prior finding against the diff. Keep the real ones. Merge duplicates into ONE finding whose "sources" lists every merged id. Put false positives in "dismissed" with a one-line reason. Dismiss only what the diff clearly disproves; when unsure, keep it.
+2. Add real issues the others missed, with "sources": [].
+3. "summary": 2-4 sentences on what this PR does and where its risk is.
+4. "walkthrough": one entry per changed file (group trivial files), one sentence each on what changed.
+
+OUTPUT FORMAT — mandatory, and your reply is checked against it:
+Reply with ONE JSON object and NOTHING else. The first character must be "{" and the last must be "}".
+No markdown, no headings, no bullets, no code fences, no preamble.
+Schema: ${SYNTH_SCHEMA}
+
+Be strict on bugs/security, lenient on style.`;
+const SYNTH_REMINDER = `\n\nReminder: your entire reply must be one JSON object of this exact shape, nothing else:\n${SYNTH_SCHEMA}`;
+/**
+ * Prior findings as one JSON object per line, bounded by `maxChars`. Findings
+ * past the budget are left out of the prompt — and, because the synthesizer
+ * cannot name them, kept unchanged by mergeSynthesis.
+ */
+function renderPriorFindings(labeled, maxChars = 30000) {
+    if (labeled.length === 0)
+        return "<prior_findings>\nNone. The other reviewers reported nothing (or none ran).\n</prior_findings>";
+    const lines = [];
+    let used = 0;
+    for (const { id, finding: f } of labeled) {
+        const line = JSON.stringify({
+            id,
+            file: f.file,
+            line: f.line ?? null,
+            severity: f.severity,
+            category: f.category,
+            comment: f.comment,
+            confidence: f.confidence,
+            agent: f.agent,
+        });
+        if (used + line.length > maxChars)
+            break;
+        lines.push(line);
+        used += line.length + 1;
+    }
+    const omitted = labeled.length - lines.length;
+    const note = omitted > 0 ? `\n(${omitted} more finding(s) omitted for length; they are kept as reported.)` : "";
+    return `<prior_findings>\n${lines.join("\n")}${note}\n</prior_findings>`;
+}
+const clip = (s, n) => String(s ?? "").replace(/\s+/g, " ").trim().slice(0, n);
+/**
+ * Pull the synthesis fields out of the parsed reply object. `rawFindings` is
+ * the reply's findings array; only entries the caller kept (`kept[i]` true)
+ * contribute a sources row, so `sources` stays aligned with the Finding[] the
+ * caller built.
+ */
+function parseSynthesis(holder, rawFindings, kept) {
+    const walk = Array.isArray(holder?.walkthrough) ? holder.walkthrough : [];
+    const dis = Array.isArray(holder?.dismissed) ? holder.dismissed : [];
+    return {
+        summary: clip(holder?.summary, 1200),
+        walkthrough: walk
+            .filter((w) => w && w.file && w.change)
+            .slice(0, 40)
+            .map((w) => ({ file: clip(w.file, 200), change: clip(w.change, 300) })),
+        dismissed: dis
+            .filter((d) => d && typeof d.id === "string")
+            .map((d) => ({ id: d.id.trim(), reason: clip(d.reason, 300) || "no reason given" })),
+        sources: rawFindings
+            .filter((_, i) => kept[i])
+            .map((f) => Array.isArray(f?.sources) ? f.sources.filter((s) => typeof s === "string").map((s) => s.trim()) : []),
+    };
+}
+/**
+ * Merge the synthesizer's verdict on the prior findings into one list.
+ * - A synthesized finding citing known ids inherits their attribution and
+ *   votes under every source provider (so `strategy: all|majority` keeps
+ *   meaning one ballot per provider). One citing none is the main agent's own.
+ * - A prior id named in `dismissed` (and cited by no finding) is removed and
+ *   reported with its reason, never dropped silently.
+ * - A prior id the synthesizer never mentions is kept unchanged.
+ */
+function mergeSynthesis(labeled, synthFindings, synth) {
+    const byId = new Map(labeled.map((l) => [l.id, l.finding]));
+    const cited = new Set();
+    const out = [];
+    synthFindings.forEach((f, i) => {
+        const srcs = [...new Set(synth.sources[i] ?? [])].filter((id) => byId.has(id));
+        srcs.forEach((id) => cited.add(id));
+        if (srcs.length === 0) {
+            out.push(f);
+            return;
+        }
+        const origins = srcs.map((id) => byId.get(id));
+        const agents = [...new Set(origins.map((o) => o.agent))];
+        out.push({
+            ...f,
+            agent: agents.join("+"),
+            provider: origins[0].provider,
+            model: origins[0].model,
+            voters: [...new Set(origins.flatMap((o) => (o.voters?.length ? o.voters : [o.provider])))],
+        });
+    });
+    const reasons = new Map(synth.dismissed.map((d) => [d.id, d.reason]));
+    const dismissed = [];
+    for (const { id, finding } of labeled) {
+        if (cited.has(id))
+            continue;
+        const reason = reasons.get(id);
+        if (reason !== undefined)
+            dismissed.push({ finding, reason });
+        else
+            out.push(finding);
+    }
+    return { findings: out, dismissed };
+}
+
 ;// CONCATENATED MODULE: ./dist-src/providers.js
+
 
 function resolveKeysFromEnv(env) {
     return {
@@ -45028,7 +45603,7 @@ async function callAnthropic(opts) {
             headers: opts.headers,
             body: JSON.stringify({
                 model: opts.model,
-                max_tokens: 2000,
+                max_tokens: opts.maxTokens,
                 system: opts.system,
                 messages: [{ role: "user", content: opts.user }],
                 ...opts.extraBody,
@@ -45143,7 +45718,7 @@ async function callOpenAICompatible(opts) {
             { role: "user", content: opts.user },
         ],
         temperature: 0.2,
-        max_tokens: 2000,
+        max_tokens: opts.maxTokens,
         ...opts.extraBody,
     };
     if (opts.jsonMode)
@@ -45297,13 +45872,20 @@ function isRetryableError(message) {
     return /empty (content|response)|timeout after|idle timeout|trickle timeout| 429[:\s]| 5\d\d[:\s]|fetch failed|timeout|ECONNRESET|ENOTFOUND|socket hang up/i.test(message);
 }
 async function runAgent(opts) {
-    const system = SYSTEM_WRAPPER(opts.lang, opts.instructions);
+    const synth = opts.priorFindings !== undefined;
+    // The synthesizer also writes a summary and a per-file walkthrough, so it
+    // gets twice the plain reviewer's output budget. extra_body.max_tokens
+    // still overrides either (it is spread after this default).
+    const maxTokens = synth ? 4000 : 2000;
+    const system = synth ? SYNTH_SYSTEM(opts.lang, opts.instructions) : SYSTEM_WRAPPER(opts.lang, opts.instructions);
     let user = `Review this unified diff (truncated):\n\n${truncate(opts.diff, opts.maxDiffChars)}`;
     if (opts.contextBlock) {
         user += `\n\n${opts.contextBlock}\nGround every finding in the diff above; use <context> only as cross-file evidence (callers, types, contracts). Never flag context-only code.`;
     }
+    if (synth)
+        user += `\n\nFindings from the other reviewers:\n${opts.priorFindings}`;
     // Restate the output contract last, after a long diff + context block.
-    user += SCHEMA_REMINDER;
+    user += synth ? SYNTH_REMINDER : SCHEMA_REMINDER;
     const rp = resolveProvider(opts.provider, opts.keys, process.env, opts.sessionId);
     // missing BYOK key -> report it as a skip so it can never read as a clean
     // review, and the caller can name the missing secret (issue #46)
@@ -45366,6 +45948,7 @@ async function runAgent(opts) {
                     user,
                     extraBody: rp.extraBody,
                     timeoutMs,
+                    maxTokens,
                 });
             }
             else {
@@ -45380,6 +45963,7 @@ async function runAgent(opts) {
                     jsonMode: rp.jsonMode,
                     extraBody: rp.extraBody,
                     timeoutMs,
+                    maxTokens,
                 });
             }
             raw = out.text;
@@ -45439,7 +46023,7 @@ async function runAgent(opts) {
         throw new AgentFailedError(`Agent ${opts.agentName} failed after ${attemptsMade} attempt(s): ${lastError || "run budget exhausted"}` +
             (lastShape ? ` [response ${lastShape}]` : ""), attemptsMade, spentAny ? { ...spent } : null, seconds, startedAt, endedAt);
     }
-    const parsed = extractFindingsJson(raw);
+    const parsed = extractReviewJson(raw);
     if (!parsed) {
         // Raw heads can be megabytes of reasoning trace; keep the log useful.
         logWarning(`Agent ${opts.agentName}: could not parse findings JSON; raw head: ${raw.slice(0, 200)}` +
@@ -45448,7 +46032,10 @@ async function runAgent(opts) {
     }
     try {
         const out = [];
-        for (const f of parsed.findings ?? []) {
+        const rawFindings = Array.isArray(parsed.findings) ? parsed.findings : [];
+        const kept = [];
+        for (const f of rawFindings) {
+            kept.push(Boolean(f?.file && f?.comment));
             if (!f?.file || !f?.comment)
                 continue;
             const sev = f.severity === "high" || f.severity === "medium" ? f.severity : "suggestion";
@@ -45464,7 +46051,12 @@ async function runAgent(opts) {
                 model: opts.provider.model,
             });
         }
-        return { findings: out, usage, seconds, attempts: attemptsMade, startedAt, endedAt, outcome: out.length > 0 ? "ok" : "no-findings" };
+        const synthesis = synth ? parseSynthesis(parsed, rawFindings, kept) : undefined;
+        return {
+            findings: out, usage, seconds, attempts: attemptsMade, startedAt, endedAt,
+            outcome: out.length > 0 ? "ok" : "no-findings",
+            ...(synthesis ? { synthesis } : {}),
+        };
     }
     catch (e) {
         // Validation of individual findings failed — warn, don't silently drop everything.
@@ -45478,12 +46070,21 @@ async function runAgent(opts) {
 // which breaks the moment prose with braces follows the JSON — a live run lost
 // two complete reviews (131k reasoning tokens) to exactly that.
 function extractFindingsJson(raw) {
+    const holder = extractReviewJson(raw);
+    if (!holder)
+        return null;
+    return Array.isArray(holder.findings) ? { findings: holder.findings } : holder;
+}
+/** Like extractFindingsJson, but returns the whole object that carries the
+ * findings array, so a synthesizer's sibling keys (summary, walkthrough,
+ * dismissed) survive the parse. */
+function extractReviewJson(raw) {
     const cleaned = raw.replace(/^```(?:json)?\s*/i, "").replace(/```$/i, "").trim();
     // 1. The whole thing is usually the JSON.
     const direct = tryParse(cleaned);
-    const directFindings = pickFindings(direct);
-    if (directFindings)
-        return { findings: directFindings };
+    const directHolder = pickFindings(direct);
+    if (directHolder)
+        return directHolder;
     // 2. Scan balanced objects left to right and take the first that really
     //    carries a findings array. Lazy on purpose: a 130k-token reasoning trace
     //    holds thousands of `{...}` fragments from quoted code, and materializing
@@ -45493,7 +46094,7 @@ function extractFindingsJson(raw) {
             continue; // cheap pre-filter
         const found = pickFindings(tryParse(cand));
         if (found)
-            return { findings: found };
+            return found;
     }
     // 3. Tolerate a differently-shaped object rather than losing the response.
     return direct;
@@ -45506,7 +46107,7 @@ function pickFindings(o, depth = 3) {
     if (!o || typeof o !== "object")
         return null;
     if (Array.isArray(o.findings))
-        return o.findings;
+        return o;
     if (depth <= 0)
         return null;
     for (const v of Object.values(o)) {
@@ -45658,10 +46259,11 @@ function splitDiff(diff) {
         cur = null;
         curBody = [];
     };
-    for (const line of diff.split("\n")) {
+    for (const rawLine of diff.split("\n")) {
+        const line = rawLine.replace(/\r$/, "");
         if (line.startsWith("+++ b/")) {
             flush();
-            cur = { file: line.slice(6), patch: "" };
+            cur = { file: line.slice(6).trim(), patch: "" };
             continue;
         }
         if (cur && !line.startsWith("--- a/"))
@@ -45731,6 +46333,19 @@ function dedupeFindings(findings) {
         out.push(f);
     }
     return out;
+}
+/**
+ * Drop findings matching decided-item patterns (rebutted items that must not
+ * resurrect). Each pattern is a case-insensitive regex against
+ * "<file> <comment>". Runs after dedupe, before noise controls and verdict
+ * math — suppressed findings neither show nor vote.
+ */
+function applySuppression(findings, patterns) {
+    if (patterns.length === 0)
+        return { visible: findings, suppressed: 0 };
+    const res = patterns.map((s) => new RegExp(s, "i"));
+    const visible = findings.filter((f) => !res.some((re) => re.test(`${f.file} ${f.comment}`)));
+    return { visible, suppressed: findings.length - visible.length };
 }
 /**
  * A review where only some agents produced a usable result must not report a
@@ -45913,6 +46528,60 @@ function logoImg() {
 function freshAppendBody(section) {
     return [STICKY_MARKER, logoImg(), section, `\n${REREVIEW_LINE}`].join("\n");
 }
+/** Table-cell safe: one line, pipes escaped. */
+const cell = (s, n) => s.replace(/\s+/g, " ").replace(/\|/g, "\\|").slice(0, n);
+/** Character budget for all reviews' summary/walkthrough/dismissed blocks
+ * together, so a many-review config cannot push one append section toward
+ * STICKY_LIMIT (see appendStickySection's size assumption). */
+const SYNTHESIS_BUDGET = 16000;
+/** Summary, walkthrough and dismissed findings for every review that has
+ * them. Labels name the review only when more than one review is shown. */
+function renderSynthesis(rows) {
+    const withData = rows.filter((r) => (r.synthesis && (r.synthesis.summary || r.synthesis.walkthrough.length > 0)) || (r.dismissed?.length ?? 0) > 0);
+    if (withData.length === 0)
+        return [];
+    const label = (r) => (rows.length > 1 ? ` — \`${r.id}\`` : "");
+    const out = [];
+    let used = 0;
+    for (let i = 0; i < withData.length; i++) {
+        const r = withData[i];
+        const block = [];
+        if (r.synthesis?.summary) {
+            block.push(`**Summary${label(r)}**`, "", r.synthesis.summary.replace(/\s+/g, " ").slice(0, 1200), "");
+        }
+        const walk = r.synthesis?.walkthrough ?? [];
+        if (walk.length > 0) {
+            const shown = walk.slice(0, 25);
+            block.push(`<details><summary>📋 Walkthrough${label(r)} (${walk.length} file${walk.length === 1 ? "" : "s"})</summary>`, "");
+            block.push("| File | Change |", "|---|---|");
+            for (const w of shown)
+                block.push(`| \`${cell(w.file, 160)}\` | ${cell(w.change, 240)} |`);
+            if (walk.length > shown.length)
+                block.push("", `… and ${walk.length - shown.length} more.`);
+            block.push("", "</details>", "");
+        }
+        const dis = r.dismissed ?? [];
+        if (dis.length > 0) {
+            const shown = dis.slice(0, 15);
+            block.push(`<details><summary>🧹 ${dis.length} finding(s) dismissed by the synthesizer${label(r)}</summary>`, "", "| Severity | File | Reported by | Why dismissed |", "|---|---|---|---|");
+            for (const d of shown) {
+                const loc = d.line ? `${d.file}:${d.line}` : d.file;
+                block.push(`| ${d.severity} | \`${cell(loc, 160)}\` | ${cell(d.agent, 80)} | ${cell(d.reason, 240)} |`);
+            }
+            if (dis.length > shown.length)
+                block.push("", `… and ${dis.length - shown.length} more.`);
+            block.push("", "</details>", "");
+        }
+        const text = block.join("\n");
+        if (used + text.length > SYNTHESIS_BUDGET && out.length > 0) {
+            out.push(`<sub>Summary for ${withData.length - i} more review(s) omitted for length.</sub>`, "");
+            break;
+        }
+        out.push(...block);
+        used += text.length;
+    }
+    return out;
+}
 /** Verdict heading text shared by update (`##`) and append (`###`) modes. */
 function verdictTitle(verdict, status) {
     return status === "error" ? "REVIEW FAILED" : verdict.replace(/_/g, " ").toUpperCase();
@@ -45938,6 +46607,7 @@ function renderRunBody(opts) {
     for (const r of opts.perReview)
         lines.push(`- \`${r.id}\`: **${r.counted === false ? "not reviewed" : r.verdict}** (${r.count} findings)`);
     lines.push("");
+    lines.push(...renderSynthesis(opts.perReview));
     if (status === "error") {
         lines.push("**No review completed.** The verdict below is not a pass — see the agent results.");
         lines.push("");
@@ -46257,7 +46927,7 @@ function readCapped(root, rel, cap) {
 // Top-level defined names: export function|const|class|interface|type X,
 // def X / class X (python), ^func X (go), ^(public|private)? (class|function) X (php/java-ish).
 const DEF_RES = [
-    /export\s+(?:async\s+)?(?:function|const|let|class|interface|type|enum)\s+([A-Za-z_$][\w$]*)/g,
+    /^export\s+(?:async\s+)?(?:function|const|let|class|interface|type|enum)\s+([A-Za-z_$][\w$]*)/gm,
     /^(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)/gm,
     /^(?:export\s+)?(?:default\s+)?class\s+([A-Za-z_$][\w$]*)/gm,
     /^def\s+([A-Za-z_]\w*)/gm,
@@ -46464,14 +47134,20 @@ function buildContextBlock(input, repoIndex) {
                 }
                 continue;
             }
+            let addedForPattern = 0;
+            let seenForPattern = 0;
             for (const f of all) {
-                if (matched.size >= 10)
+                if (addedForPattern >= 10)
                     break;
-                if (matchesAny(f, [pattern]) && !pushed.has(f) && !matched.has(f)) {
+                if (!matchesAny(f, [pattern]))
+                    continue;
+                seenForPattern++;
+                if (!pushed.has(f) && !matched.has(f)) {
                     const content = readCached(index, input.repoRoot, f, 8000);
                     if (content === null)
                         continue;
                     matched.add(f);
+                    addedForPattern++;
                     if (push(`--- context file: ${f} ---\n${content}`)) {
                         extraCount++;
                         pushed.add(f);
@@ -46479,6 +47155,9 @@ function buildContextBlock(input, repoIndex) {
                     else
                         break;
                 }
+            }
+            if (seenForPattern === 0) {
+                warnings.push(`context_files: pattern '${pattern}' matched no files`);
             }
         }
     }
@@ -46597,6 +47276,7 @@ function authorizeTrigger(input) {
 }
 
 ;// CONCATENATED MODULE: ./dist-src/main.js
+
 
 
 
@@ -46735,6 +47415,31 @@ function summarizeUsage(records) {
 function selectInlineFindings(reviews) {
     return reviews.filter((r) => r.postInline).flatMap((r) => r.findings);
 }
+/**
+ * Run one review's agents according to `main_mode`.
+ * - synthesize: subagents in a bounded pool, then `main` over their findings;
+ *   its merge/dismiss decisions apply via mergeSynthesis. A main that returns
+ *   no usable synthesis (failed, unparseable, budget gone) falls back to the
+ *   plain union of subagent findings — a bad synthesizer never erases them.
+ * - parallel (or no runnable main): every agent in one pool, findings unioned.
+ * `results` always lists main first, then subagents, matching declaration order.
+ */
+async function runReviewAgents(opts) {
+    const { main, subs, synthesize, maxConcurrency } = opts;
+    if (!synthesize || !main) {
+        const results = await runPooled(main ? [() => main(), ...subs] : subs, maxConcurrency);
+        return { results, findings: results.flatMap((r) => r.findings), dismissed: [], reported: 0 };
+    }
+    const subResults = await runPooled(subs, maxConcurrency);
+    const labeled = labelFindings(subResults.flatMap((r) => r.findings));
+    const mainResult = await main(renderPriorFindings(labeled));
+    const results = [mainResult, ...subResults];
+    if (!mainResult.synthesis) {
+        return { results, findings: subResults.flatMap((r) => r.findings), dismissed: [], reported: labeled.length };
+    }
+    const merged = mergeSynthesis(labeled, mainResult.findings, mainResult.synthesis);
+    return { results, ...merged, synthesis: mainResult.synthesis, reported: labeled.length };
+}
 /** Run thunks with at most `limit` in flight, preserving result order.
  * Takes thunks, NOT promises: an already-started promise is in flight before
  * the pool can see it, so passing promises caps nothing. */
@@ -46870,17 +47575,18 @@ async function run() {
                 maxContextChars: review.max_context_chars ?? config.defaults.max_context_chars ?? 20000,
                 ignore: config.defaults.ignore ?? [],
             }, repoIndex);
+            const mainDef = { ...review.main, name: review.main.name ?? `${review.id}:main` };
+            const subDefs = review.subagents.map((s, i) => ({ ...s, name: s.name ?? `${review.id}:sub${i}` }));
+            const synthesize = review.main_mode !== "parallel";
+            logInfo(`Review ${review.id}: launching ${1 + subDefs.length} agent(s) [${[mainDef, ...subDefs]
+                .map((a) => `${a.name}/${a.provider}`)
+                .join(", ")}] on ${scopedFiles.length} file(s), strategy=${review.strategy}, ` +
+                `main_mode=${synthesize ? "synthesize" : "parallel"}`);
             // Thunks, not promises: runAgent must not start until the pool allows it
             // (an eager promise is already in flight, so the cap would be a no-op).
-            const tasks = [];
-            const agentDefs = [
-                { ...review.main, name: review.main.name ?? `${review.id}:main` },
-                ...review.subagents.map((s, i) => ({ ...s, name: s.name ?? `${review.id}:sub${i}` })),
-            ];
-            logInfo(`Review ${review.id}: launching ${agentDefs.length} agent(s) [${agentDefs
-                .map((a) => `${a.name}/${a.provider}`)
-                .join(", ")}] on ${scopedFiles.length} file(s), strategy=${review.strategy}`);
-            for (const a of agentDefs) {
+            // The optional argument is the synthesizer's <prior_findings> block,
+            // known only once the subagents have finished.
+            const makeTask = (a) => {
                 let provider = config.providers[a.provider];
                 if (!provider) {
                     if (a.provider.includes(".")) {
@@ -46889,13 +47595,14 @@ async function run() {
                     }
                     else {
                         logWarning(`Review ${review.id}: unknown provider '${a.provider}', skipped agent ${a.name}.`);
-                        continue;
+                        return null;
                     }
                 }
-                tasks.push(() => runAgent({
-                    agentName: a.name ?? "agent",
+                const p = provider;
+                return (priorFindings) => runAgent({
+                    agentName: a.name,
                     providerName: a.provider,
-                    provider,
+                    provider: p,
                     instructions: a.instructions,
                     diff: scopedDiff,
                     lang: config.defaults.lang ?? "en",
@@ -46904,6 +47611,7 @@ async function run() {
                     sessionId,
                     contextBlock,
                     deadlineAt,
+                    priorFindings,
                 })
                     .then((result) => ({
                     findings: result.findings,
@@ -46913,9 +47621,10 @@ async function run() {
                     startedAt: result.startedAt,
                     endedAt: result.endedAt,
                     outcome: result.outcome,
-                    agent: a.name ?? "agent",
+                    agent: a.name,
                     providerName: a.provider,
-                    model: provider.model,
+                    model: p.model,
+                    synthesis: result.synthesis,
                 }))
                     .catch((e) => {
                     const msg = e.message;
@@ -46936,20 +47645,48 @@ async function run() {
                         endedAt: failed?.endedAt ?? now,
                         error: msg,
                         outcome: "error",
-                        agent: a.name ?? "agent",
+                        agent: a.name,
                         providerName: a.provider,
-                        model: provider.model,
+                        model: p.model,
                     };
-                }));
-            }
+                });
+            };
+            const subTasks = subDefs
+                .map((a) => makeTask(a))
+                .filter((t) => t !== null)
+                .map((t) => () => t());
+            const mainTask = makeTask(mainDef);
             // Bounded fan-out (issue #51): run at most `max_concurrency` agents at a
             // time instead of bursting every agent at the provider at once. The
             // thunk is what makes the cap real — see runPooled.
-            const results = await runPooled(tasks, maxConcurrency);
-            let findings = results.flatMap((r) => r.findings);
+            const { results, findings: merged, dismissed, synthesis, reported } = await runReviewAgents({
+                main: mainTask,
+                subs: subTasks,
+                synthesize,
+                maxConcurrency,
+            });
+            let findings = merged;
+            if (synthesis) {
+                logInfo(`Review ${review.id}: synthesizer kept ${findings.length} finding(s) from ${reported} reported, ` +
+                    `dismissed ${dismissed.length}.`);
+            }
+            else if (synthesize && mainTask && reported > 0) {
+                logWarning(`Review ${review.id}: synthesizer produced no usable result; keeping all ${reported} subagent finding(s).`);
+            }
             const agentErrors = results.filter((r) => r.error).map((r) => `- \`${r.agent}\`: ${r.error}`);
             if (review.verdict.deduplicate)
                 findings = dedupeFindings(findings);
+            // Decided items: rebutted patterns suppressed before verdict math —
+            // they neither show nor vote. Per-review wins over defaults.suppress.
+            const suppress = review.suppress ?? config.defaults.suppress ?? [];
+            if (suppress.length > 0) {
+                const preSuppress = findings.length;
+                findings = applySuppression(findings, suppress).visible;
+                if (findings.length < preSuppress) {
+                    logInfo(`Review ${review.id}: suppression dropped ${preSuppress - findings.length} decided finding(s) ` +
+                        `(${suppress.length} pattern(s))`);
+                }
+            }
             // Noise controls (issue #21): confidence floor + cap, then verdict on survivors.
             const noise = resolveNoise({
                 profile: review.profile ?? config.defaults.profile,
@@ -46980,10 +47717,14 @@ async function run() {
                 // Dotted refs (`opencode.flash`) vote under their full ref, so two
                 // models on one transport disagree as two ballots (issue #67).
                 const byProvider = new Map();
+                // A synthesized finding merging several agents' reports votes in
+                // each source provider's ballot.
                 for (const f of findings) {
-                    const list = byProvider.get(f.provider) ?? [];
-                    list.push(f);
-                    byProvider.set(f.provider, list);
+                    for (const v of f.voters?.length ? f.voters : [f.provider]) {
+                        const list = byProvider.get(v) ?? [];
+                        list.push(f);
+                        byProvider.set(v, list);
+                    }
                 }
                 const ballots = [...byProvider.entries()].map(([name, fs]) => {
                     const v = decideReviewVerdict(review.verdict.mode, review.verdict.min_severity, fs);
@@ -47001,6 +47742,8 @@ async function run() {
                 id: review.id,
                 verdict,
                 findings,
+                synthesis,
+                dismissed,
                 errors: agentErrors,
                 counted: counted > 0,
                 // verdict.post_inline finally honored (issue #53): a review that opts
@@ -47064,6 +47807,8 @@ async function run() {
             verdict: r.verdict,
             count: r.findings.length,
             counted: r.counted,
+            synthesis: r.synthesis,
+            dismissed: r.dismissed.map((d) => ({ ...d.finding, reason: d.reason })),
         }));
         const agentRows = perReview.flatMap((r) => r.agents.map((a) => ({
             ...a,

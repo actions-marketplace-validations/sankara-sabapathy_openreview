@@ -71,10 +71,11 @@ export function splitDiff(diff: string): DiffFile[] {
     cur = null;
     curBody = [];
   };
-  for (const line of diff.split("\n")) {
+  for (const rawLine of diff.split("\n")) {
+    const line = rawLine.replace(/\r$/, "");
     if (line.startsWith("+++ b/")) {
       flush();
-      cur = { file: line.slice(6), patch: "" };
+      cur = { file: line.slice(6).trim(), patch: "" };
       continue;
     }
     if (cur && !line.startsWith("--- a/")) curBody.push(line);
@@ -149,6 +150,22 @@ export function dedupeFindings<T extends { file: string; line?: number; comment:
     out.push(f);
   }
   return out;
+}
+
+/**
+ * Drop findings matching decided-item patterns (rebutted items that must not
+ * resurrect). Each pattern is a case-insensitive regex against
+ * "<file> <comment>". Runs after dedupe, before noise controls and verdict
+ * math — suppressed findings neither show nor vote.
+ */
+export function applySuppression<T extends { file: string; comment: string }>(
+  findings: T[],
+  patterns: string[]
+): { visible: T[]; suppressed: number } {
+  if (patterns.length === 0) return { visible: findings, suppressed: 0 };
+  const res = patterns.map((s) => new RegExp(s, "i"));
+  const visible = findings.filter((f) => !res.some((re) => re.test(`${f.file} ${f.comment}`)));
+  return { visible, suppressed: findings.length - visible.length };
 }
 
 /**

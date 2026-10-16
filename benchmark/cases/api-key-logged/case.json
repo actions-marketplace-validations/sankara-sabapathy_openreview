@@ -1,0 +1,26 @@
+{
+  "id": "api-key-logged",
+  "language": "TypeScript",
+  "description": "Adds request timing logs to the invoice client.",
+  "bugs": [
+    {
+      "id": "key-in-log",
+      "file": "src/client.ts",
+      "lines": [
+        5,
+        5
+      ],
+      "severity": "high",
+      "summary": "The bearer API key is written to the debug log.",
+      "keywords": [
+        "secret",
+        "api key",
+        "apikey",
+        "credential",
+        "token",
+        "leak",
+        "log"
+      ]
+    }
+  ]
+}

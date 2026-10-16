@@ -20,7 +20,9 @@ defaults:
   # not here.
   command: "/review"
   lang: en
-  ignore: ["**.lock", "dist/**", "website/build/**"]
+  # benchmark/cases holds deliberately buggy fixtures (see benchmark/README.md);
+  # reviewing them on every PR would only re-find the seeded bugs.
+  ignore: ["**.lock", "dist/**", "website/build/**", "benchmark/cases/**"]
   max_diff_chars: 80000
   # Wall-clock budget for the whole run (30-14400, default 1200). Once spent, no
   # new agent call starts and the rest report `budget-exhausted` instead of
@@ -38,26 +40,17 @@ defaults:
 
 providers:
   # --- Active: OpenCode Go, free tier ---
-  # This repo reviews itself with `space-bunny-free`. Go ships exactly two free
-  # models; the other one, `longcat-2.5-preview-free`, was tried first and
-  # REJECTED for review work:
-  #   * it answers a full-size diff with 7-8k chars of markdown prose and no
-  #     JSON at all, so every agent reported "unusable response" -> zero findings
-  #   * it ignores `response_format: {type: json_object}`, so `json_mode` cannot
-  #     save it, and neither could a much harder prompt instruction
-  # Both are reasoning models; the difference is that space-bunny-free honours
-  # the JSON contract on a real diff while longcat does not. Verify a model
-  # before trusting it: `npm run probe:model <id>` (needs OPENCODE_API_KEY).
-  #
-  # Deepseek/GLM/Kimi etc. are available on the same subscription — see
-  # website/docs/providers/opencode-go.md and openreview.example.yml for the
-  # full provider matrix. Only the model this repo actually uses is configured.
+  # This repo reviews itself with the free `cat-jam-free` model.
+  # Other free-tier candidates are not usable in our tests:
+  #   - longcat-2.5-preview-free : returns prose instead of JSON
+  # deepseek-v4-flash / space-bunny-free failed earlier.
+  # See website/docs/providers/opencode-go.md for model details.
   opencode:
     # kind: is a deprecated shorthand (anthropic|openai|opencode|openai-compatible).
     # Prefer protocol below; both are shown here for reference.
     kind: opencode
     protocol: openai-chat # openai-chat | anthropic-messages
-    model: space-bunny-free
+    model: cat-jam-free
     base_url: https://opencode.ai/zen/go/v1
     key_from: secrets.OPENCODE_API_KEY # any $NAME: "secrets.FOO" | "env.FOO"
     # json_mode stays TRUE (the default). Turning it off removes
@@ -69,13 +62,7 @@ providers:
     # endpoint_path: /chat/completions # default per protocol (/chat/completions, /v1/messages)
     # json_mode: true # set false ONLY for providers that reject response_format
     # extra_body: { temperature: 0.1 } # extra JSON body fields merged into requests
-    # Reasoning models spend their thinking from the 2000-token output budget:
-    # on a large diff space-bunny-free thinks ~9.5k chars, hits
-    # finish_reason=length with empty content, and both agents end unparseable
-    # (measured 0/5 parseable; a bigger cap does NOT help — thinking expands to
-    # fill it, 0/2 at 8000). Capping the thinking fixes it (2/2 parseable with
-    # real findings on the same 80k-char diff), so this stays active.
-    extra_body: { reasoning_effort: "low" }
+    extra_body: { reasoning_effort: "low", max_tokens: 16000 }
     # retries: 2 # attempts after the first for empty/5xx/429/network (0-5)
     # timeout_s: 420 # per-attempt TOTAL cap in seconds (10-600); 90s idle + 60s/1KB trickle guards always on
     # Named per-model overrides sharing this entry's transport + credential
@@ -83,7 +70,7 @@ providers:
     # only set keys win, so `{ model: ... }` alone keeps base retries/timeout.
     # models:
     #   flash:
-    #     model: deepseek-v4-flash
+    #     model: deepseek-v4.1-flash
     #   free:
     #     model: longcat-2.5-preview-free
     #     json_mode: false
@@ -130,11 +117,16 @@ reviews:
     # profile: balanced
     # min_confidence: 0.6
     # max_findings: 10
+    # suppress: ["decided-pattern"] # rebutted items that must not resurrect (regex, file + comment)
     # Cross-file context: full changed files + call-site excerpts automatic
     # (bounded by max_context_chars below); add explicit files when needed:
     # context_files: ["src/config.ts"]
     # include_full_files: true
     # max_context_chars: 20000
+    # synthesize (default): main runs after the subagents, merges or dismisses
+    # their findings, and writes the PR summary + walkthrough on the sticky.
+    # parallel: main is one more independent reviewer (pre-0.13 behavior).
+    # main_mode: synthesize
     main:
       # name: defaults to "<review-id>:main"
       provider: opencode

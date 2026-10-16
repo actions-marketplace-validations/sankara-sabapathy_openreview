@@ -1,0 +1,19 @@
+def normalize(tag: str) -> str:
+    return tag.strip().lower()
+
+
+def merge_tags(new_tags, existing=[]):
+    """Return `existing` plus every normalized tag in `new_tags`, without duplicates."""
+    for tag in new_tags:
+        t = normalize(tag)
+        if t and t not in existing:
+            existing.append(t)
+    return existing
+
+
+def tag_cloud(posts):
+    counts = {}
+    for post in posts:
+        for tag in merge_tags(post.get("tags", [])):
+            counts[tag] = counts.get(tag, 0) + 1
+    return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))

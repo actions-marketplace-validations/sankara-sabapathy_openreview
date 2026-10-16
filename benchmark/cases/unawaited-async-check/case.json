@@ -1,0 +1,23 @@
+{
+  "id": "unawaited-async-check",
+  "language": "TypeScript",
+  "description": "Adds a login lockout after repeated failures.",
+  "bugs": [
+    {
+      "id": "isLockedOut-not-awaited",
+      "file": "src/login.ts",
+      "lines": [
+        6,
+        6
+      ],
+      "severity": "high",
+      "summary": "isLockedOut is async but not awaited; a Promise is always truthy, so every login is rejected as locked.",
+      "keywords": [
+        "await",
+        "promise",
+        "always truthy",
+        "async"
+      ]
+    }
+  ]
+}

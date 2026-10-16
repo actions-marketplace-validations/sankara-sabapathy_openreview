@@ -1,0 +1,25 @@
+{
+  "id": "pagination-off-by-one",
+  "language": "TypeScript",
+  "description": "Adds 1-based pagination to a list endpoint helper.",
+  "bugs": [
+    {
+      "id": "slice-end",
+      "file": "src/paginate.ts",
+      "lines": [
+        13,
+        13
+      ],
+      "severity": "medium",
+      "summary": "slice end is offset + size + 1, so every page returns one extra item that also repeats as the first item of the next page.",
+      "keywords": [
+        "off-by-one",
+        "off by one",
+        "+ 1",
+        "extra item",
+        "one extra",
+        "size + 1"
+      ]
+    }
+  ]
+}

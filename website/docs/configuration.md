@@ -45,6 +45,7 @@ providers:
 reviews:
   - id: general-quality
     if_paths: ["**"] # which files this review SEES (the diff is scoped to these, too)
+    main_mode: synthesize # default: main runs after the subagents and merges their findings; `parallel` = main is one more reviewer
     main: # synthesizer; name defaults to "<id>:main"
       provider: go # or go.flash for a models entry; unknown `go.typo` fails the run naming both
       instructions: "Synthesize sub-agent findings. Strict on bugs, lenient on style."
@@ -105,6 +106,9 @@ reviews:
     profile: balanced # quiet | balanced | assertive
     min_confidence: 0.6 # explicit knobs override the profile preset
     max_findings: 10
+    # suppress: ["backdate the config"] # decided items: case-insensitive regexes
+    # matched against "<file> <comment>", dropped before verdict math (never vote).
+    # Per-review wins over defaults.suppress. Invalid regex fails load naming the entry.
 ```
 
 | Profile | `min_confidence` | `max_findings` | Effect |
