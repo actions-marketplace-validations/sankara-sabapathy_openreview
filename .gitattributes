@@ -1,0 +1,8 @@
+# Normalize text to LF on checkout.
+#
+# Why: the committed blobs (including dist/) are LF, but a Windows checkout
+# with core.autocrlf=true materializes CRLF working files. Rebuilding dist/
+# from those then produces a CRLF dist/index.js.map, and CI's dist-fresh
+# check (Linux, LF) fails on the phantom diff. Seen twice while landing
+# #84 and #85. text=auto leaves detected binaries untouched.
+* text=auto eol=lf
