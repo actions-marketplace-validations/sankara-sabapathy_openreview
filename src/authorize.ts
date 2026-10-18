@@ -37,7 +37,7 @@ export type AuthorizeInput = {
 
 export type AuthorizeResult = { allowed: true } | { allowed: false; reason: string };
 
-function parseAssociations(raw: string | undefined): string[] {
+export function parseAssociations(raw: string | undefined): string[] {
   const list = (raw ?? "")
     .split(",")
     .map((s) => s.trim().toUpperCase())

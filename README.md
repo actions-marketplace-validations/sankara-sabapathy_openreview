@@ -48,7 +48,7 @@ jobs:
     # sender on write access so no random commenter can spend your provider
     # budget. The command match is a cheap pre-filter: `trim()` does not exist
     # in the Actions expression language, and the action itself enforces the
-    # EXACT command (defaults.command) plus this same association check.
+    # EXACT command (defaults.command), `/ask`, plus this same association check.
     if: >-
       github.event_name == 'pull_request' ||
       (github.event_name == 'issue_comment' &&
@@ -57,7 +57,8 @@ jobs:
       (github.event.comment.author_association == 'OWNER' ||
       github.event.comment.author_association == 'MEMBER' ||
       github.event.comment.author_association == 'COLLABORATOR') &&
-      contains(github.event.comment.body, '/review'))
+      (contains(github.event.comment.body, '/review') ||
+      contains(github.event.comment.body, '/ask')))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

@@ -13,6 +13,7 @@ import {
   AgentFailedError,
   resolveDottedProvider,
   assertProviderRefs,
+  runTextAgent,
   type Finding,
   type AgentOutcome,
 } from "./providers.js";
@@ -21,6 +22,8 @@ import {
   applyDegradedFloor, resolveNoise, applyNoiseControls, splitDiff, scopeDiff, parseHunkRanges, type Verdict,
   satisfiesActionVersion, runningActionVersion, renderPriorReview, matchCarriedFindings,
 } from "./reviewer.js";
+import { parseAskComment, buildAskPrompt, collectFeedbackSignals } from "./ask.js";
+import { parseAssociations } from "./authorize.js";
 import { renderStickyBody, upsertStickyComment, appendStickySection, renderAppendSection, createInlineReview, findStickyComment, parseStickyState, type RunStatus, type StickyFindingState } from "./github.js";
 import { initLogger, logInfo, logWarning, logDebug } from "./logger.js";
 import { buildContextBlock, buildRepoIndex } from "./context.js";
@@ -337,6 +340,100 @@ export async function runPooled<T>(thunks: (() => Promise<T>)[], limit: number):
   return out;
 }
 
+type AskFlowOpts = {
+  octokit: ReturnType<typeof github.getOctokit>;
+  owner: string;
+  repo: string;
+  prNumber: number;
+  config: ReturnType<typeof parseConfig>;
+  keys: ReturnType<typeof resolveKeysFromEnv>;
+  question: string;
+  quoted: string;
+  sessionId: string;
+  deadlineAt: number;
+  dryRun: boolean;
+};
+
+/**
+ * In-thread Q&A (issue #23): answer `/ask` from the PR diff plus the
+ * recorded prior findings, then log the sticky's reaction signal (the
+ * learning half of issue #43; read-only, never changes behavior).
+ */
+async function runAskFlow(opts: AskFlowOpts): Promise<void> {
+  const { octokit, owner, repo, prNumber, config, keys } = opts;
+  const { fileNames, diff, headSha, omitted, stale } = await getPrDiff(
+    octokit, owner, repo, prNumber, (github.context.payload as any).pull_request?.head?.sha
+  );
+  if (stale) {
+    logWarning("Ask: PR head moved during diff fetch; answering from the fetched (slightly old) diff.");
+  }
+  if (!diff.trim() || fileNames.length === 0) {
+    logWarning("Ask: empty diff, nothing to answer from.");
+    return;
+  }
+  // Prior findings ground follow-ups ("what about the P1?") without
+  // re-running any agent. Absent state just means a thinner prompt.
+  let prior: { file: string; line?: number; comment: string }[] = [];
+  try {
+    const sticky = await findStickyComment(octokit, owner, repo, prNumber);
+    const state = sticky?.body ? parseStickyState(sticky.body) : null;
+    if (state) prior = state.reviews.flatMap((r) => r.findings);
+  } catch {
+    logWarning("Ask: prior run state unreadable; answering from the diff alone.");
+  }
+  const mainDef = config.reviews[0]?.main;
+  if (!mainDef) {
+    logWarning("Ask: no reviews configured; cannot pick an answering provider.");
+    return;
+  }
+  let provider = config.providers[mainDef.provider];
+  if (!provider) {
+    if (mainDef.provider.includes(".")) {
+      provider = resolveDottedProvider(config.providers, mainDef.provider).config;
+    } else {
+      logWarning(`Ask: unknown provider '${mainDef.provider}'.`);
+      return;
+    }
+  }
+  const { system, user } = buildAskPrompt({
+    diff: diff.slice(0, config.defaults.max_diff_chars ?? 80000),
+    priorFindings: prior,
+    quoted: opts.quoted,
+    question: opts.question,
+  });
+  let answer: string;
+  let modelLine = "";
+  try {
+    const r = await runTextAgent({
+      agentName: "ask",
+      providerName: mainDef.provider,
+      provider,
+      system,
+      user,
+      keys,
+      sessionId: opts.sessionId,
+      deadlineAt: opts.deadlineAt,
+    });
+    answer = r.text;
+    modelLine = `${provider.model}${r.usage ? ` · ${formatTokens(r.usage.in)}/${formatTokens(r.usage.out)} in/out` : ""}`;
+  } catch (e) {
+    logWarning(`Ask: answering failed (${e instanceof Error ? e.message : String(e)}).`);
+    answer = "";
+  }
+  if (opts.dryRun) {
+    logInfo(`DRY RUN ask answer (model ${provider.model}):\n${(answer || "(no answer)").slice(0, 2000)}`);
+    return;
+  }
+  const body = answer
+    ? `**OpenReview answer** (to \`${opts.question.slice(0, 120)}\`)\n\n${answer}\n\n<sub>Answered with \`${modelLine || provider.model}\` · react on this comment to teach future reviews · ask again with \`/ask\`</sub>`
+    : `OpenReview could not answer that (model ${provider.model} returned nothing usable). Try rephrasing, or run a fresh review with \`/review\`.`;
+  await octokit.rest.issues.createComment({ owner, repo, issue_number: prNumber, body });
+  logInfo(`Ask: answered question (${opts.question.slice(0, 80)}).`);
+  const signals = await collectFeedbackSignals(octokit, owner, repo, prNumber);
+  logInfo(`Feedback signals: ${JSON.stringify(signals.totals)} across ${signals.comments.length} bot comment(s).`);
+}
+
+
 export async function run(): Promise<void> {
   try {
     initLogger();
@@ -373,6 +470,39 @@ export async function run(): Promise<void> {
       }
     }
     const keys = resolveKeysFromEnv(process.env as any);
+    // In-thread Q&A (issue #23): `/ask <question>` on a PR is answered from
+    // the diff, before the review gate below (which would reject any body
+    // that is not exactly the review command). Same write-access rule as
+    // /review: BASE-repo secrets are live here too (issue #59).
+    const askParsed =
+      (ctx.payload as any).issue?.pull_request != null
+        ? parseAskComment((ctx.payload as any).comment?.body)
+        : null;
+    if (askParsed) {
+      const allowed = parseAssociations(core.getInput("allowed-author-associations"));
+      const association = ((ctx.payload as any).comment?.author_association ?? "NONE").trim().toUpperCase();
+      if (!allowed.includes(association)) {
+        logWarning(
+          `Ask denied: sender association '${association}' may not spend provider budget (allowed: ${allowed.join(", ")}). Nothing was answered or posted.`
+        );
+        return;
+      }
+      const askDeadline = Date.now() + (config.defaults.max_runtime_s ?? 1200) * 1000;
+      await runAskFlow({
+        octokit,
+        owner,
+        repo,
+        prNumber,
+        config,
+        keys,
+        question: askParsed.question,
+        quoted: askParsed.quoted,
+        sessionId: process.env.GITHUB_RUN_ID ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        deadlineAt: askDeadline,
+        dryRun,
+      });
+      return;
+    }
     // Authorization gate (issue #59): `issue_comment` runs in the BASE repo
     // context, so the secrets are live. Without this, anyone on the internet
     // could comment the command on any PR and spend the maintainer's keys.
@@ -1074,6 +1204,11 @@ export async function run(): Promise<void> {
         await upsertStickyComment(octokit, owner, repo, prNumber, stickyBase + extras.join(""));
         logInfo(`Published sticky comment (verdict ${global}, ${all.length} findings).`);
       }
+      // Feedback signal (issue #23, learning half of #43): reactions on the
+      // bot's own comments, logged as structured output. Read-only; a
+      // failure here must never fail the run.
+      const signals = await collectFeedbackSignals(octokit, owner, repo, prNumber);
+      logInfo(`Feedback signals: ${JSON.stringify(signals.totals)} across ${signals.comments.length} bot comment(s).`);
     }
     if (global === "request_changes" && config.global_verdict.fail_check_on_request_changes)
       core.setFailed("OpenReview verdict: request_changes");

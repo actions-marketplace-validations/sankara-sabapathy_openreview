@@ -859,6 +859,113 @@ export async function runAgent(opts: {
   }
 }
 
+/** Free-form answer turn (issue #23: `/ask`). Same transport, budget, and
+ * retry discipline as runAgent, but the model replies in prose: no JSON
+ * output contract, no `response_format` (which would force JSON-shaped
+ * prose), and the trimmed text is the result. */
+export type TextAgentResult = {
+  text: string;
+  usage: Usage;
+  seconds: number;
+  attempts: number;
+  startedAt: number;
+  endedAt: number;
+  outcome: "ok" | "skipped-no-key" | "budget-exhausted";
+};
+
+export async function runTextAgent(opts: {
+  agentName: string;
+  providerName: string;
+  provider: ProviderConfig;
+  system: string;
+  user: string;
+  keys: ResolvedKeys;
+  maxTokens?: number;
+  sessionId: string;
+  deadlineAt?: number;
+}): Promise<TextAgentResult> {
+  const rp = resolveProvider(opts.provider, opts.keys, process.env as any, opts.sessionId);
+  const started = Date.now();
+  if (!rp.apiKey) {
+    return { text: "", usage: null, seconds: 0, attempts: 0, startedAt: started, endedAt: started, outcome: "skipped-no-key" };
+  }
+  if (opts.deadlineAt !== undefined && Date.now() >= opts.deadlineAt) {
+    logWarning(`Agent ${opts.agentName}: run budget exhausted before starting.`);
+    return { text: "", usage: null, seconds: 0, attempts: 0, startedAt: started, endedAt: started, outcome: "budget-exhausted" };
+  }
+  const maxAttempts = 1 + Math.min(Math.max(opts.provider.retries ?? 2, 0), 5);
+  const perAttempt = (opts.provider.timeout_s ?? 420) * 1000;
+  const maxTokens = opts.maxTokens ?? 1000;
+  const spent = { in: 0, out: 0 };
+  let spentAny = false;
+  let raw = "";
+  let lastError = "";
+  let attemptsMade = 0;
+  // An empty-but-successful response is usually deterministic (the model
+  // answers in a field we don't read), so one retry is the cap — a third
+  // attempt just triples the wall-clock cost (same rule as runAgent).
+  let emptyRetries = 0;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (opts.deadlineAt !== undefined && Date.now() >= opts.deadlineAt) break;
+    attemptsMade = attempt;
+    const timeoutMs =
+      opts.deadlineAt === undefined
+        ? perAttempt
+        : Math.max(1_000, Math.min(perAttempt, opts.deadlineAt - Date.now()));
+    try {
+      const out =
+        rp.protocol === "anthropic-messages"
+          ? await callAnthropic({
+              apiKey: rp.apiKey, baseUrl: rp.baseUrl, endpointPath: rp.endpointPath, headers: rp.headers,
+              model: opts.provider.model, system: opts.system, user: opts.user,
+              extraBody: rp.extraBody, timeoutMs, maxTokens,
+            })
+          : await callOpenAICompatible({
+              apiKey: rp.apiKey, baseUrl: rp.baseUrl, endpointPath: rp.endpointPath, headers: rp.headers,
+              model: opts.provider.model, system: opts.system, user: opts.user,
+              jsonMode: false, extraBody: rp.extraBody, timeoutMs, maxTokens,
+            });
+      raw = out.text;
+      if (out.usage) {
+        spent.in += out.usage.in;
+        spent.out += out.usage.out;
+        spentAny = true;
+      }
+      if (raw && raw.trim()) break;
+      lastError = `empty content from ${opts.provider.model}`;
+      raw = "";
+    } catch (e) {
+      lastError = (e as Error).message;
+      raw = "";
+    }
+    if (attempt < maxAttempts && isRetryableError(lastError)) {
+      if (lastError.startsWith("empty content")) {
+        if (emptyRetries >= 1) break;
+        emptyRetries++;
+      }
+      logWarning(`Agent ${opts.agentName}: attempt ${attempt}/${maxAttempts} failed (${lastError.slice(0, 160)}); retrying`);
+      await sleep(Math.min(2000 * attempt, 8000));
+    } else if (attempt < maxAttempts) {
+      break;
+    }
+  }
+  const seconds = (Date.now() - started) / 1000;
+  const endedAt = Date.now();
+  const usage: Usage = spentAny ? { ...spent } : null;
+  if (!raw.trim()) {
+    throw new AgentFailedError(
+      `Agent ${opts.agentName} failed after ${attemptsMade} attempt(s): ${lastError || "run budget exhausted"}`,
+      attemptsMade,
+      usage,
+      seconds,
+      started,
+      endedAt
+    );
+  }
+  logInfo(`Agent ${opts.agentName}: answered in ${seconds.toFixed(1)}s`);
+  return { text: raw.trim(), usage, seconds, attempts: attemptsMade, startedAt: started, endedAt: endedAt, outcome: "ok" };
+}
+
 // Parse the findings JSON out of a model response. A strict parse first, then
 // a balanced-brace scan for the first object that parses AND carries a
 // `findings` key (issue #54). The old fallback was a GREEDY `/\{[\s\S]*\}/`,

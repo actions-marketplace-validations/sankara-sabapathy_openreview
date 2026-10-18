@@ -46140,6 +46140,84 @@ async function runAgent(opts) {
         return { findings: [], usage, seconds, attempts: attemptsMade, startedAt, endedAt, outcome: "unparseable" };
     }
 }
+async function runTextAgent(opts) {
+    const rp = resolveProvider(opts.provider, opts.keys, process.env, opts.sessionId);
+    const started = Date.now();
+    if (!rp.apiKey) {
+        return { text: "", usage: null, seconds: 0, attempts: 0, startedAt: started, endedAt: started, outcome: "skipped-no-key" };
+    }
+    if (opts.deadlineAt !== undefined && Date.now() >= opts.deadlineAt) {
+        logWarning(`Agent ${opts.agentName}: run budget exhausted before starting.`);
+        return { text: "", usage: null, seconds: 0, attempts: 0, startedAt: started, endedAt: started, outcome: "budget-exhausted" };
+    }
+    const maxAttempts = 1 + Math.min(Math.max(opts.provider.retries ?? 2, 0), 5);
+    const perAttempt = (opts.provider.timeout_s ?? 420) * 1000;
+    const maxTokens = opts.maxTokens ?? 1000;
+    const spent = { in: 0, out: 0 };
+    let spentAny = false;
+    let raw = "";
+    let lastError = "";
+    let attemptsMade = 0;
+    // An empty-but-successful response is usually deterministic (the model
+    // answers in a field we don't read), so one retry is the cap — a third
+    // attempt just triples the wall-clock cost (same rule as runAgent).
+    let emptyRetries = 0;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        if (opts.deadlineAt !== undefined && Date.now() >= opts.deadlineAt)
+            break;
+        attemptsMade = attempt;
+        const timeoutMs = opts.deadlineAt === undefined
+            ? perAttempt
+            : Math.max(1_000, Math.min(perAttempt, opts.deadlineAt - Date.now()));
+        try {
+            const out = rp.protocol === "anthropic-messages"
+                ? await callAnthropic({
+                    apiKey: rp.apiKey, baseUrl: rp.baseUrl, endpointPath: rp.endpointPath, headers: rp.headers,
+                    model: opts.provider.model, system: opts.system, user: opts.user,
+                    extraBody: rp.extraBody, timeoutMs, maxTokens,
+                })
+                : await callOpenAICompatible({
+                    apiKey: rp.apiKey, baseUrl: rp.baseUrl, endpointPath: rp.endpointPath, headers: rp.headers,
+                    model: opts.provider.model, system: opts.system, user: opts.user,
+                    jsonMode: false, extraBody: rp.extraBody, timeoutMs, maxTokens,
+                });
+            raw = out.text;
+            if (out.usage) {
+                spent.in += out.usage.in;
+                spent.out += out.usage.out;
+                spentAny = true;
+            }
+            if (raw && raw.trim())
+                break;
+            lastError = `empty content from ${opts.provider.model}`;
+            raw = "";
+        }
+        catch (e) {
+            lastError = e.message;
+            raw = "";
+        }
+        if (attempt < maxAttempts && isRetryableError(lastError)) {
+            if (lastError.startsWith("empty content")) {
+                if (emptyRetries >= 1)
+                    break;
+                emptyRetries++;
+            }
+            logWarning(`Agent ${opts.agentName}: attempt ${attempt}/${maxAttempts} failed (${lastError.slice(0, 160)}); retrying`);
+            await sleep(Math.min(2000 * attempt, 8000));
+        }
+        else if (attempt < maxAttempts) {
+            break;
+        }
+    }
+    const seconds = (Date.now() - started) / 1000;
+    const endedAt = Date.now();
+    const usage = spentAny ? { ...spent } : null;
+    if (!raw.trim()) {
+        throw new AgentFailedError(`Agent ${opts.agentName} failed after ${attemptsMade} attempt(s): ${lastError || "run budget exhausted"}`, attemptsMade, usage, seconds, started, endedAt);
+    }
+    logInfo(`Agent ${opts.agentName}: answered in ${seconds.toFixed(1)}s`);
+    return { text: raw.trim(), usage, seconds, attempts: attemptsMade, startedAt: started, endedAt: endedAt, outcome: "ok" };
+}
 // Parse the findings JSON out of a model response. A strict parse first, then
 // a balanced-brace scan for the first object that parses AND carries a
 // `findings` key (issue #54). The old fallback was a GREEDY `/\{[\s\S]*\}/`,
@@ -46620,6 +46698,154 @@ function runningActionVersion(env) {
     if (/^v?\d+\.\d+\.\d+/.test(ref))
         return ref;
     return null;
+}
+
+;// CONCATENATED MODULE: ./dist-src/ask.js
+/**
+ * In-thread Q&A (issue #23): `/ask <question>` on a PR answers from the
+ * diff, and reactions on bot comments are logged as structured feedback
+ * signal (the learning half of issue #43; no behavior change yet).
+ */
+const ASK_COMMAND = "/ask";
+/**
+ * Parse an issue-comment body as an `/ask` invocation. Returns null unless
+ * the trimmed body starts with `/ask` (case-insensitive); a bare `/ask`
+ * with no question is also null so the caller can post usage instead.
+ */
+function parseAskComment(body) {
+    if (!body)
+        return null;
+    const lines = body.trim().split("\n");
+    const first = (lines[0] ?? "").trim();
+    if (first.toLowerCase() !== ASK_COMMAND && !first.toLowerCase().startsWith(ASK_COMMAND + " "))
+        return null;
+    const rest = [first.slice(ASK_COMMAND.length), ...lines.slice(1)].join("\n");
+    const quoted = [];
+    const question = [];
+    for (const line of rest.split("\n")) {
+        const t = line.trim();
+        if (t.startsWith(">"))
+            quoted.push(t.replace(/^>\s?/, ""));
+        else if (t)
+            question.push(t);
+    }
+    const q = question.join("\n").trim();
+    if (!q)
+        return null;
+    return { question: q, quoted: quoted.join("\n").trim() };
+}
+/**
+ * Render the Q&A prompt. Grounded in the (possibly truncated) PR diff plus
+ * the previous round's recorded findings; the quoted reply context comes
+ * last so a quoted finding stays adjacent to the question about it.
+ */
+function buildAskPrompt(opts) {
+    const system = "You answer questions about a pull request under review. " +
+        "Ground every claim in the diff below; say plainly when the diff does not contain the answer. " +
+        "Reply in markdown, concise: short paragraphs and bullets. No JSON, no code fences unless showing code.";
+    const prior = opts.priorFindings.length > 0
+        ? opts.priorFindings
+            .slice(0, 20)
+            .map((f, i) => `${i + 1}. ${f.file}${f.line !== undefined ? `:${f.line}` : ""} — ${f.comment.replace(/\s+/g, " ").slice(0, 200)}`)
+            .join("\n")
+        : "(no prior findings recorded)";
+    const quoted = opts.quoted ? `\n\nQuoted context from the thread:\n${opts.quoted.slice(0, 2000)}` : "";
+    return {
+        system,
+        user: `PR diff (truncated):\n\n${opts.diff}\n\n` +
+            `Previous round's recorded findings:\n${prior}` +
+            quoted +
+            `\n\nQuestion: ${opts.question}`,
+    };
+}
+/**
+ * Aggregate reactions on the bot's own PR comments (sticky + replies).
+ * Inline review-thread reactions need per-review-comment IDs, which runs
+ * do not retain — documented residual, not silent loss: the sticky is the
+ * durable feedback surface. Never throws: signal collection must not fail
+ * a review or an answer.
+ */
+async function collectFeedbackSignals(octokit, owner, repo, prNumber, botMarker = "<!-- openreview:") {
+    const comments = [];
+    const totals = {};
+    try {
+        const all = await octokit.paginate(octokit.rest.issues.listComments, {
+            owner,
+            repo,
+            issue_number: prNumber,
+            per_page: 100,
+        });
+        const botComments = all.filter((c) => c?.user?.type === "Bot" && typeof c?.body === "string" && c.body.includes(botMarker));
+        for (const c of botComments.slice(0, 20)) {
+            const { data } = await octokit.rest.reactions.listForIssueComment({
+                owner,
+                repo,
+                comment_id: c.id,
+            });
+            const counts = {};
+            for (const r of data ?? []) {
+                const key = String(r.content ?? "unknown");
+                counts[key] = (counts[key] ?? 0) + 1;
+                totals[key] = (totals[key] ?? 0) + 1;
+            }
+            comments.push({ commentId: c.id, url: c.html_url ?? "", counts });
+        }
+    }
+    catch {
+        // Signal is best-effort; an API failure is not a review failure.
+    }
+    return { comments, totals };
+}
+
+;// CONCATENATED MODULE: ./dist-src/authorize.js
+/**
+ * Who may spend the repo's BYOK budget, and by what command.
+ *
+ * `issue_comment` events run in the BASE repo context, so the workflow's
+ * secrets are fully available. Without a gate, any GitHub user could comment
+ * `/review` on any PR (including a fork) and have the action spend the
+ * maintainer's provider keys — an open wallet for the whole internet. The
+ * workflow `if:` can filter this, but a workflow is per-repo and easy to leave
+ * stale, so the action enforces it too.
+ *
+ * Rules for `issue_comment`:
+ * 1. the body must be exactly the configured command (trimmed) — `contains()`
+ *    style matching also fires on "/reviewer", quoted text, and code blocks;
+ * 2. the sender must hold write access (author_association OWNER / MEMBER /
+ *    COLLABORATOR by default). PR authors from forks are NOT allowed by
+ *    default: authorizing them means authorizing anyone.
+ *
+ * `pull_request` is unaffected — pushing the branch already required write
+ * access, and GitHub withholds secrets from fork PRs.
+ */
+/** GitHub's `author_association` values that imply write access. */
+const DEFAULT_ALLOWED_ASSOCIATIONS = ["OWNER", "MEMBER", "COLLABORATOR"];
+function parseAssociations(raw) {
+    const list = (raw ?? "")
+        .split(",")
+        .map((s) => s.trim().toUpperCase())
+        .filter(Boolean);
+    return list.length > 0 ? list : DEFAULT_ALLOWED_ASSOCIATIONS;
+}
+function authorizeTrigger(input) {
+    if (input.eventName !== "issue_comment")
+        return { allowed: true };
+    const body = (input.commentBody ?? "").trim();
+    const command = input.command.trim();
+    if (!command)
+        return { allowed: true }; // no command configured -> command path disabled
+    if (body.toLowerCase() !== command.toLowerCase()) {
+        return { allowed: false, reason: `comment is not the configured command (${command})` };
+    }
+    const allowed = parseAssociations(input.allowedAssociations);
+    const association = (input.authorAssociation ?? "NONE").trim().toUpperCase();
+    if (!allowed.includes(association)) {
+        return {
+            allowed: false,
+            reason: `sender association '${association}' may not trigger a review (allowed: ${allowed.join(", ")})`,
+        };
+    }
+    return { allowed: true };
 }
 
 ;// CONCATENATED MODULE: ./dist-src/github.js
@@ -47657,58 +47883,9 @@ function buildContextBlock(input, repoIndex) {
     return { block: `<context>\n${parts.join("\n\n")}\n</context>`, stats };
 }
 
-;// CONCATENATED MODULE: ./dist-src/authorize.js
-/**
- * Who may spend the repo's BYOK budget, and by what command.
- *
- * `issue_comment` events run in the BASE repo context, so the workflow's
- * secrets are fully available. Without a gate, any GitHub user could comment
- * `/review` on any PR (including a fork) and have the action spend the
- * maintainer's provider keys — an open wallet for the whole internet. The
- * workflow `if:` can filter this, but a workflow is per-repo and easy to leave
- * stale, so the action enforces it too.
- *
- * Rules for `issue_comment`:
- * 1. the body must be exactly the configured command (trimmed) — `contains()`
- *    style matching also fires on "/reviewer", quoted text, and code blocks;
- * 2. the sender must hold write access (author_association OWNER / MEMBER /
- *    COLLABORATOR by default). PR authors from forks are NOT allowed by
- *    default: authorizing them means authorizing anyone.
- *
- * `pull_request` is unaffected — pushing the branch already required write
- * access, and GitHub withholds secrets from fork PRs.
- */
-/** GitHub's `author_association` values that imply write access. */
-const DEFAULT_ALLOWED_ASSOCIATIONS = ["OWNER", "MEMBER", "COLLABORATOR"];
-function parseAssociations(raw) {
-    const list = (raw ?? "")
-        .split(",")
-        .map((s) => s.trim().toUpperCase())
-        .filter(Boolean);
-    return list.length > 0 ? list : DEFAULT_ALLOWED_ASSOCIATIONS;
-}
-function authorizeTrigger(input) {
-    if (input.eventName !== "issue_comment")
-        return { allowed: true };
-    const body = (input.commentBody ?? "").trim();
-    const command = input.command.trim();
-    if (!command)
-        return { allowed: true }; // no command configured -> command path disabled
-    if (body.toLowerCase() !== command.toLowerCase()) {
-        return { allowed: false, reason: `comment is not the configured command (${command})` };
-    }
-    const allowed = parseAssociations(input.allowedAssociations);
-    const association = (input.authorAssociation ?? "NONE").trim().toUpperCase();
-    if (!allowed.includes(association)) {
-        return {
-            allowed: false,
-            reason: `sender association '${association}' may not trigger a review (allowed: ${allowed.join(", ")})`,
-        };
-    }
-    return { allowed: true };
-}
-
 ;// CONCATENATED MODULE: ./dist-src/main.js
+
+
 
 
 
@@ -47952,6 +48129,86 @@ async function runPooled(thunks, limit) {
     await Promise.all(Array.from({ length: cap }, worker));
     return out;
 }
+/**
+ * In-thread Q&A (issue #23): answer `/ask` from the PR diff plus the
+ * recorded prior findings, then log the sticky's reaction signal (the
+ * learning half of issue #43; read-only, never changes behavior).
+ */
+async function runAskFlow(opts) {
+    const { octokit, owner, repo, prNumber, config, keys } = opts;
+    const { fileNames, diff, headSha, omitted, stale } = await getPrDiff(octokit, owner, repo, prNumber, github.context.payload.pull_request?.head?.sha);
+    if (stale) {
+        logWarning("Ask: PR head moved during diff fetch; answering from the fetched (slightly old) diff.");
+    }
+    if (!diff.trim() || fileNames.length === 0) {
+        logWarning("Ask: empty diff, nothing to answer from.");
+        return;
+    }
+    // Prior findings ground follow-ups ("what about the P1?") without
+    // re-running any agent. Absent state just means a thinner prompt.
+    let prior = [];
+    try {
+        const sticky = await findStickyComment(octokit, owner, repo, prNumber);
+        const state = sticky?.body ? parseStickyState(sticky.body) : null;
+        if (state)
+            prior = state.reviews.flatMap((r) => r.findings);
+    }
+    catch {
+        logWarning("Ask: prior run state unreadable; answering from the diff alone.");
+    }
+    const mainDef = config.reviews[0]?.main;
+    if (!mainDef) {
+        logWarning("Ask: no reviews configured; cannot pick an answering provider.");
+        return;
+    }
+    let provider = config.providers[mainDef.provider];
+    if (!provider) {
+        if (mainDef.provider.includes(".")) {
+            provider = resolveDottedProvider(config.providers, mainDef.provider).config;
+        }
+        else {
+            logWarning(`Ask: unknown provider '${mainDef.provider}'.`);
+            return;
+        }
+    }
+    const { system, user } = buildAskPrompt({
+        diff: diff.slice(0, config.defaults.max_diff_chars ?? 80000),
+        priorFindings: prior,
+        quoted: opts.quoted,
+        question: opts.question,
+    });
+    let answer;
+    let modelLine = "";
+    try {
+        const r = await runTextAgent({
+            agentName: "ask",
+            providerName: mainDef.provider,
+            provider,
+            system,
+            user,
+            keys,
+            sessionId: opts.sessionId,
+            deadlineAt: opts.deadlineAt,
+        });
+        answer = r.text;
+        modelLine = `${provider.model}${r.usage ? ` · ${formatTokens(r.usage.in)}/${formatTokens(r.usage.out)} in/out` : ""}`;
+    }
+    catch (e) {
+        logWarning(`Ask: answering failed (${e instanceof Error ? e.message : String(e)}).`);
+        answer = "";
+    }
+    if (opts.dryRun) {
+        logInfo(`DRY RUN ask answer (model ${provider.model}):\n${(answer || "(no answer)").slice(0, 2000)}`);
+        return;
+    }
+    const body = answer
+        ? `**OpenReview answer** (to \`${opts.question.slice(0, 120)}\`)\n\n${answer}\n\n<sub>Answered with \`${modelLine || provider.model}\` · react on this comment to teach future reviews · ask again with \`/ask\`</sub>`
+        : `OpenReview could not answer that (model ${provider.model} returned nothing usable). Try rephrasing, or run a fresh review with \`/review\`.`;
+    await octokit.rest.issues.createComment({ owner, repo, issue_number: prNumber, body });
+    logInfo(`Ask: answered question (${opts.question.slice(0, 80)}).`);
+    const signals = await collectFeedbackSignals(octokit, owner, repo, prNumber);
+    logInfo(`Feedback signals: ${JSON.stringify(signals.totals)} across ${signals.comments.length} bot comment(s).`);
+}
 async function run() {
     try {
         initLogger();
@@ -47985,6 +48242,36 @@ async function run() {
             }
         }
         const keys = resolveKeysFromEnv(process.env);
+        // In-thread Q&A (issue #23): `/ask <question>` on a PR is answered from
+        // the diff, before the review gate below (which would reject any body
+        // that is not exactly the review command). Same write-access rule as
+        // /review: BASE-repo secrets are live here too (issue #59).
+        const askParsed = ctx.payload.issue?.pull_request != null
+            ? parseAskComment(ctx.payload.comment?.body)
+            : null;
+        if (askParsed) {
+            const allowed = parseAssociations(core.getInput("allowed-author-associations"));
+            const association = (ctx.payload.comment?.author_association ?? "NONE").trim().toUpperCase();
+            if (!allowed.includes(association)) {
+                logWarning(`Ask denied: sender association '${association}' may not spend provider budget (allowed: ${allowed.join(", ")}). Nothing was answered or posted.`);
+                return;
+            }
+            const askDeadline = Date.now() + (config.defaults.max_runtime_s ?? 1200) * 1000;
+            await runAskFlow({
+                octokit,
+                owner,
+                repo,
+                prNumber,
+                config,
+                keys,
+                question: askParsed.question,
+                quoted: askParsed.quoted,
+                sessionId: process.env.GITHUB_RUN_ID ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+                deadlineAt: askDeadline,
+                dryRun,
+            });
+            return;
+        }
         // Authorization gate (issue #59): `issue_comment` runs in the BASE repo
         // context, so the secrets are live. Without this, anyone on the internet
         // could comment the command on any PR and spend the maintainer's keys.
@@ -48592,6 +48879,11 @@ async function run() {
                 await upsertStickyComment(octokit, owner, repo, prNumber, stickyBase + extras.join(""));
                 logInfo(`Published sticky comment (verdict ${global}, ${all.length} findings).`);
             }
+            // Feedback signal (issue #23, learning half of #43): reactions on the
+            // bot's own comments, logged as structured output. Read-only; a
+            // failure here must never fail the run.
+            const signals = await collectFeedbackSignals(octokit, owner, repo, prNumber);
+            logInfo(`Feedback signals: ${JSON.stringify(signals.totals)} across ${signals.comments.length} bot comment(s).`);
         }
         if (global === "request_changes" && config.global_verdict.fail_check_on_request_changes)
             core.setFailed("OpenReview verdict: request_changes");

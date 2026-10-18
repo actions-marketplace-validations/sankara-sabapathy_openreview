@@ -16,6 +16,7 @@ Everything about configuring and running OpenReview AI.
 
 ## Operate
 
+- [Conversation](./conversation) — ask the reviewer questions, reaction signal.
 - [Self-hosted runners](./self-hosted) — labels, egress, secrets hygiene.
 - [Versioning](./versioning) — releases, tags, config compatibility.
 - [Troubleshooting](./troubleshooting) — errors and fixes.
