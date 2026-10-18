@@ -122,6 +122,10 @@ reviews:
     # and carry prior findings for fix validation instead of re-reviewing base..head.
     # Stays off here: dogfood reviews the whole branch every push.
     # incremental: false
+    # One-click fixes (issue #22): agents attach full replacement lines, rendered as
+    # appliable ```suggestion blocks inline and a fenced Suggested fixes section on the sticky.
+    # Default true, shown here commented since the default already applies.
+    # suggest_fixes: false
     # Cross-file context: full changed files + call-site excerpts automatic
     # (bounded by max_context_chars below); add explicit files when needed:
     # context_files: ["src/config.ts"]
