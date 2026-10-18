@@ -16,6 +16,9 @@ import {
   parseHunkRanges,
   lineInRanges,
   applySuppression,
+  renderPriorReview,
+  matchCarriedFindings,
+  PRIOR_FINDINGS_CAP,
 } from "./reviewer.js";
 
 type V = "approve" | "comment" | "request_changes";
@@ -386,5 +389,84 @@ describe("applySuppression (decided items)", () => {
   it("is a no-op without patterns", () => {
     const fs = [F("a.ts", "x")];
     assert.deepEqual(applySuppression(fs, []).visible, fs);
+  });
+});
+
+describe("renderPriorReview (issue #18)", () => {
+  const P = (file: string, line: number | undefined, comment: string) => ({
+    file,
+    ...(line === undefined ? {} : { line }),
+    severity: "high",
+    category: "bugs",
+    comment,
+  });
+  it("numbers findings with stale-line warning", () => {
+    const { block, shown, total } = renderPriorReview([
+      P("a.ts", 10, "Null deref."),
+      P("b.ts", undefined, "Typo."),
+    ]);
+    assert.equal(shown, 2);
+    assert.equal(total, 2);
+    assert.match(block, /P1\. \[high\] a\.ts:10/);
+    assert.match(block, /P2\. \[high\] b\.ts/);
+    assert.match(block, /OLD head/);
+  });
+  it("caps the block and notes the remainder stays open", () => {
+    const many = Array.from({ length: PRIOR_FINDINGS_CAP + 3 }, (_, i) => P(`f${i}.ts`, i, `bug ${i}`));
+    const { block, shown, total } = renderPriorReview(many);
+    assert.equal(shown, PRIOR_FINDINGS_CAP);
+    assert.equal(total, PRIOR_FINDINGS_CAP + 3);
+    assert.match(block, /still open/);
+  });
+});
+
+describe("matchCarriedFindings (issue #18)", () => {
+  const P = (file: string, line: number | undefined, comment: string) => ({
+    file,
+    ...(line === undefined ? {} : { line }),
+    severity: "high" as const,
+    category: "bugs",
+    comment,
+  });
+  const C = (
+    file: string,
+    line: number | undefined,
+    comment: string,
+    status?: "fixed" | "open" | "new"
+  ) => ({ file, line, severity: "high" as const, category: "bugs", comment, status });
+  it("links fixed validations and excludes them from the vote set", () => {
+    const m = matchCarriedFindings([P("a.ts", 10, "Null deref here")], [C("a.ts", 12, "Null deref here", "fixed")]);
+    assert.equal(m.fixed.length, 1);
+    assert.equal(m.open.length, 0);
+    assert.equal(m.fresh.length, 0);
+    assert.deepEqual(m.resolved.map((f) => f.comment), ["Null deref here"]);
+    assert.equal(m.confirmed.length, 0);
+  });
+  it("open wins over fixed on disagreement", () => {
+    const m = matchCarriedFindings(
+      [P("a.ts", 10, "Null deref here")],
+      [C("a.ts", 10, "Null deref here", "fixed"), C("a.ts", 11, "Null deref here", "open")]
+    );
+    assert.equal(m.fixed.length, 0);
+    assert.equal(m.open.length, 1);
+    assert.equal(m.confirmed.length, 1);
+  });
+  it("unmentioned priors stay open and unverified", () => {
+    const m = matchCarriedFindings([P("a.ts", 10, "Old bug")], [C("b.ts", 1, "New bug", "new")]);
+    assert.equal(m.open.length, 1);
+    assert.equal(m.unverified.length, 1);
+    assert.equal(m.fresh.length, 1);
+  });
+  it("unmatched fixed labels become new (can only validate known priors)", () => {
+    const m = matchCarriedFindings([P("a.ts", 10, "Old bug")], [C("z.ts", 1, "Mystery", "fixed")]);
+    assert.equal(m.fresh.length, 1);
+    assert.equal(m.fresh[0].status, "new");
+  });
+  it("matches line-less findings by comment head", () => {
+    const m = matchCarriedFindings(
+      [P("a.ts", undefined, "File-level concern here")],
+      [C("a.ts", undefined, "File-level concern here", "fixed")]
+    );
+    assert.equal(m.fixed.length, 1);
   });
 });

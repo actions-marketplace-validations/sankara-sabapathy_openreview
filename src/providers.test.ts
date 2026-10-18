@@ -12,6 +12,7 @@ import {
   resolveDottedProvider,
   assertProviderRefs,
   countsAsReview,
+  normalizeStatus,
 } from "./providers.js";
 import { parseConfig } from "./config.js";
 import { hasNestedQuantifier } from "./config.js";
@@ -718,5 +719,17 @@ describe("catastrophic patterns (dogfood on #81)", () => {
         }),
       /catastrophically slow/
     );
+  });
+});
+
+describe("normalizeStatus (issue #18)", () => {
+  it("passes through fixed and open", () => {
+    assert.equal(normalizeStatus("fixed"), "fixed");
+    assert.equal(normalizeStatus("open"), "open");
+  });
+  it("degrades anything else to new so unconfirmed findings keep voting", () => {
+    assert.equal(normalizeStatus(undefined), "new");
+    assert.equal(normalizeStatus("bogus"), "new");
+    assert.equal(normalizeStatus(42), "new");
   });
 });

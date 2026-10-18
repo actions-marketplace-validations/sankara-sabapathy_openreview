@@ -57,5 +57,14 @@ global_verdict:
   whole repo — that is what makes a finding on `auth/**` able to cite a caller in
   `lib/`.
 - `global_verdict.strategy: any_blocking|majority` merges per-review verdicts.
+- **Incremental re-review** (per-review `incremental: true`, off by default).
+  On `synchronize`, the review diffs head-vs-last-reviewed-SHA (compare API,
+  full-diff fallback) instead of base..head, and carries the previous round's
+  open findings so agents validate each as `fixed`/`open` and report only
+  genuinely new issues. Fixed findings neither show nor vote; unmatched priors
+  stay open (fail-safe) and re-enter next run's state, flooring a clean
+  approve to `comment`. A `/review` comment always runs a full review. Only
+  works when the sticky holds the previous run's state (written automatically
+  since 0.14.0); truncated state or an unresolvable base falls back to full.
 - Output: sticky comment (marker `openreview:sticky`), inline `pulls.createReview` (max 20, pre-validated against the diff — bogus paths/lines are dropped and counted on the sticky instead of 422ing the batch; file-level notes ride in the review body), `verdict` output. `verdict.post_inline: false` opts a review out of inline comments. `global_verdict.sticky_comment_mode: append` keeps a per-run history in the sticky (head SHA + verdict + run link per section, rotates past ~60KB) instead of replacing it.
 - Every run appends usage footers to the sticky (`Models: <model> <in>/<out> <tok/s> …`, summed per model, plus an `Agents:` line with each agent's own spend and attempt count). Token counts accumulate across all attempts — a retried attempt still billed — and model throughput divides by wall-clock elapsed, not summed durations. Providers that omit `usage` render as `?/?` (unknown, never zero); a model total covering only some agents carries a `+` partial marker.

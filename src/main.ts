@@ -19,9 +19,9 @@ import {
 import {
   matchesAny, filterIgnored, dedupeFindings, applySuppression, decideReviewVerdict, combineVerdicts, combineBallots,
   applyDegradedFloor, resolveNoise, applyNoiseControls, splitDiff, scopeDiff, parseHunkRanges, type Verdict,
-  satisfiesActionVersion, runningActionVersion,
+  satisfiesActionVersion, runningActionVersion, renderPriorReview, matchCarriedFindings,
 } from "./reviewer.js";
-import { renderStickyBody, upsertStickyComment, appendStickySection, renderAppendSection, createInlineReview, type RunStatus } from "./github.js";
+import { renderStickyBody, upsertStickyComment, appendStickySection, renderAppendSection, createInlineReview, findStickyComment, parseStickyState, type RunStatus, type StickyFindingState } from "./github.js";
 import { initLogger, logInfo, logWarning, logDebug } from "./logger.js";
 import { buildContextBlock, buildRepoIndex } from "./context.js";
 import { authorizeTrigger } from "./authorize.js";
@@ -128,6 +128,60 @@ export async function getPrDiff(
     logWarning(
       `PR head moved during diff fetch (${baseline.slice(0, 7)} -> ${freshSha.slice(0, 7)}); ` +
         `file list may mix both heads, inline positions revalidated before posting.`
+    );
+  return { fileNames: names, diff: parts.join("\n\n"), headSha: freshSha, omitted, truncated, totalFiles: files.length, stale };
+}
+
+/**
+ * Incremental diff for issue #18: what changed between the last-reviewed
+ * SHA and the current head, via the compare API (one call, no pagination
+ * race). Falls back to the full PR diff on any failure — a force-push that
+ * rewrote history 404s the base, in which case re-reviewing everything is
+ * the only honest option. Same shape and accounting as getPrDiff so the
+ * review loop treats both uniformly.
+ */
+export async function getIncrementalDiff(
+  octokit: ReturnType<typeof github.getOctokit>,
+  owner: string,
+  repo: string,
+  pr: number,
+  base: string,
+  head: string
+): Promise<PrDiff> {
+  const { data } = await octokit.rest.repos.compareCommits({
+    owner,
+    repo,
+    base,
+    head,
+  });
+  const files = data.files ?? [];
+  const truncated = files.length > MAX_DIFF_FILES;
+  const capped = files.slice(0, MAX_DIFF_FILES);
+  const parts: string[] = [];
+  const names: string[] = [];
+  const omitted: string[] = [];
+  for (const f of capped) {
+    names.push(f.filename);
+    if (f.patch) parts.push(`--- a/${f.filename}\n+++ b/${f.filename}\n${f.patch}`);
+    else omitted.push(f.filename);
+  }
+  if (truncated)
+    logWarning(
+      `Incremental diff truncated: ${files.length} files changed since ${base.slice(0, 7)}, reviewing the first ${MAX_DIFF_FILES}.`
+    );
+  if (omitted.length > 0)
+    logWarning(
+      `${omitted.length} file(s) have no renderable patch (binary or too large) and were not sent to reviewers: ${omitted.slice(0, 10).join(", ")}${omitted.length > 10 ? ", …" : ""}`
+    );
+  // Same mid-fetch guard as the full diff (issue #71): a push landing
+  // during the compare leaves base...head stale. Fail closed, the new push
+  // re-runs and aborts are never read as a pass (issue #46).
+  const { data: pull } = await octokit.rest.pulls.get({ owner, repo, pull_number: pr });
+  const freshSha = pull.head.sha;
+  const stale = head !== freshSha;
+  if (stale)
+    logWarning(
+      `PR head moved during incremental diff fetch (${head.slice(0, 7)} -> ${freshSha.slice(0, 7)}); aborting - a fresh review runs on the new head.`
     );
   return { fileNames: names, diff: parts.join("\n\n"), headSha: freshSha, omitted, truncated, totalFiles: files.length, stale };
 }
@@ -343,6 +397,58 @@ export async function run(): Promise<void> {
     }
     logInfo(`Diff: ${fileNames.length} files, ${diff.length} chars (head ${headSha.slice(0, 7)})`);
     logDebug(`Diff files: ${fileNames.join(", ")}`);
+    // Incremental re-review (issue #18): recover the last-reviewed SHA and
+    // open findings from the sticky's machine-readable state (slice 0).
+    // Only `synchronize` pushes qualify — a manual /review is an explicit
+    // ask for a fresh full review. One sticky lookup per run, not per review.
+    const isSynchronize = (ctx.payload as any).action === "synchronize";
+    type PriorCarry = { sha: string; verdict: Verdict; truncated: boolean; findings: StickyFindingState[] };
+    const priorByReview = new Map<string, PriorCarry>();
+    if (isSynchronize && config.reviews.some((r) => r.incremental)) {
+      try {
+        const sticky = await findStickyComment(octokit, owner, repo, prNumber);
+        const state = sticky?.body ? parseStickyState(sticky.body) : null;
+        if (state) {
+          for (const r of state.reviews) {
+            priorByReview.set(r.id, {
+              sha: state.sha,
+              verdict: r.verdict === "approve" || r.verdict === "request_changes" ? r.verdict : "comment",
+              truncated: r.truncated,
+              findings: r.findings,
+            });
+          }
+          logInfo(
+            `Incremental carry: prior run at ${state.sha.slice(0, 7)} recorded ${state.reviews.length} review(s) with state.`
+          );
+        } else {
+          logInfo("Incremental: no prior run state in sticky; reviews fall back to full diff.");
+        }
+      } catch (e) {
+        logWarning(`Incremental: sticky lookup failed (${(e as Error).message}); falling back to full diff.`);
+      }
+    }
+    // One incremental diff per run (all reviews share the prior run's SHA).
+    // A base that no longer resolves (force-push rewrote history) 404s the
+    // compare call — then re-reviewing everything is the honest fallback.
+    const incBase = [...priorByReview.values()].map((p) => p.sha)[0];
+    let incDiff: PrDiff | null = null;
+    if (incBase && incBase !== headSha) {
+      try {
+        incDiff = await getIncrementalDiff(octokit, owner, repo, prNumber, incBase, headSha);
+        if (incDiff.stale) {
+          core.setOutput("verdict", "comment");
+          core.setOutput("review_status", "error");
+          logWarning("Head moved during incremental diff fetch; aborting - a fresh review runs on the new head.");
+          return;
+        }
+        logInfo(
+          `Incremental diff: ${incDiff.fileNames.length} files, ${incDiff.diff.length} chars (${incBase.slice(0, 7)}..${headSha.slice(0, 7)})`
+        );
+      } catch (e) {
+        logWarning(`Incremental diff failed (${(e as Error).message}); falling back to full diff.`);
+        incDiff = null;
+      }
+    }
     if (truncated)
       logWarning(`PR touches more than ${MAX_DIFF_FILES} files; only the first ${MAX_DIFF_FILES} were reviewed.`);
     if (omitted.length > 0)
@@ -382,20 +488,88 @@ export async function run(): Promise<void> {
       postInline: boolean;
       agents: AgentRun[];
       usage: AgentSpend[];
+      /** Unmatched prior findings re-entering next run's state (issue #18). */
+      carried?: StickyFindingState[];
+      /** Pre-rendered incremental ledger lines for the sticky footer. */
+      ledger?: string[];
     }[] = [];
+    // Incremental parsed diff, shared by every incremental review in the run.
+    const parsedInc = incDiff ? splitDiff(incDiff.diff) : [];
+    const incIgnore = config.defaults.ignore ?? [];
     for (const review of config.reviews) {
-      const scopedFiles = inScope.filter((f) => matchesAny(f, review.if_paths));
+      const prior = priorByReview.get(review.id);
+      const incWanted =
+        review.incremental && isSynchronize && !!prior && !prior.truncated && !!incDiff;
+      // No new commits since the last review, or no new in-scope changes:
+      // carry the previous verdict forward without spending provider budget.
+      // Fixes cannot have landed where nothing changed, so unvalidated
+      // priors stay open by construction, never silently dropped.
+      const carryReason =
+        review.incremental && isSynchronize && prior && !prior.truncated && prior.sha === headSha
+          ? "no new commits since the last review"
+          : null;
+      if (carryReason) {
+        const baseShort = prior!.sha.slice(0, 7);
+        logInfo(`Review ${review.id}: incremental carry (${carryReason}); ${prior!.findings.length} prior finding(s) stand.`);
+        perReview.push({
+          id: review.id,
+          verdict: prior!.verdict,
+          findings: [],
+          dismissed: [],
+          errors: [],
+          counted: true,
+          postInline: review.verdict.post_inline !== false,
+          agents: [],
+          usage: [],
+          carried: prior!.findings,
+          ledger: [
+            `\n> 🔁 Incremental since \`${baseShort}\`: ${carryReason}; ` +
+              `${prior!.findings.length} prior finding(s) carried, verdict stands at ${prior!.verdict}.`,
+          ],
+        });
+        continue;
+      }
+      const incActive = incWanted && !!incDiff;
+      const baseFiles = incActive ? filterIgnored(incDiff!.fileNames, incIgnore) : inScope;
+      const scopedFiles = baseFiles.filter((f) => matchesAny(f, review.if_paths));
       if (scopedFiles.length === 0) {
+        if (incActive && prior) {
+          // Additive diff has nothing in scope: fixes may still have landed
+          // elsewhere, so priors stay open and the verdict stands.
+          const baseShort = prior.sha.slice(0, 7);
+          logInfo(
+            `Review ${review.id}: incremental carry (no new in-scope changes); ${prior.findings.length} prior finding(s) stand.`
+          );
+          perReview.push({
+            id: review.id,
+            verdict: prior.verdict,
+            findings: [],
+            dismissed: [],
+            errors: [],
+            counted: true,
+            postInline: review.verdict.post_inline !== false,
+            agents: [],
+            usage: [],
+            carried: prior.findings,
+            ledger: [
+              `\n> 🔁 Incremental since \`${baseShort}\`: no new in-scope changes; ` +
+                `${prior.findings.length} prior finding(s) carried, verdict stands at ${prior.verdict}.`,
+            ],
+          });
+          continue;
+        }
         logInfo(`Review ${review.id}: no matching paths, skipped.`);
         continue;
       }
       // Scoped diff (issue #47). `if_paths` used to decide only *whether* a
       // review ran — agents always got the whole PR diff, so a src/-only review
       // still paid for (and could comment on) website/ and dist/. Parsed once per
-      // run, reused by every review and agent.
-      const scopedDiff = scopeDiff(scopedFiles, parsedDiff, inScope.length);
+      // run, reused by every review and agent. Incremental reviews scope the
+      // additive diff instead (issue #18).
+      const useParsed = incActive ? parsedInc : parsedDiff;
+      const scopedDiff = scopeDiff(scopedFiles, useParsed, baseFiles.length);
       logDebug(
-        `Review ${review.id}: ${scopedFiles.length}/${inScope.length} in-scope file(s) sent ` +
+        `Review ${review.id}: ${scopedFiles.length}/${baseFiles.length} in-scope file(s) sent ` +
           `(${scopedDiff.length} chars)`
       );
       // Cross-file context (issue #20): full files + call-site excerpts, budgeted.
@@ -423,6 +597,18 @@ export async function run(): Promise<void> {
         model: string;
         synthesis?: Synthesis;
       };
+      // Prior-round carry for incremental reviews (issue #18). Rendered once
+      // per review; subagents validate each entry, the synthesizer inherits
+      // through its cited sources (see mergeSynthesis).
+      const priorRender =
+        incActive && prior && prior.findings.length > 0 ? renderPriorReview(prior.findings) : null;
+      const priorReview = priorRender
+        ? {
+            baseShort: prior!.sha.slice(0, 7),
+            headShort: headSha.slice(0, 7),
+            block: priorRender.block,
+          }
+        : undefined;
       const mainDef = { ...review.main, name: review.main.name ?? `${review.id}:main` };
       const subDefs = review.subagents.map((s, i) => ({ ...s, name: s.name ?? `${review.id}:sub${i}` }));
       const synthesize = review.main_mode !== "parallel";
@@ -430,14 +616,16 @@ export async function run(): Promise<void> {
         `Review ${review.id}: launching ${1 + subDefs.length} agent(s) [${[mainDef, ...subDefs]
           .map((a) => `${a.name}/${a.provider}`)
           .join(", ")}] on ${scopedFiles.length} file(s), strategy=${review.strategy}, ` +
-          `main_mode=${synthesize ? "synthesize" : "parallel"}`
+          `main_mode=${synthesize ? "synthesize" : "parallel"}` +
+          (priorReview ? `, incremental carry (${priorRender!.shown}/${priorRender!.total} prior findings)` : "")
       );
       // Thunks, not promises: runAgent must not start until the pool allows it
       // (an eager promise is already in flight, so the cap would be a no-op).
       // The optional argument is the synthesizer's <prior_findings> block,
       // known only once the subagents have finished.
       const makeTask = (
-        a: { name: string; provider: string; instructions: string }
+        a: { name: string; provider: string; instructions: string },
+        isMain: boolean
       ): ((priorFindings?: string) => Promise<TaskResult>) | null => {
         let provider = config.providers[a.provider];
         if (!provider) {
@@ -464,6 +652,9 @@ export async function run(): Promise<void> {
             contextBlock,
             deadlineAt,
             priorFindings,
+            // Validation duty sits with the subagents; the synthesizer
+            // inherits each finding's status through its cited sources.
+            priorReview: !isMain ? priorReview : undefined,
           })
             .then((result): TaskResult => ({
               findings: result.findings,
@@ -504,10 +695,10 @@ export async function run(): Promise<void> {
             });
       };
       const subTasks = subDefs
-        .map((a) => makeTask(a))
+        .map((a) => makeTask(a, false))
         .filter((t): t is (p?: string) => Promise<TaskResult> => t !== null)
         .map((t) => () => t());
-      const mainTask = makeTask(mainDef);
+      const mainTask = makeTask(mainDef, true);
       // Bounded fan-out (issue #51): run at most `max_concurrency` agents at a
       // time instead of bursting every agent at the provider at once. The
       // thunk is what makes the cap real — see runPooled.
@@ -557,6 +748,44 @@ export async function run(): Promise<void> {
             `(profile=${review.profile ?? config.defaults.profile}, min_confidence=${noise.min_confidence}, max_findings=${noise.max_findings})`
         );
       }
+      // Incremental validation (issue #18): link this round's findings back
+      // to the carried priors. Fixed findings neither show nor vote;
+      // still-open and new findings vote as usual. Unmatched priors stay
+      // open (fail-safe) and re-enter next run's state; if any exist the
+      // review cannot report a clean approve.
+      let carried: StickyFindingState[] = [];
+      let ledger: string[] | undefined;
+      let incFloor = false;
+      if (incActive && prior && priorRender && priorRender.total > 0) {
+        const m = matchCarriedFindings(prior.findings, findings);
+        const voteSet = [...m.confirmed, ...m.fresh];
+        const unverified = m.unverified;
+        carried = unverified;
+        findings = voteSet;
+        const baseShort = prior.sha.slice(0, 7);
+        const openCount = m.open.length;
+        ledger = [
+          `\n> 🔁 Incremental since \`${baseShort}\`: ${m.fixed.length} fixed, ` +
+            `${openCount} still open${unverified.length > 0 ? ` (${unverified.length} carried unverified)` : ""}, ${m.fresh.length} new.`,
+        ];
+        if (m.fixed.length > 0) {
+          ledger.push(
+            `<details><summary>Fixed since ${baseShort} (${m.fixed.length})</summary>\n\n` +
+              m.fixed
+                .map((f) => `- \`${f.file}${f.line !== undefined ? `:${f.line}` : ""}\` — ${f.comment.replace(/\s+/g, " ").slice(0, 120)}`)
+                .join("\n") +
+              `\n\n</details>`
+          );
+        }
+        logInfo(
+          `Review ${review.id}: incremental match — ${m.fixed.length} fixed, ${openCount} still open, ${m.fresh.length} new, ${unverified.length} unverified.`
+        );
+        if (unverified.length > 0) {
+          // Unvalidated carry means no clean approve: the next run (or a
+          // human) still has to look. Applied after the verdict math below.
+          incFloor = true;
+        }
+      }
       findings.sort((a, b) =>
         ({ high: 0, medium: 1, suggestion: 2 } as const)[a.severity] -
         ({ high: 0, medium: 1, suggestion: 2 } as const)[b.severity]
@@ -569,7 +798,7 @@ export async function run(): Promise<void> {
       // it may not report a clean pass either: floor it at `comment` rather
       // than dropping its findings or claiming everything was checked.
       const degraded = counted > 0 && counted < results.length;
-      const verdict = (() => {
+      let verdict = (() => {
         if (counted === 0) return "approve" as Verdict; // placeholder, excluded below
         // One ballot per distinct provider (issue #12). `any` reproduces the
         // old pooled behavior exactly; `all`/`majority` resolve disagreement.
@@ -599,6 +828,12 @@ export async function run(): Promise<void> {
         }
         return applyDegradedFloor(base, counted, results.length);
       })();
+      if (incFloor && verdict === "approve") {
+        verdict = "comment";
+        logWarning(
+          `Review ${review.id}: ${carried.length} prior finding(s) carried unverified - flooring to comment instead of a clean approve.`
+        );
+      }
       perReview.push({
         id: review.id,
         verdict,
@@ -633,6 +868,8 @@ export async function run(): Promise<void> {
             startedAt: r.startedAt,
             endedAt: r.endedAt,
           })),
+        carried: carried.length > 0 ? carried : undefined,
+        ledger,
       });
       if (counted === 0) {
         logWarning(
@@ -697,7 +934,20 @@ export async function run(): Promise<void> {
       findings: all,
       runUrl,
       headSha,
-      stateReviews: perReview.map((r) => ({ id: r.id, verdict: r.verdict, findings: r.findings })),
+      stateReviews: perReview.map((r) => ({
+        id: r.id,
+        verdict: r.verdict,
+        findings: [
+          ...r.findings.map((f) => ({
+            file: f.file,
+            ...(f.line !== undefined ? { line: f.line } : {}),
+            severity: f.severity,
+            category: f.category,
+            comment: f.comment,
+          })),
+          ...(r.carried ?? []),
+        ],
+      })),
     });
     // Derived from actual agent outcomes, not from a hardcoded list of three
     // env var names — a config using key_from: env.GROQ_API_KEY used to be told
@@ -729,6 +979,11 @@ export async function run(): Promise<void> {
     if (agentsLine) {
       extras.push(`\n<sub>Agents: ${agentsLine}</sub>`);
       logInfo(`Per-agent usage: ${agentsLine}`);
+    }
+    // Incremental ledgers ride the same footer path in both sticky modes
+    // (issue #18): fixed/still-open/new counts plus the fixed list.
+    for (const r of perReview) {
+      if (r.ledger) extras.push(...r.ledger);
     }
     if (skippedNoKey.length > 0) {
       const names = [...new Set(skippedNoKey.map((a) => a.agent))].map((a) => `\`${a}\``).join(", ");
@@ -784,7 +1039,20 @@ export async function run(): Promise<void> {
           headSha,
           runUrl,
           extras,
-          stateReviews: perReview.map((r) => ({ id: r.id, verdict: r.verdict, findings: r.findings })),
+          stateReviews: perReview.map((r) => ({
+        id: r.id,
+        verdict: r.verdict,
+        findings: [
+          ...r.findings.map((f) => ({
+            file: f.file,
+            ...(f.line !== undefined ? { line: f.line } : {}),
+            severity: f.severity,
+            category: f.category,
+            comment: f.comment,
+          })),
+          ...(r.carried ?? []),
+        ],
+      })),
         });
         const { rotated } = await appendStickySection(octokit, owner, repo, prNumber, section);
         logInfo(`Appended sticky section (verdict ${global}, ${all.length} findings${rotated ? ", rotated" : ""}).`);

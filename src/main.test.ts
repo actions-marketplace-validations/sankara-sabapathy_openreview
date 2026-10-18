@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { runPooled, getPrDiff, MAX_DIFF_FILES, summarizeUsage, selectInlineFindings } from "./main.js";
+import { runPooled, getPrDiff, getIncrementalDiff, MAX_DIFF_FILES, summarizeUsage, selectInlineFindings } from "./main.js";
 
 describe("runPooled (issue #51)", () => {
   it("preserves result order regardless of completion order", async () => {
@@ -207,5 +207,51 @@ describe("selectInlineFindings (issue #53)", () => {
   });
   it("empty when everything opts out", () => {
     assert.deepEqual(selectInlineFindings([{ postInline: false, findings: [f("a.ts")] }]), []);
+  });
+});
+
+describe("getIncrementalDiff (issue #18)", () => {
+  const fake = (files: { filename: string; patch?: string }[], headSha = "head1234") => ({
+    rest: {
+      repos: { compareCommits: async () => ({ data: { files } }) },
+      pulls: { get: async () => ({ data: { head: { sha: headSha } } }) },
+    },
+  }) as any;
+
+  it("returns base..head patches in DiffFile shape", async () => {
+    const out = await getIncrementalDiff(
+      fake([{ filename: "a.ts", patch: "@@ -1 +1 @@\n+x" }, { filename: "logo.png" }]),
+      "o",
+      "r",
+      7,
+      "base0000",
+      "head1234"
+    );
+    assert.deepEqual(out.fileNames, ["a.ts", "logo.png"]);
+    assert.deepEqual(out.omitted, ["logo.png"]);
+    assert.equal(out.headSha, "head1234");
+    assert.equal(out.truncated, false);
+    assert.ok(out.diff.includes("+++ b/a.ts"));
+  });
+
+  it("flags a mid-fetch head move as stale", async () => {
+    const octokit = fake([{ filename: "a.ts", patch: "@@ -1 +1 @@\n+x" }], "newhead99");
+    const out = await getIncrementalDiff(octokit, "o", "r", 7, "base0000", "head1234");
+    assert.equal(out.stale, true);
+    assert.equal(out.headSha, "newhead99");
+  });
+
+  it("throws on an unresolvable base so the caller falls back to full diff", async () => {
+    const octokit = {
+      rest: {
+        repos: {
+          compareCommits: async () => {
+            throw new Error("404 base not found (force-push rewrote history)");
+          },
+        },
+        pulls: { get: async () => ({ data: { head: { sha: "head1234" } } }) },
+      },
+    } as any;
+    await assert.rejects(() => getIncrementalDiff(octokit, "o", "r", 7, "gone0000", "head1234"), /404/);
   });
 });

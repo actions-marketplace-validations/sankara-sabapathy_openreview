@@ -44,6 +44,85 @@ export function filterIgnored(files: string[], ignore: string[]): string[] {
 export type DiffFile = { file: string; patch: string };
 
 /**
+ * Render the previous round's open findings for an incremental review
+ * prompt (issue #18). Numbered, capped, locations flagged as stale: line
+ * numbers refer to the OLD head and may have shifted, so agents must match
+ * by file and issue, never by exact line. Callers treat unlisted remainder
+ * as still open (fail-safe: only an explicit "fixed" label resolves).
+ */
+export const PRIOR_FINDINGS_CAP = 20;
+
+export function renderPriorReview(
+  findings: { file: string; line?: number; severity: string; category: string; comment: string }[]
+): { block: string; shown: number; total: number } {
+  const shown = findings.slice(0, PRIOR_FINDINGS_CAP);
+  const lines = shown.map((f, i) => {
+    const at = f.line !== undefined ? `:${f.line}` : "";
+    return `P${i + 1}. [${f.severity}] ${f.file}${at} (${f.category}) — ${f.comment.replace(/\s+/g, " ").slice(0, 300)}`;
+  });
+  lines.unshift("Prior round's open findings (OLD head line numbers - locations may have shifted, match by file and issue):");
+  if (findings.length > shown.length) {
+    lines.push(`(+${findings.length - shown.length} more prior findings not shown; treat them as still open.)`);
+  }
+  return { block: lines.join("\n"), shown: shown.length, total: findings.length };
+}
+
+const normHead = (s: string) => s.toLowerCase().replace(/\s+/g, " ").trim().slice(0, 60);
+
+/**
+ * Link this round's findings back to the prior round's (issue #18).
+ * A carried finding is "fixed" only when an agent explicitly labeled a
+ * matching finding fixed AND no agent reports it open/new: disagreement
+ * resolves toward open, and an unmentioned prior finding stays open
+ * (fail-safe — an incremental diff cannot prove a negative). Matching is
+ * same-file plus close line (±5, tolerating shifted hunks) or equal
+ * comment head, falling back to comment head alone for line-less findings.
+ * Unmatched current findings are new by definition: the review can only
+ * validate what the previous round recorded.
+ */
+export function matchCarriedFindings<
+  P extends { file: string; line?: number; comment: string },
+  C extends { file: string; line?: number; comment: string; status?: "fixed" | "open" | "new" },
+>(
+  prior: P[],
+  current: C[]
+): { fixed: P[]; open: P[]; unverified: P[]; fresh: C[]; confirmed: C[]; resolved: C[] } {
+  const used = new Set<number>();
+  const fixed: P[] = [];
+  const open: P[] = [];
+  const unverified: P[] = [];
+  const confirmed: C[] = [];
+  const resolved: C[] = [];
+  for (const p of prior) {
+    const hits = current
+      .map((c, i) => ({ c, i }))
+      .filter(
+        ({ c, i }) =>
+          !used.has(i) &&
+          c.file === p.file &&
+          (p.line !== undefined && c.line !== undefined
+            ? Math.abs(p.line - c.line) <= 5
+            : normHead(p.comment) === normHead(c.comment))
+      );
+    if (hits.length === 0) {
+      open.push(p);
+      unverified.push(p);
+      continue;
+    }
+    const anyOpen = hits.some(({ c }) => (c.status ?? "new") !== "fixed");
+    for (const { c, i } of hits) {
+      used.add(i);
+      ((c.status ?? "new") === "fixed" ? resolved : confirmed).push(c);
+    }
+    (anyOpen ? open : fixed).push(p);
+  }
+  const fresh = current
+    .filter((_, i) => !used.has(i))
+    .map((c) => ((c.status ?? "new") === "fixed" ? { ...c, status: "new" as const } : c));
+  return { fixed, open, unverified, fresh, confirmed, resolved };
+}
+
+/**
  * Split a multi-file unified diff into per-file patches (issue #47).
  * GitHub hands us one blob built as
  *   --- a/<file>\n+++ b/<file>\n<patch>

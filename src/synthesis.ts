@@ -133,13 +133,24 @@ export function mergeSynthesis(
     const srcs = [...new Set(synth.sources[i] ?? [])].filter((id) => byId.has(id));
     srcs.forEach((id) => cited.add(id));
     if (srcs.length === 0) {
-      out.push(f);
+      // The synthesizer's own addition: new to this run (issue #18).
+      out.push(f.status ? f : { ...f, status: "new" as const });
       return;
     }
     const origins = srcs.map((id) => byId.get(id)!);
     const agents = [...new Set(origins.map((o) => o.agent))];
+    // Validation inherits through the merge (issue #18): the synthesizer
+    // never sees the prior round itself, so a merged finding keeps its
+    // sources' verdict — fixed only when every source says fixed.
+    const inherited =
+      origins.every((o) => o.status === "fixed")
+        ? ("fixed" as const)
+        : origins.some((o) => (o.status ?? "new") === "new")
+          ? ("new" as const)
+          : ("open" as const);
     out.push({
       ...f,
+      status: f.status ?? inherited,
       agent: agents.join("+"),
       provider: origins[0].provider,
       model: origins[0].model,
