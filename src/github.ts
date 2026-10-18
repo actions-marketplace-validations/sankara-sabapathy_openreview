@@ -286,7 +286,13 @@ export function renderStickyState(
       };
     }),
   };
-  return `<!-- ${STICKY_STATE_MARKER} ${JSON.stringify(state)} -->`;
+  // Finding text is attacker-influenced (it quotes PR diffs). A literal
+  // `-->` inside would close the HTML comment early and corrupt or split
+  // the block; `<!--` would nest one. Both sequences are escaped with
+  // JSON unicode escapes, which JSON.parse decodes back byte-identically,
+  // so the round-trip is exact and the comment structure is intact.
+  const json = JSON.stringify(state).replace(/<!--/g, "\\u003c!--").replace(/-->/g, "--\\u003e");
+  return `<!-- ${STICKY_STATE_MARKER} ${json} -->`;
 }
 
 function isStickyFindingState(f: unknown): f is StickyFindingState {
