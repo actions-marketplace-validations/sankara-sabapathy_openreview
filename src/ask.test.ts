@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { parseAskComment, buildAskPrompt, collectFeedbackSignals } from "./ask.js";
-
+import { parseAskComment, buildAskPrompt, collectFeedbackSignals, isAskAllowed, resolveAskProvider } from "./ask.js";
+import { parseConfig } from "./config.js";
 describe("parseAskComment (issue #23)", () => {
   it("parses a plain question", () => {
     assert.deepEqual(parseAskComment("/ask why is this flagged?"), {
@@ -89,5 +89,40 @@ describe("collectFeedbackSignals (issue #23)", () => {
       rest: { issues: { listComments: () => {} }, reactions: { listForIssueComment: async () => ({ data: [] }) } },
     } as any;
     assert.deepEqual(await collectFeedbackSignals(broken, "o", "r", 7), { comments: [], totals: {} });
+  });
+});
+
+describe("isAskAllowed (issue #59, reused for #23)", () => {
+  it("allows the default write roles and honors overrides", () => {
+    assert.equal(isAskAllowed("OWNER", undefined), true);
+    assert.equal(isAskAllowed("member", undefined), true);
+    assert.equal(isAskAllowed("COLLABORATOR", undefined), true);
+    assert.equal(isAskAllowed("NONE", undefined), false);
+    assert.equal(isAskAllowed(undefined, undefined), false);
+    assert.equal(isAskAllowed("CONTRIBUTOR", "CONTRIBUTOR"), true);
+    assert.equal(isAskAllowed("OWNER", "MEMBER"), false);
+  });
+});
+
+describe("resolveAskProvider (issue #23)", () => {
+  const cfg = (providers: any, mainProvider: string) =>
+    parseConfig({ version: 1, providers, reviews: [{ id: "r", main: { provider: mainProvider, instructions: "i" } }] });
+  it("resolves plain and dotted providers", () => {
+    const ok = resolveAskProvider(cfg({ go: { model: "m" } }, "go"));
+    assert.equal(ok.ok, true);
+    if (ok.ok) assert.equal(ok.provider.model, "m");
+    const dotted = resolveAskProvider(
+      cfg({ go: { model: "base", models: { flash: { model: "f" } } } }, "go.flash")
+    );
+    assert.equal(dotted.ok, true);
+    if (dotted.ok) assert.equal(dotted.provider.model, "f");
+  });
+  it("reports missing reviews and unknown providers instead of throwing", () => {
+    assert.deepEqual(resolveAskProvider({ reviews: [], providers: {} }), {
+      ok: false,
+      reason: "no reviews configured",
+    });
+    const bad = resolveAskProvider(cfg({ go: { model: "m" } }, "nope"));
+    assert.equal(bad.ok, false);
   });
 });

@@ -70,6 +70,41 @@ export function buildAskPrompt(opts: {
   };
 }
 
+import { parseAssociations } from "./authorize.js";
+import type { ProviderConfig } from "./config.js";
+import { resolveDottedProvider } from "./providers.js";
+
+/** Write-access check shared with the review gate (issue #59): the BASE-repo
+ * secrets are live on issue_comment, so only OWNER/MEMBER/COLLABORATOR
+ * (or the configured override list) may spend provider budget. */
+export function isAskAllowed(authorAssociation: string | undefined, allowedRaw: string | undefined): boolean {
+  const allowed = parseAssociations(allowedRaw);
+  const association = (authorAssociation ?? "NONE").trim().toUpperCase();
+  return allowed.includes(association);
+}
+
+/** Resolve the answering provider: the first review's main, dotted refs
+ * included (issue #67). Pure so the no-provider branch is unit-tested
+ * instead of only live-tested. */
+export function resolveAskProvider(config: {
+  reviews: { main: { provider: string } }[];
+  providers: Record<string, ProviderConfig>;
+}): { ok: true; provider: ProviderConfig; providerName: string } | { ok: false; reason: string } {
+  const mainDef = config.reviews[0]?.main;
+  if (!mainDef) return { ok: false, reason: "no reviews configured" };
+  const direct = config.providers[mainDef.provider];
+  if (direct) return { ok: true, provider: direct, providerName: mainDef.provider };
+  if (mainDef.provider.includes(".")) {
+    try {
+      const { config: resolved } = resolveDottedProvider(config.providers, mainDef.provider);
+      return { ok: true, provider: resolved, providerName: mainDef.provider };
+    } catch (e) {
+      return { ok: false, reason: (e as Error).message };
+    }
+  }
+  return { ok: false, reason: `unknown provider '${mainDef.provider}'` };
+}
+
 /** One bot comment's reaction signal. */
 export type CommentReactions = {
   commentId: number;

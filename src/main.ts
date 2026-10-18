@@ -22,8 +22,7 @@ import {
   applyDegradedFloor, resolveNoise, applyNoiseControls, splitDiff, scopeDiff, parseHunkRanges, type Verdict,
   satisfiesActionVersion, runningActionVersion, renderPriorReview, matchCarriedFindings,
 } from "./reviewer.js";
-import { parseAskComment, buildAskPrompt, collectFeedbackSignals } from "./ask.js";
-import { parseAssociations } from "./authorize.js";
+import { parseAskComment, buildAskPrompt, collectFeedbackSignals, isAskAllowed, resolveAskProvider } from "./ask.js";
 import { renderStickyBody, upsertStickyComment, appendStickySection, renderAppendSection, createInlineReview, findStickyComment, parseStickyState, type RunStatus, type StickyFindingState } from "./github.js";
 import { initLogger, logInfo, logWarning, logDebug } from "./logger.js";
 import { buildContextBlock, buildRepoIndex } from "./context.js";
@@ -382,19 +381,13 @@ async function runAskFlow(opts: AskFlowOpts): Promise<void> {
     logWarning("Ask: prior run state unreadable; answering from the diff alone.");
   }
   const mainDef = config.reviews[0]?.main;
-  if (!mainDef) {
-    logWarning("Ask: no reviews configured; cannot pick an answering provider.");
+  const resolved = resolveAskProvider(config);
+  if (!resolved.ok || !mainDef) {
+    logWarning(`Ask: cannot pick an answering provider (${!mainDef ? "no reviews configured" : (resolved as { reason: string }).reason}).`);
     return;
   }
-  let provider = config.providers[mainDef.provider];
-  if (!provider) {
-    if (mainDef.provider.includes(".")) {
-      provider = resolveDottedProvider(config.providers, mainDef.provider).config;
-    } else {
-      logWarning(`Ask: unknown provider '${mainDef.provider}'.`);
-      return;
-    }
-  }
+  const { provider } = resolved;
+  const providerName = mainDef.provider;
   const { system, user } = buildAskPrompt({
     diff: diff.slice(0, config.defaults.max_diff_chars ?? 80000),
     priorFindings: prior,
@@ -406,7 +399,7 @@ async function runAskFlow(opts: AskFlowOpts): Promise<void> {
   try {
     const r = await runTextAgent({
       agentName: "ask",
-      providerName: mainDef.provider,
+      providerName,
       provider,
       system,
       user,
@@ -482,11 +475,14 @@ export async function run(): Promise<void> {
         ? parseAskComment((ctx.payload as any).comment?.body)
         : null;
     if (askParsed) {
-      const allowed = parseAssociations(core.getInput("allowed-author-associations"));
-      const association = ((ctx.payload as any).comment?.author_association ?? "NONE").trim().toUpperCase();
-      if (!allowed.includes(association)) {
+      if (
+        !isAskAllowed(
+          (ctx.payload as any).comment?.author_association,
+          core.getInput("allowed-author-associations")
+        )
+      ) {
         logWarning(
-          `Ask denied: sender association '${association}' may not spend provider budget (allowed: ${allowed.join(", ")}). Nothing was answered or posted.`
+          `Ask denied: sender association '${(ctx.payload as any).comment?.author_association ?? "NONE"}' may not spend provider budget. Nothing was answered or posted.`
         );
         return;
       }

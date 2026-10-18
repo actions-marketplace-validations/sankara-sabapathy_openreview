@@ -46700,6 +46700,57 @@ function runningActionVersion(env) {
     return null;
 }
 
+;// CONCATENATED MODULE: ./dist-src/authorize.js
+/**
+ * Who may spend the repo's BYOK budget, and by what command.
+ *
+ * `issue_comment` events run in the BASE repo context, so the workflow's
+ * secrets are fully available. Without a gate, any GitHub user could comment
+ * `/review` on any PR (including a fork) and have the action spend the
+ * maintainer's provider keys — an open wallet for the whole internet. The
+ * workflow `if:` can filter this, but a workflow is per-repo and easy to leave
+ * stale, so the action enforces it too.
+ *
+ * Rules for `issue_comment`:
+ * 1. the body must be exactly the configured command (trimmed) — `contains()`
+ *    style matching also fires on "/reviewer", quoted text, and code blocks;
+ * 2. the sender must hold write access (author_association OWNER / MEMBER /
+ *    COLLABORATOR by default). PR authors from forks are NOT allowed by
+ *    default: authorizing them means authorizing anyone.
+ *
+ * `pull_request` is unaffected — pushing the branch already required write
+ * access, and GitHub withholds secrets from fork PRs.
+ */
+/** GitHub's `author_association` values that imply write access. */
+const DEFAULT_ALLOWED_ASSOCIATIONS = ["OWNER", "MEMBER", "COLLABORATOR"];
+function parseAssociations(raw) {
+    const list = (raw ?? "")
+        .split(",")
+        .map((s) => s.trim().toUpperCase())
+        .filter(Boolean);
+    return list.length > 0 ? list : DEFAULT_ALLOWED_ASSOCIATIONS;
+}
+function authorizeTrigger(input) {
+    if (input.eventName !== "issue_comment")
+        return { allowed: true };
+    const body = (input.commentBody ?? "").trim();
+    const command = input.command.trim();
+    if (!command)
+        return { allowed: true }; // no command configured -> command path disabled
+    if (body.toLowerCase() !== command.toLowerCase()) {
+        return { allowed: false, reason: `comment is not the configured command (${command})` };
+    }
+    const allowed = parseAssociations(input.allowedAssociations);
+    const association = (input.authorAssociation ?? "NONE").trim().toUpperCase();
+    if (!allowed.includes(association)) {
+        return {
+            allowed: false,
+            reason: `sender association '${association}' may not trigger a review (allowed: ${allowed.join(", ")})`,
+        };
+    }
+    return { allowed: true };
+}
+
 ;// CONCATENATED MODULE: ./dist-src/ask.js
 /**
  * In-thread Q&A (issue #23): `/ask <question>` on a PR answers from the
@@ -46758,6 +46809,37 @@ function buildAskPrompt(opts) {
             `\n\nQuestion: ${opts.question}`,
     };
 }
+
+
+/** Write-access check shared with the review gate (issue #59): the BASE-repo
+ * secrets are live on issue_comment, so only OWNER/MEMBER/COLLABORATOR
+ * (or the configured override list) may spend provider budget. */
+function isAskAllowed(authorAssociation, allowedRaw) {
+    const allowed = parseAssociations(allowedRaw);
+    const association = (authorAssociation ?? "NONE").trim().toUpperCase();
+    return allowed.includes(association);
+}
+/** Resolve the answering provider: the first review's main, dotted refs
+ * included (issue #67). Pure so the no-provider branch is unit-tested
+ * instead of only live-tested. */
+function resolveAskProvider(config) {
+    const mainDef = config.reviews[0]?.main;
+    if (!mainDef)
+        return { ok: false, reason: "no reviews configured" };
+    const direct = config.providers[mainDef.provider];
+    if (direct)
+        return { ok: true, provider: direct, providerName: mainDef.provider };
+    if (mainDef.provider.includes(".")) {
+        try {
+            const { config: resolved } = resolveDottedProvider(config.providers, mainDef.provider);
+            return { ok: true, provider: resolved, providerName: mainDef.provider };
+        }
+        catch (e) {
+            return { ok: false, reason: e.message };
+        }
+    }
+    return { ok: false, reason: `unknown provider '${mainDef.provider}'` };
+}
 /**
  * Aggregate reactions on the bot's own PR comments (sticky + replies).
  * Inline review-thread reactions need per-review-comment IDs, which runs
@@ -46795,57 +46877,6 @@ async function collectFeedbackSignals(octokit, owner, repo, prNumber, botMarker 
         // Signal is best-effort; an API failure is not a review failure.
     }
     return { comments, totals };
-}
-
-;// CONCATENATED MODULE: ./dist-src/authorize.js
-/**
- * Who may spend the repo's BYOK budget, and by what command.
- *
- * `issue_comment` events run in the BASE repo context, so the workflow's
- * secrets are fully available. Without a gate, any GitHub user could comment
- * `/review` on any PR (including a fork) and have the action spend the
- * maintainer's provider keys — an open wallet for the whole internet. The
- * workflow `if:` can filter this, but a workflow is per-repo and easy to leave
- * stale, so the action enforces it too.
- *
- * Rules for `issue_comment`:
- * 1. the body must be exactly the configured command (trimmed) — `contains()`
- *    style matching also fires on "/reviewer", quoted text, and code blocks;
- * 2. the sender must hold write access (author_association OWNER / MEMBER /
- *    COLLABORATOR by default). PR authors from forks are NOT allowed by
- *    default: authorizing them means authorizing anyone.
- *
- * `pull_request` is unaffected — pushing the branch already required write
- * access, and GitHub withholds secrets from fork PRs.
- */
-/** GitHub's `author_association` values that imply write access. */
-const DEFAULT_ALLOWED_ASSOCIATIONS = ["OWNER", "MEMBER", "COLLABORATOR"];
-function parseAssociations(raw) {
-    const list = (raw ?? "")
-        .split(",")
-        .map((s) => s.trim().toUpperCase())
-        .filter(Boolean);
-    return list.length > 0 ? list : DEFAULT_ALLOWED_ASSOCIATIONS;
-}
-function authorizeTrigger(input) {
-    if (input.eventName !== "issue_comment")
-        return { allowed: true };
-    const body = (input.commentBody ?? "").trim();
-    const command = input.command.trim();
-    if (!command)
-        return { allowed: true }; // no command configured -> command path disabled
-    if (body.toLowerCase() !== command.toLowerCase()) {
-        return { allowed: false, reason: `comment is not the configured command (${command})` };
-    }
-    const allowed = parseAssociations(input.allowedAssociations);
-    const association = (input.authorAssociation ?? "NONE").trim().toUpperCase();
-    if (!allowed.includes(association)) {
-        return {
-            allowed: false,
-            reason: `sender association '${association}' may not trigger a review (allowed: ${allowed.join(", ")})`,
-        };
-    }
-    return { allowed: true };
 }
 
 ;// CONCATENATED MODULE: ./dist-src/github.js
@@ -47899,7 +47930,6 @@ function buildContextBlock(input, repoIndex) {
 
 
 
-
 const CONFIG_CANDIDATES = [
     ".github/openreview.yml",
     ".github/openreview.yaml",
@@ -48157,20 +48187,13 @@ async function runAskFlow(opts) {
         logWarning("Ask: prior run state unreadable; answering from the diff alone.");
     }
     const mainDef = config.reviews[0]?.main;
-    if (!mainDef) {
-        logWarning("Ask: no reviews configured; cannot pick an answering provider.");
+    const resolved = resolveAskProvider(config);
+    if (!resolved.ok || !mainDef) {
+        logWarning(`Ask: cannot pick an answering provider (${!mainDef ? "no reviews configured" : resolved.reason}).`);
         return;
     }
-    let provider = config.providers[mainDef.provider];
-    if (!provider) {
-        if (mainDef.provider.includes(".")) {
-            provider = resolveDottedProvider(config.providers, mainDef.provider).config;
-        }
-        else {
-            logWarning(`Ask: unknown provider '${mainDef.provider}'.`);
-            return;
-        }
-    }
+    const { provider } = resolved;
+    const providerName = mainDef.provider;
     const { system, user } = buildAskPrompt({
         diff: diff.slice(0, config.defaults.max_diff_chars ?? 80000),
         priorFindings: prior,
@@ -48182,7 +48205,7 @@ async function runAskFlow(opts) {
     try {
         const r = await runTextAgent({
             agentName: "ask",
-            providerName: mainDef.provider,
+            providerName,
             provider,
             system,
             user,
@@ -48253,10 +48276,8 @@ async function run() {
             ? parseAskComment(ctx.payload.comment?.body)
             : null;
         if (askParsed) {
-            const allowed = parseAssociations(core.getInput("allowed-author-associations"));
-            const association = (ctx.payload.comment?.author_association ?? "NONE").trim().toUpperCase();
-            if (!allowed.includes(association)) {
-                logWarning(`Ask denied: sender association '${association}' may not spend provider budget (allowed: ${allowed.join(", ")}). Nothing was answered or posted.`);
+            if (!isAskAllowed(ctx.payload.comment?.author_association, core.getInput("allowed-author-associations"))) {
+                logWarning(`Ask denied: sender association '${ctx.payload.comment?.author_association ?? "NONE"}' may not spend provider budget. Nothing was answered or posted.`);
                 return;
             }
             const askDeadline = Date.now() + (config.defaults.max_runtime_s ?? 1200) * 1000;
