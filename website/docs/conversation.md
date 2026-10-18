@@ -24,6 +24,13 @@ workflow), or files outside the diff except through the recorded findings.
 the run's `max_runtime_s` budget like any agent call. Manual `/review`
 always runs a full fresh review.
 
+Adoption note: `/ask` needs the workflow trigger extended to fire on
+`/ask` comments (see the `contains(..., '/ask')` line in the reference
+workflow). `issue_comment` workflows always run from the default branch,
+so a consumer repo picks this up by copying the current workflow file —
+and for the same reason `/ask` itself can only be dogfooded live after
+its code reaches `main`, never from the PR branch.
+
 ## Feedback signal
 
 Every published review also logs a structured reaction summary:
