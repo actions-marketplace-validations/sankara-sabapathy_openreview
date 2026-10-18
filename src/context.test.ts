@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, symlinkSync, rmSync, mkdirSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
-import { extractDefinedNames, buildContextBlock, buildRepoIndex, MAX_CALLER_SCAN_BYTES } from "./context.js";
+import { extractDefinedNames, maskTemplateLiterals, buildContextBlock, buildRepoIndex, MAX_CALLER_SCAN_BYTES } from "./context.js";
 import { combineBallots, decideReviewVerdict, matchesAny } from "./reviewer.js";
 import { isRetryableError } from "./providers.js";
 
@@ -20,6 +20,53 @@ describe("extractDefinedNames", () => {
     const names = extractDefinedNames("def handler():\n  pass\nclass Model:\n  pass");
     assert.ok(names.includes("handler") && names.includes("Model"));
     assert.ok(extractDefinedNames("func Serve() {}").includes("Serve"));
+  });
+});
+
+describe("maskTemplateLiterals (issue #87)", () => {
+  it("ignores column-0 keywords inside template literals", () => {
+    const names = extractDefinedNames(
+      "export function real() {}\nconst doc = `\n# example\nexport function fake() {}\n`;\n"
+    );
+    assert.ok(names.includes("real"));
+    assert.ok(!names.includes("fake"));
+  });
+  it("does not end masking on an escaped backtick", () => {
+    const names = extractDefinedNames("const t = `a\\`b\nexport function fake() {}`;\nexport function real() {}");
+    assert.ok(names.includes("real"));
+    assert.ok(!names.includes("fake"));
+  });
+  it("keeps interpolation-adjacent code visible", () => {
+    const names = extractDefinedNames("const t = `hello ${username}`;\nexport function real() {}");
+    assert.ok(names.includes("real"));
+    assert.ok(!names.includes("username"));
+  });
+  it("masks Go raw strings too", () => {
+    const names = extractDefinedNames("package main\nvar doc = `func Fake() {}`\nfunc Serve() {}");
+    assert.ok(names.includes("Serve"));
+    assert.ok(!names.includes("Fake"));
+  });
+  it("masks block comments spanning lines", () => {
+    const names = extractDefinedNames("/*\nexport function fake() {}\n*/\nexport function real() {}");
+    assert.ok(names.includes("real"));
+    assert.ok(!names.includes("fake"));
+  });
+  it("masks to end of input on an unclosed backtick (safe direction)", () => {
+    assert.ok(!extractDefinedNames("`\nexport function fake() {}").includes("fake"));
+  });
+  it("does not let a backtick inside a regular string mask real code", () => {
+    const names = extractDefinedNames('const s = "`";\nexport function real() {}');
+    assert.ok(names.includes("real"));
+  });
+  it("preserves length and newline positions", () => {
+    const src = "export function real() {}\nconst t = `a${x}b\nc`;\n/* c */\n";
+    const masked = maskTemplateLiterals(src);
+    assert.equal(masked.length, src.length);
+    assert.deepEqual(
+      [...src].map((c, i) => (c === "\n" ? i : -1)).filter((i) => i >= 0),
+      [...masked].map((c, i) => (c === "\n" ? i : -1)).filter((i) => i >= 0)
+    );
+    assert.ok(masked.startsWith("export function real() {}"));
   });
 });
 
