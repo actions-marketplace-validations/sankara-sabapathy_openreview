@@ -696,6 +696,8 @@ export async function run(): Promise<void> {
       agents: agentRows,
       findings: all,
       runUrl,
+      headSha,
+      stateReviews: perReview.map((r) => ({ id: r.id, verdict: r.verdict, findings: r.findings })),
     });
     // Derived from actual agent outcomes, not from a hardcoded list of three
     // env var names — a config using key_from: env.GROQ_API_KEY used to be told
@@ -782,6 +784,7 @@ export async function run(): Promise<void> {
           headSha,
           runUrl,
           extras,
+          stateReviews: perReview.map((r) => ({ id: r.id, verdict: r.verdict, findings: r.findings })),
         });
         const { rotated } = await appendStickySection(octokit, owner, repo, prNumber, section);
         logInfo(`Appended sticky section (verdict ${global}, ${all.length} findings${rotated ? ", rotated" : ""}).`);

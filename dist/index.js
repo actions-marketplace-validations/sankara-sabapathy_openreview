@@ -46645,6 +46645,91 @@ function renderRunBody(opts) {
     return lines;
 }
 const REREVIEW_LINE = "<sub>Re-review with `/review`. Config: `.github/openreview.yml`.</sub>";
+/**
+ * Machine-readable run state for incremental re-review (issue #18).
+ *
+ * The next `synchronize` run needs two things no API gives it cheaply: the
+ * exact SHA it last reviewed (so it can diff head-vs-last instead of
+ * base..head) and that run's open findings (so agents can validate fixes
+ * instead of re-reporting). Both ride along as a hidden HTML comment —
+ * invisible to users, zero new storage, subject to the same STICKY_LIMIT
+ * rotation as everything else. Update mode carries one block; append mode
+ * one per section, and the parser takes the LAST valid block (latest run).
+ */
+const STICKY_STATE_MARKER = "openreview:state";
+const STICKY_STATE_VERSION = 1;
+/** Per-finding comment cap in state: enough to re-identify, not the full text. */
+const STICKY_STATE_COMMENT_CAP = 500;
+/** Per-review finding cap in state; cut reviews set `truncated` so the next
+ * run knows the carry is partial and falls back to a full review. */
+const STICKY_STATE_FINDINGS_CAP = 50;
+function renderStickyState(sha, reviews) {
+    const state = {
+        v: STICKY_STATE_VERSION,
+        sha,
+        reviews: reviews.map((r) => ({
+            id: r.id,
+            verdict: r.verdict,
+            findings: r.findings.slice(0, STICKY_STATE_FINDINGS_CAP).map((f) => ({
+                file: f.file,
+                ...(f.line !== undefined ? { line: f.line } : {}),
+                severity: f.severity,
+                category: f.category,
+                comment: f.comment.slice(0, STICKY_STATE_COMMENT_CAP),
+            })),
+            truncated: r.findings.length > STICKY_STATE_FINDINGS_CAP,
+        })),
+    };
+    return `<!-- ${STICKY_STATE_MARKER} ${JSON.stringify(state)} -->`;
+}
+function isStickyFindingState(f) {
+    const o = f;
+    return (!!o &&
+        typeof o.file === "string" &&
+        (o.line === undefined || typeof o.line === "number") &&
+        typeof o.severity === "string" &&
+        typeof o.category === "string" &&
+        typeof o.comment === "string");
+}
+/** Latest valid state block in a sticky body, or null when none parses.
+ * Never throws: a hand-edited or truncated block is not state. */
+function parseStickyState(body) {
+    const re = new RegExp(`<!-- ${STICKY_STATE_MARKER} (.*?) -->`, "gs");
+    let m;
+    let last = null;
+    while ((m = re.exec(body)) !== null) {
+        try {
+            const s = JSON.parse(m[1]);
+            if (typeof s !== "object" || s === null || s.v !== STICKY_STATE_VERSION)
+                continue;
+            if (typeof s.sha !== "string" || s.sha.length === 0)
+                continue;
+            if (!Array.isArray(s.reviews))
+                continue;
+            const reviews = [];
+            let ok = true;
+            for (const r of s.reviews) {
+                const ro = r;
+                if (!ro || typeof ro.id !== "string" || typeof ro.verdict !== "string" || !Array.isArray(ro.findings)) {
+                    ok = false;
+                    break;
+                }
+                if (!ro.findings.every(isStickyFindingState)) {
+                    ok = false;
+                    break;
+                }
+                reviews.push({ id: ro.id, verdict: ro.verdict, findings: ro.findings, truncated: ro.truncated === true });
+            }
+            if (!ok)
+                continue;
+            last = { v: STICKY_STATE_VERSION, sha: s.sha, reviews };
+        }
+        catch {
+            continue;
+        }
+    }
+    return last;
+}
 function renderStickyBody(opts) {
     const status = opts.status ?? "ok";
     const lines = [];
@@ -46657,6 +46742,8 @@ function renderStickyBody(opts) {
     lines.push(...renderRunBody(opts));
     if (opts.runUrl)
         lines.push(`\n<sub>Run: ${opts.runUrl}</sub>`);
+    if (opts.headSha && opts.stateReviews)
+        lines.push(`\n${renderStickyState(opts.headSha, opts.stateReviews)}`);
     lines.push(`\n${REREVIEW_LINE}`);
     return lines.join("\n");
 }
@@ -46675,6 +46762,8 @@ function renderAppendSection(opts) {
     ];
     for (const e of opts.extras ?? [])
         lines.push(e);
+    if (opts.stateReviews)
+        lines.push(`\n${renderStickyState(opts.headSha, opts.stateReviews)}`);
     return lines.join("\n");
 }
 /** GitHub hard-caps comments at 65536 chars; rotate well before hitting it. */
@@ -47951,6 +48040,8 @@ async function run() {
             agents: agentRows,
             findings: all,
             runUrl,
+            headSha,
+            stateReviews: perReview.map((r) => ({ id: r.id, verdict: r.verdict, findings: r.findings })),
         });
         // Derived from actual agent outcomes, not from a hardcoded list of three
         // env var names — a config using key_from: env.GROQ_API_KEY used to be told
@@ -48030,6 +48121,7 @@ async function run() {
                     headSha,
                     runUrl,
                     extras,
+                    stateReviews: perReview.map((r) => ({ id: r.id, verdict: r.verdict, findings: r.findings })),
                 });
                 const { rotated } = await appendStickySection(octokit, owner, repo, prNumber, section);
                 logInfo(`Appended sticky section (verdict ${global}, ${all.length} findings${rotated ? ", rotated" : ""}).`);
