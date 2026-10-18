@@ -35,8 +35,8 @@ jobs:
       (github.event.comment.author_association == 'OWNER' ||
       github.event.comment.author_association == 'MEMBER' ||
       github.event.comment.author_association == 'COLLABORATOR') &&
-      contains(github.event.comment.body, '/review') ||
-      contains(github.event.comment.body, '/ask'))
+      (contains(github.event.comment.body, '/review') ||
+      contains(github.event.comment.body, '/ask')))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
