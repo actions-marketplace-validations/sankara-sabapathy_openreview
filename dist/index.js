@@ -46926,6 +46926,134 @@ function readCapped(root, rel, cap) {
 }
 // Top-level defined names: export function|const|class|interface|type X,
 // def X / class X (python), ^func X (go), ^(public|private)? (class|function) X (php/java-ish).
+//
+// Masked first (issue #87): a `^`-anchored scan cannot tell code from a
+// multi-line template literal, so a doc example starting with `export` at
+// column 0 inside backticks used to register as a defined symbol (and the
+// same holds for `/* */` block comments spanning lines). Masking replaces
+// those spans with spaces, keeping newlines so line structure and `^`
+// anchors are unaffected. `${...}` interpolations hold real code and stay
+// visible. Known gaps, unchanged from before: Python triple-quoted
+// docstrings, and a backtick inside a single-line regular string (rare;
+// errs toward fewer false positives).
+function maskTemplateLiterals(content) {
+    const out = [];
+    // Only `${...}` pushes a frame (brace depth of that interpolation).
+    // Backticks flip between code and template without pushing: after a
+    // nested template closes, the stack top is still its interpolation.
+    const stack = [];
+    let inTemplate = false;
+    let i = 0;
+    const n = content.length;
+    const blank = (ch) => (ch === "\n" ? "\n" : " ");
+    while (i < n) {
+        const ch = content[i];
+        const next = i + 1 < n ? content[i + 1] : "";
+        if (!inTemplate) {
+            if (ch === "`") {
+                inTemplate = true;
+                out.push(" ");
+                i++;
+                continue;
+            }
+            if (ch === "/" && next === "*") {
+                out.push(" ", " ");
+                i += 2;
+                while (i < n && !(content[i] === "*" && content[i + 1] === "/")) {
+                    out.push(blank(content[i]));
+                    i++;
+                }
+                if (i < n) {
+                    out.push(" ", " ");
+                    i += 2;
+                }
+                continue;
+            }
+            if (ch === "'" || ch === '"') {
+                // Single-line string: copy verbatim. It cannot contain a line
+                // starting at column 0, and skipping it keeps a backtick, brace,
+                // or /* inside from falsely opening template/comment/brace
+                // tracking (e.g. "`" in a regular string, or "}" in `${...}`).
+                const quote = ch;
+                out.push(ch);
+                i++;
+                while (i < n && content[i] !== "\n") {
+                    out.push(content[i]);
+                    if (content[i] === "\\" && i + 1 < n) {
+                        out.push(content[i + 1]);
+                        i += 2;
+                        continue;
+                    }
+                    i++;
+                    if (content[i - 1] === quote)
+                        break;
+                }
+                continue;
+            }
+            if (ch === "/" && next === "/") {
+                // `//` line comment: mask to end of line. A backtick inside the
+                // comment must not open template masking (dogfood on #89). Runs
+                // after string skipping, so `http://...` inside quotes is safe.
+                // Masking stops at the newline, so a `}` closing an interpolation
+                // on a later line is still seen; a `}` after `//` on the same
+                // line is a real comment and correctly ignored.
+                out.push(" ", " ");
+                i += 2;
+                while (i < n && content[i] !== "\n") {
+                    out.push(" ");
+                    i++;
+                }
+                continue;
+            }
+            if (stack.length > 0) {
+                if (ch === "{") {
+                    stack[stack.length - 1]++;
+                    out.push(ch);
+                    i++;
+                    continue;
+                }
+                if (ch === "}") {
+                    if (stack[stack.length - 1] > 0) {
+                        stack[stack.length - 1]--;
+                        out.push(ch);
+                        i++;
+                        continue;
+                    }
+                    stack.pop();
+                    inTemplate = true;
+                    out.push(ch);
+                    i++;
+                    continue;
+                }
+            }
+            out.push(ch);
+            i++;
+            continue;
+        }
+        // Inside a template literal (or Go raw string).
+        if (ch === "\\" && next !== "") {
+            out.push(" ", " ");
+            i += 2;
+            continue;
+        }
+        if (ch === "`") {
+            inTemplate = false;
+            out.push(" ");
+            i++;
+            continue;
+        }
+        if (ch === "$" && next === "{") {
+            stack.push(0);
+            inTemplate = false;
+            out.push(" ", " ");
+            i += 2;
+            continue;
+        }
+        out.push(blank(ch));
+        i++;
+    }
+    return out.join("");
+}
 const DEF_RES = [
     /^export\s+(?:async\s+)?(?:function|const|let|class|interface|type|enum)\s+([A-Za-z_$][\w$]*)/gm,
     /^(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)/gm,
@@ -46936,10 +47064,11 @@ const DEF_RES = [
 ];
 function extractDefinedNames(content, limit = 20) {
     const names = new Set();
+    const masked = maskTemplateLiterals(content);
     for (const re of DEF_RES) {
         re.lastIndex = 0;
         let m;
-        while ((m = re.exec(content)) !== null && names.size < limit) {
+        while ((m = re.exec(masked)) !== null && names.size < limit) {
             if (m[1].length >= 3)
                 names.add(m[1]);
         }
