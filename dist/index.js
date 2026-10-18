@@ -46645,6 +46645,103 @@ function renderRunBody(opts) {
     return lines;
 }
 const REREVIEW_LINE = "<sub>Re-review with `/review`. Config: `.github/openreview.yml`.</sub>";
+/**
+ * Machine-readable run state for incremental re-review (issue #18).
+ *
+ * The next `synchronize` run needs two things no API gives it cheaply: the
+ * exact SHA it last reviewed (so it can diff head-vs-last instead of
+ * base..head) and that run's open findings (so agents can validate fixes
+ * instead of re-reporting). Both ride along as a hidden HTML comment —
+ * invisible to users, zero new storage, subject to the same STICKY_LIMIT
+ * rotation as everything else. Update mode carries one block; append mode
+ * one per section, and the parser takes the LAST valid block (latest run).
+ */
+const STICKY_STATE_MARKER = "openreview:state";
+const STICKY_STATE_VERSION = 1;
+/** Per-finding comment cap in state: enough to re-identify, not the full text. */
+const STICKY_STATE_COMMENT_CAP = 500;
+/** Per-review finding cap in state; cut reviews set `truncated` so the next
+ * run knows the carry is partial and falls back to a full review. */
+const STICKY_STATE_FINDINGS_CAP = 50;
+function renderStickyState(sha, reviews) {
+    const state = {
+        v: STICKY_STATE_VERSION,
+        sha,
+        reviews: reviews.map((r) => {
+            const kept = r.findings.slice(0, STICKY_STATE_FINDINGS_CAP);
+            return {
+                id: r.id,
+                verdict: r.verdict,
+                findings: kept.map((f) => ({
+                    file: f.file,
+                    ...(f.line !== undefined ? { line: f.line } : {}),
+                    severity: f.severity,
+                    category: f.category,
+                    comment: f.comment.slice(0, STICKY_STATE_COMMENT_CAP),
+                })),
+                // Partial carry in either dimension (dropped findings or sliced
+                // comments) means the next run cannot trust the state as complete.
+                truncated: r.findings.length > STICKY_STATE_FINDINGS_CAP ||
+                    kept.some((f) => f.comment.length > STICKY_STATE_COMMENT_CAP),
+            };
+        }),
+    };
+    // Finding text is attacker-influenced (it quotes PR diffs). A literal
+    // `-->` inside would close the HTML comment early and corrupt or split
+    // the block; `<!--` would nest one. Both sequences are escaped with
+    // JSON unicode escapes, which JSON.parse decodes back byte-identically,
+    // so the round-trip is exact and the comment structure is intact.
+    const json = JSON.stringify(state).replace(/<!--/g, "\\u003c!--").replace(/-->/g, "--\\u003e");
+    return `<!-- ${STICKY_STATE_MARKER} ${json} -->`;
+}
+function isStickyFindingState(f) {
+    const o = f;
+    return (!!o &&
+        typeof o.file === "string" &&
+        (o.line === undefined || typeof o.line === "number") &&
+        typeof o.severity === "string" &&
+        typeof o.category === "string" &&
+        typeof o.comment === "string");
+}
+/** Latest valid state block in a sticky body, or null when none parses.
+ * Never throws: a hand-edited or truncated block is not state. */
+function parseStickyState(body) {
+    const re = new RegExp(`<!-- ${STICKY_STATE_MARKER} (.*?) -->`, "gs");
+    let m;
+    let last = null;
+    while ((m = re.exec(body)) !== null) {
+        try {
+            const s = JSON.parse(m[1]);
+            if (typeof s !== "object" || s === null || s.v !== STICKY_STATE_VERSION)
+                continue;
+            if (typeof s.sha !== "string" || s.sha.length === 0)
+                continue;
+            if (!Array.isArray(s.reviews))
+                continue;
+            const reviews = [];
+            let ok = true;
+            for (const r of s.reviews) {
+                const ro = r;
+                if (!ro || typeof ro.id !== "string" || typeof ro.verdict !== "string" || !Array.isArray(ro.findings)) {
+                    ok = false;
+                    break;
+                }
+                if (!ro.findings.every(isStickyFindingState)) {
+                    ok = false;
+                    break;
+                }
+                reviews.push({ id: ro.id, verdict: ro.verdict, findings: ro.findings, truncated: ro.truncated === true });
+            }
+            if (!ok)
+                continue;
+            last = { v: STICKY_STATE_VERSION, sha: s.sha, reviews };
+        }
+        catch {
+            continue;
+        }
+    }
+    return last;
+}
 function renderStickyBody(opts) {
     const status = opts.status ?? "ok";
     const lines = [];
@@ -46657,6 +46754,8 @@ function renderStickyBody(opts) {
     lines.push(...renderRunBody(opts));
     if (opts.runUrl)
         lines.push(`\n<sub>Run: ${opts.runUrl}</sub>`);
+    if (opts.headSha && opts.stateReviews)
+        lines.push(`\n${renderStickyState(opts.headSha, opts.stateReviews)}`);
     lines.push(`\n${REREVIEW_LINE}`);
     return lines.join("\n");
 }
@@ -46675,6 +46774,8 @@ function renderAppendSection(opts) {
     ];
     for (const e of opts.extras ?? [])
         lines.push(e);
+    if (opts.stateReviews)
+        lines.push(`\n${renderStickyState(opts.headSha, opts.stateReviews)}`);
     return lines.join("\n");
 }
 /** GitHub hard-caps comments at 65536 chars; rotate well before hitting it. */
@@ -46926,6 +47027,134 @@ function readCapped(root, rel, cap) {
 }
 // Top-level defined names: export function|const|class|interface|type X,
 // def X / class X (python), ^func X (go), ^(public|private)? (class|function) X (php/java-ish).
+//
+// Masked first (issue #87): a `^`-anchored scan cannot tell code from a
+// multi-line template literal, so a doc example starting with `export` at
+// column 0 inside backticks used to register as a defined symbol (and the
+// same holds for `/* */` block comments spanning lines). Masking replaces
+// those spans with spaces, keeping newlines so line structure and `^`
+// anchors are unaffected. `${...}` interpolations hold real code and stay
+// visible. Known gaps, unchanged from before: Python triple-quoted
+// docstrings, and a backtick inside a single-line regular string (rare;
+// errs toward fewer false positives).
+function maskTemplateLiterals(content) {
+    const out = [];
+    // Only `${...}` pushes a frame (brace depth of that interpolation).
+    // Backticks flip between code and template without pushing: after a
+    // nested template closes, the stack top is still its interpolation.
+    const stack = [];
+    let inTemplate = false;
+    let i = 0;
+    const n = content.length;
+    const blank = (ch) => (ch === "\n" ? "\n" : " ");
+    while (i < n) {
+        const ch = content[i];
+        const next = i + 1 < n ? content[i + 1] : "";
+        if (!inTemplate) {
+            if (ch === "`") {
+                inTemplate = true;
+                out.push(" ");
+                i++;
+                continue;
+            }
+            if (ch === "/" && next === "*") {
+                out.push(" ", " ");
+                i += 2;
+                while (i < n && !(content[i] === "*" && content[i + 1] === "/")) {
+                    out.push(blank(content[i]));
+                    i++;
+                }
+                if (i < n) {
+                    out.push(" ", " ");
+                    i += 2;
+                }
+                continue;
+            }
+            if (ch === "'" || ch === '"') {
+                // Single-line string: copy verbatim. It cannot contain a line
+                // starting at column 0, and skipping it keeps a backtick, brace,
+                // or /* inside from falsely opening template/comment/brace
+                // tracking (e.g. "`" in a regular string, or "}" in `${...}`).
+                const quote = ch;
+                out.push(ch);
+                i++;
+                while (i < n && content[i] !== "\n") {
+                    out.push(content[i]);
+                    if (content[i] === "\\" && i + 1 < n) {
+                        out.push(content[i + 1]);
+                        i += 2;
+                        continue;
+                    }
+                    i++;
+                    if (content[i - 1] === quote)
+                        break;
+                }
+                continue;
+            }
+            if (ch === "/" && next === "/") {
+                // `//` line comment: mask to end of line. A backtick inside the
+                // comment must not open template masking (dogfood on #89). Runs
+                // after string skipping, so `http://...` inside quotes is safe.
+                // Masking stops at the newline, so a `}` closing an interpolation
+                // on a later line is still seen; a `}` after `//` on the same
+                // line is a real comment and correctly ignored.
+                out.push(" ", " ");
+                i += 2;
+                while (i < n && content[i] !== "\n") {
+                    out.push(" ");
+                    i++;
+                }
+                continue;
+            }
+            if (stack.length > 0) {
+                if (ch === "{") {
+                    stack[stack.length - 1]++;
+                    out.push(ch);
+                    i++;
+                    continue;
+                }
+                if (ch === "}") {
+                    if (stack[stack.length - 1] > 0) {
+                        stack[stack.length - 1]--;
+                        out.push(ch);
+                        i++;
+                        continue;
+                    }
+                    stack.pop();
+                    inTemplate = true;
+                    out.push(ch);
+                    i++;
+                    continue;
+                }
+            }
+            out.push(ch);
+            i++;
+            continue;
+        }
+        // Inside a template literal (or Go raw string).
+        if (ch === "\\" && next !== "") {
+            out.push(" ", " ");
+            i += 2;
+            continue;
+        }
+        if (ch === "`") {
+            inTemplate = false;
+            out.push(" ");
+            i++;
+            continue;
+        }
+        if (ch === "$" && next === "{") {
+            stack.push(0);
+            inTemplate = false;
+            out.push(" ", " ");
+            i += 2;
+            continue;
+        }
+        out.push(blank(ch));
+        i++;
+    }
+    return out.join("");
+}
 const DEF_RES = [
     /^export\s+(?:async\s+)?(?:function|const|let|class|interface|type|enum)\s+([A-Za-z_$][\w$]*)/gm,
     /^(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)/gm,
@@ -46936,10 +47165,11 @@ const DEF_RES = [
 ];
 function extractDefinedNames(content, limit = 20) {
     const names = new Set();
+    const masked = maskTemplateLiterals(content);
     for (const re of DEF_RES) {
         re.lastIndex = 0;
         let m;
-        while ((m = re.exec(content)) !== null && names.size < limit) {
+        while ((m = re.exec(masked)) !== null && names.size < limit) {
             if (m[1].length >= 3)
                 names.add(m[1]);
         }
@@ -47822,6 +48052,8 @@ async function run() {
             agents: agentRows,
             findings: all,
             runUrl,
+            headSha,
+            stateReviews: perReview.map((r) => ({ id: r.id, verdict: r.verdict, findings: r.findings })),
         });
         // Derived from actual agent outcomes, not from a hardcoded list of three
         // env var names — a config using key_from: env.GROQ_API_KEY used to be told
@@ -47901,6 +48133,7 @@ async function run() {
                     headSha,
                     runUrl,
                     extras,
+                    stateReviews: perReview.map((r) => ({ id: r.id, verdict: r.verdict, findings: r.findings })),
                 });
                 const { rotated } = await appendStickySection(octokit, owner, repo, prNumber, section);
                 logInfo(`Appended sticky section (verdict ${global}, ${all.length} findings${rotated ? ", rotated" : ""}).`);

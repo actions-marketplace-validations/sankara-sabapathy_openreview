@@ -221,6 +221,127 @@ function renderRunBody(opts: RunContentOpts): string[] {
 
 const REREVIEW_LINE = "<sub>Re-review with `/review`. Config: `.github/openreview.yml`.</sub>";
 
+/**
+ * Machine-readable run state for incremental re-review (issue #18).
+ *
+ * The next `synchronize` run needs two things no API gives it cheaply: the
+ * exact SHA it last reviewed (so it can diff head-vs-last instead of
+ * base..head) and that run's open findings (so agents can validate fixes
+ * instead of re-reporting). Both ride along as a hidden HTML comment —
+ * invisible to users, zero new storage, subject to the same STICKY_LIMIT
+ * rotation as everything else. Update mode carries one block; append mode
+ * one per section, and the parser takes the LAST valid block (latest run).
+ */
+export const STICKY_STATE_MARKER = "openreview:state";
+export const STICKY_STATE_VERSION = 1;
+/** Per-finding comment cap in state: enough to re-identify, not the full text. */
+export const STICKY_STATE_COMMENT_CAP = 500;
+/** Per-review finding cap in state; cut reviews set `truncated` so the next
+ * run knows the carry is partial and falls back to a full review. */
+export const STICKY_STATE_FINDINGS_CAP = 50;
+
+export type StickyFindingState = {
+  file: string;
+  line?: number;
+  severity: string;
+  category: string;
+  comment: string;
+};
+export type StickyReviewState = {
+  id: string;
+  verdict: string;
+  findings: StickyFindingState[];
+  truncated: boolean;
+};
+export type StickyRunState = {
+  v: number;
+  sha: string;
+  reviews: StickyReviewState[];
+};
+
+export function renderStickyState(
+  sha: string,
+  reviews: { id: string; verdict: string; findings: StickyFindingState[] }[]
+): string {
+  const state: StickyRunState = {
+    v: STICKY_STATE_VERSION,
+    sha,
+    reviews: reviews.map((r) => {
+      const kept = r.findings.slice(0, STICKY_STATE_FINDINGS_CAP);
+      return {
+        id: r.id,
+        verdict: r.verdict,
+        findings: kept.map((f) => ({
+          file: f.file,
+          ...(f.line !== undefined ? { line: f.line } : {}),
+          severity: f.severity,
+          category: f.category,
+          comment: f.comment.slice(0, STICKY_STATE_COMMENT_CAP),
+        })),
+        // Partial carry in either dimension (dropped findings or sliced
+        // comments) means the next run cannot trust the state as complete.
+        truncated:
+          r.findings.length > STICKY_STATE_FINDINGS_CAP ||
+          kept.some((f) => f.comment.length > STICKY_STATE_COMMENT_CAP),
+      };
+    }),
+  };
+  // Finding text is attacker-influenced (it quotes PR diffs). A literal
+  // `-->` inside would close the HTML comment early and corrupt or split
+  // the block; `<!--` would nest one. Both sequences are escaped with
+  // JSON unicode escapes, which JSON.parse decodes back byte-identically,
+  // so the round-trip is exact and the comment structure is intact.
+  const json = JSON.stringify(state).replace(/<!--/g, "\\u003c!--").replace(/-->/g, "--\\u003e");
+  return `<!-- ${STICKY_STATE_MARKER} ${json} -->`;
+}
+
+function isStickyFindingState(f: unknown): f is StickyFindingState {
+  const o = f as Record<string, unknown>;
+  return (
+    !!o &&
+    typeof o.file === "string" &&
+    (o.line === undefined || typeof o.line === "number") &&
+    typeof o.severity === "string" &&
+    typeof o.category === "string" &&
+    typeof o.comment === "string"
+  );
+}
+
+/** Latest valid state block in a sticky body, or null when none parses.
+ * Never throws: a hand-edited or truncated block is not state. */
+export function parseStickyState(body: string): StickyRunState | null {
+  const re = new RegExp(`<!-- ${STICKY_STATE_MARKER} (.*?) -->`, "gs");
+  let m: RegExpExecArray | null;
+  let last: StickyRunState | null = null;
+  while ((m = re.exec(body)) !== null) {
+    try {
+      const s = JSON.parse(m[1]) as Partial<StickyRunState>;
+      if (typeof s !== "object" || s === null || s.v !== STICKY_STATE_VERSION) continue;
+      if (typeof s.sha !== "string" || s.sha.length === 0) continue;
+      if (!Array.isArray(s.reviews)) continue;
+      const reviews: StickyReviewState[] = [];
+      let ok = true;
+      for (const r of s.reviews) {
+        const ro = r as Partial<StickyReviewState>;
+        if (!ro || typeof ro.id !== "string" || typeof ro.verdict !== "string" || !Array.isArray(ro.findings)) {
+          ok = false;
+          break;
+        }
+        if (!ro.findings.every(isStickyFindingState)) {
+          ok = false;
+          break;
+        }
+        reviews.push({ id: ro.id, verdict: ro.verdict, findings: ro.findings, truncated: ro.truncated === true });
+      }
+      if (!ok) continue;
+      last = { v: STICKY_STATE_VERSION, sha: s.sha, reviews };
+    } catch {
+      continue;
+    }
+  }
+  return last;
+}
+
 export function renderStickyBody(opts: {
   verdict: string;
   status?: RunStatus;
@@ -243,6 +364,8 @@ export function renderStickyBody(opts: {
     model: string;
   }[];
   runUrl?: string;
+  headSha?: string;
+  stateReviews?: { id: string; verdict: string; findings: StickyFindingState[] }[];
 }): string {
   const status = opts.status ?? "ok";
   const lines: string[] = [];
@@ -254,6 +377,7 @@ export function renderStickyBody(opts: {
   lines.push(`## OpenReview AI — ${verdictTitle(opts.verdict, status)}`);
   lines.push(...renderRunBody(opts));
   if (opts.runUrl) lines.push(`\n<sub>Run: ${opts.runUrl}</sub>`);
+  if (opts.headSha && opts.stateReviews) lines.push(`\n${renderStickyState(opts.headSha, opts.stateReviews)}`);
   lines.push(`\n${REREVIEW_LINE}`);
   return lines.join("\n");
 }
@@ -264,7 +388,12 @@ export function renderStickyBody(opts: {
  * footer extras (usage, warnings — assembled by the caller).
  */
 export function renderAppendSection(
-  opts: RunContentOpts & { headSha: string; runUrl?: string; extras?: string[] }
+  opts: RunContentOpts & {
+    headSha: string;
+    runUrl?: string;
+    extras?: string[];
+    stateReviews?: { id: string; verdict: string; findings: StickyFindingState[] }[];
+  }
 ): string {
   const status = opts.status ?? "ok";
   const short = opts.headSha.slice(0, 7);
@@ -274,6 +403,7 @@ export function renderAppendSection(
     ...renderRunBody(opts),
   ];
   for (const e of opts.extras ?? []) lines.push(e);
+  if (opts.stateReviews) lines.push(`\n${renderStickyState(opts.headSha, opts.stateReviews)}`);
   return lines.join("\n");
 }
 
