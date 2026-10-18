@@ -41,10 +41,34 @@ export type Finding = {
   /** Provider refs this finding votes under. Absent means `[provider]`; a
    * synthesized finding merging several agents' reports votes for each. */
   voters?: string[];
+  /** Incremental-review validation (issue #18): how the reporter classifies
+   * this finding against the previous round. Absent means "new". "fixed"
+   * findings are confirmed resolved: they neither show nor vote. */
+  status?: "fixed" | "open" | "new";
 };
 
 const FINDINGS_SCHEMA =
   '{"findings":[{"file":string,"line":number|null,"severity":"high|medium|suggestion","category":string,"comment":string,"confidence":0-1}]}';
+
+// Incremental reviews (issue #18) add per-finding validation against the
+// previous round, carried in the user message (see renderPriorReview).
+// The extra field is optional and defaults to "new", so a model that
+// ignores it degrades to reporting everything as new findings.
+const INCREMENTAL_SCHEMA =
+  '{"findings":[{"file":string,"line":number|null,"severity":"high|medium|suggestion","category":string,"comment":string,"confidence":0-1,"status":"fixed|open|new"}]}';
+
+const INCREMENTAL_GUIDANCE = (baseShort: string, headShort: string) =>
+  `This is an INCREMENTAL review: the diff above shows only what changed since the last review (${baseShort}..${headShort}), not the whole PR.
+Below are the previous round's open findings with their OLD line numbers - locations may have shifted, match by file and issue, never by exact line.
+For EACH prior finding, verify it against the current code and report it again with "status":"fixed" (resolved by the new changes or no longer present) or "status":"open" (still present, even if moved).
+Never re-report a prior finding as new. Report genuinely new issues from this diff with "status":"new".
+If nothing is fixed and nothing is new, reply {"findings":[]}.`;
+
+/** Incremental validation label (issue #18). Unknown values degrade to
+ * "new": a finding that is not confirmed fixed keeps voting. */
+export function normalizeStatus(value: unknown): "fixed" | "open" | "new" {
+  return value === "fixed" || value === "open" ? value : "new";
+}
 
 // The output contract is enforced in the prompt because `response_format` is
 // NOT reliable across gateways: some ignore it, and a free/preview model that
@@ -580,20 +604,31 @@ export async function runAgent(opts: {
   deadlineAt?: number;
   /** Rendered <prior_findings> block. Present = run as the synthesizer. */
   priorFindings?: string;
+  /** Rendered prior-round block for incremental reviews (issue #18).
+   * Present = incremental mode: validate each prior finding (fixed/open)
+   * and report only genuinely new issues as new. Independent of the
+   * synthesizer channel above; subagents get this, the synthesizer
+   * inherits validation through its cited sources. */
+  priorReview?: { baseShort: string; headShort: string; block: string };
 }): Promise<AgentResult> {
   const synth = opts.priorFindings !== undefined;
+  const incremental = opts.priorReview !== undefined;
   // The synthesizer also writes a summary and a per-file walkthrough, so it
   // gets twice the plain reviewer's output budget. extra_body.max_tokens
   // still overrides either (it is spread after this default).
   const maxTokens = synth ? 4000 : 2000;
   const system = synth ? SYNTH_SYSTEM(opts.lang, opts.instructions) : SYSTEM_WRAPPER(opts.lang, opts.instructions);
+  const schema = incremental && !synth ? INCREMENTAL_SCHEMA : FINDINGS_SCHEMA;
   let user = `Review this unified diff (truncated):\n\n${truncate(opts.diff, opts.maxDiffChars)}`;
   if (opts.contextBlock) {
     user += `\n\n${opts.contextBlock}\nGround every finding in the diff above; use <context> only as cross-file evidence (callers, types, contracts). Never flag context-only code.`;
   }
   if (synth) user += `\n\nFindings from the other reviewers:\n${opts.priorFindings}`;
+  if (incremental) {
+    user += `\n\n${INCREMENTAL_GUIDANCE(opts.priorReview!.baseShort, opts.priorReview!.headShort)}\n\nPrior round's open findings:\n${opts.priorReview!.block}`;
+  }
   // Restate the output contract last, after a long diff + context block.
-  user += synth ? SYNTH_REMINDER : SCHEMA_REMINDER;
+  user += synth ? SYNTH_REMINDER : `\n\nReminder: your entire reply must be one JSON object of this exact shape, nothing else:\n${schema}`;
   const rp = resolveProvider(opts.provider, opts.keys, process.env as any, opts.sessionId);
   // missing BYOK key -> report it as a skip so it can never read as a clean
   // review, and the caller can name the missing secret (issue #46)
@@ -768,6 +803,7 @@ export async function runAgent(opts: {
         agent: opts.agentName,
         provider: opts.providerName,
         model: opts.provider.model,
+        status: normalizeStatus((f as { status?: unknown }).status),
       });
     }
     const synthesis = synth ? parseSynthesis(parsed, rawFindings, kept) : undefined;

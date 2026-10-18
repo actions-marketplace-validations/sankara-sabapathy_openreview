@@ -118,6 +118,10 @@ reviews:
     # min_confidence: 0.6
     # max_findings: 10
     # suppress: ["decided-pattern"] # rebutted items that must not resurrect (regex, file + comment)
+    # Incremental re-review (issue #18): on synchronize, review head-vs-last-reviewed-SHA
+    # and carry prior findings for fix validation instead of re-reviewing base..head.
+    # Stays off here: dogfood reviews the whole branch every push.
+    # incremental: false
     # Cross-file context: full changed files + call-site excerpts automatic
     # (bounded by max_context_chars below); add explicit files when needed:
     # context_files: ["src/config.ts"]

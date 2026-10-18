@@ -46,6 +46,8 @@ reviews:
   - id: general-quality
     if_paths: ["**"] # which files this review SEES (the diff is scoped to these, too)
     main_mode: synthesize # default: main runs after the subagents and merges their findings; `parallel` = main is one more reviewer
+    # incremental: false # default: on synchronize, review head-vs-last-reviewed-SHA and
+    # carry prior findings for fix validation (see multi-review); /review always runs full
     main: # synthesizer; name defaults to "<id>:main"
       provider: go # or go.flash for a models entry; unknown `go.typo` fails the run naming both
       instructions: "Synthesize sub-agent findings. Strict on bugs, lenient on style."

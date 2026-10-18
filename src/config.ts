@@ -514,6 +514,11 @@ export const ReviewConfig = z.object({
   // Decided items: rebutted patterns suppressed before verdict math (win over
   // defaults.suppress when set).
   suppress: SuppressPatterns.optional(),
+  // Incremental re-review (issue #18): on `synchronize`, review only
+  // head-vs-last-reviewed-SHA (compare API, full-diff fallback) and carry
+  // the previous round's open findings for fix validation, instead of
+  // re-reviewing base..head from scratch. Manual `/review` always runs full.
+  incremental: z.boolean().default(false),
   main: AgentConfig,
   subagents: z.array(AgentConfig).default([]),
   verdict: VerdictConfig.default({}),
