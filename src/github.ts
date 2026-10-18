@@ -266,18 +266,25 @@ export function renderStickyState(
   const state: StickyRunState = {
     v: STICKY_STATE_VERSION,
     sha,
-    reviews: reviews.map((r) => ({
-      id: r.id,
-      verdict: r.verdict,
-      findings: r.findings.slice(0, STICKY_STATE_FINDINGS_CAP).map((f) => ({
-        file: f.file,
-        ...(f.line !== undefined ? { line: f.line } : {}),
-        severity: f.severity,
-        category: f.category,
-        comment: f.comment.slice(0, STICKY_STATE_COMMENT_CAP),
-      })),
-      truncated: r.findings.length > STICKY_STATE_FINDINGS_CAP,
-    })),
+    reviews: reviews.map((r) => {
+      const kept = r.findings.slice(0, STICKY_STATE_FINDINGS_CAP);
+      return {
+        id: r.id,
+        verdict: r.verdict,
+        findings: kept.map((f) => ({
+          file: f.file,
+          ...(f.line !== undefined ? { line: f.line } : {}),
+          severity: f.severity,
+          category: f.category,
+          comment: f.comment.slice(0, STICKY_STATE_COMMENT_CAP),
+        })),
+        // Partial carry in either dimension (dropped findings or sliced
+        // comments) means the next run cannot trust the state as complete.
+        truncated:
+          r.findings.length > STICKY_STATE_FINDINGS_CAP ||
+          kept.some((f) => f.comment.length > STICKY_STATE_COMMENT_CAP),
+      };
+    }),
   };
   return `<!-- ${STICKY_STATE_MARKER} ${JSON.stringify(state)} -->`;
 }

@@ -464,4 +464,18 @@ describe("sticky run state (issue #18 slice 0)", () => {
     assert.ok(parsed);
     assert.equal(parsed.reviews[0].truncated, true);
   });
+  it("truncated fires on sliced comments as well as dropped findings", () => {
+    const sliced = renderStickyState("s", [
+      {
+        id: "r",
+        verdict: "comment",
+        findings: [{ file: "a.ts", severity: "high", category: "bugs", comment: "x".repeat(STICKY_STATE_COMMENT_CAP + 1) }],
+      },
+    ]);
+    assert.equal(parseStickyState(sliced)?.reviews[0].truncated, true);
+    const intact = renderStickyState("s", [
+      { id: "r", verdict: "comment", findings: [{ file: "a.ts", severity: "high", category: "bugs", comment: "short" }] },
+    ]);
+    assert.equal(parseStickyState(intact)?.reviews[0].truncated, false);
+  });
 });
