@@ -83,6 +83,16 @@ For EACH prior finding, verify it against the current code and report it again w
 Never re-report a prior finding as new. Report genuinely new issues from this diff with "status":"new".
 If nothing is fixed and nothing is new, reply {"findings":[]}.`;
 
+/** Model confidence in [0,1] (issue #56: validate model fields). Numeric
+ * strings coerce ("0.9" used to become the 0.7 default); out-of-range values
+ * clamp instead of passing through (confidence: 5 used to pass every floor);
+ * anything else falls back to the 0.7 default. */
+export function normalizeConfidence(value: unknown): number {
+  const n = typeof value === "string" && value.trim() !== "" ? Number(value) : value;
+  if (typeof n !== "number" || !Number.isFinite(n)) return 0.7;
+  return Math.min(1, Math.max(0, n));
+}
+
 /** Incremental validation label (issue #18). Unknown values degrade to
  * "new": a finding that is not confirmed fixed keeps voting. */
 export function normalizeStatus(value: unknown): "fixed" | "open" | "new" {
@@ -836,7 +846,7 @@ export async function runAgent(opts: {
         severity: sev,
         category: String(f.category ?? "general"),
         comment: String(f.comment).slice(0, 1200),
-        confidence: typeof f.confidence === "number" ? f.confidence : 0.7,
+        confidence: normalizeConfidence((f as { confidence?: unknown }).confidence),
         agent: opts.agentName,
         provider: opts.providerName,
         model: opts.provider.model,

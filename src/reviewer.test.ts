@@ -19,6 +19,8 @@ import {
   renderPriorReview,
   matchCarriedFindings,
   PRIOR_FINDINGS_CAP,
+  dedupeFindings,
+  validateFindingFiles,
 } from "./reviewer.js";
 
 type V = "approve" | "comment" | "request_changes";
@@ -468,5 +470,81 @@ describe("matchCarriedFindings (issue #18)", () => {
       [C("a.ts", undefined, "File-level concern here", "fixed")]
     );
     assert.equal(m.fixed.length, 1);
+  });
+});
+
+describe("dedupeFindings merging (issue #56)", () => {
+  const F = (over: Record<string, unknown> = {}): {
+    file: string;
+    line?: number;
+    comment: string;
+    severity: "high" | "medium" | "suggestion";
+    confidence: number;
+    agent: string;
+    provider: string;
+    model: string;
+    voters?: string[];
+  } => ({
+    file: "a.ts",
+    line: 10,
+    comment: "Null dereference on user input path",
+    severity: "medium",
+    confidence: 0.6,
+    agent: "corr",
+    provider: "p1",
+    model: "m1",
+    ...over,
+  });
+  it("merges exact duplicates with combined attribution", () => {
+    const out = dedupeFindings([F({ agent: "corr" }), F({ agent: "main", confidence: 0.9 })]);
+    assert.equal(out.length, 1);
+    assert.equal(out[0].agent, "corr+main");
+    assert.equal(out[0].confidence, 0.9);
+    assert.deepEqual(out[0].voters, ["p1"]);
+  });
+  it("merges near-duplicates and keeps the stronger signal", () => {
+    const out = dedupeFindings([
+      F({ agent: "corr", provider: "p1", severity: "medium" as const, comment: "Null dereference on user input path" }),
+      F({ agent: "sec", provider: "p2", severity: "high" as const, comment: "Null dereference on the user input path!" }),
+    ]);
+    assert.equal(out.length, 1);
+    assert.equal(out[0].severity, "high");
+    assert.equal(out[0].agent, "corr+sec");
+    assert.deepEqual(out[0].voters, ["p1", "p2"]);
+  });
+  it("keeps genuinely different findings that share a comment prefix", () => {
+    const prefix = "x".repeat(80);
+    const out = dedupeFindings([
+      F({ comment: `${prefix} null deref` }),
+      F({ comment: `${prefix} use after free` }),
+    ]);
+    assert.equal(out.length, 2);
+  });
+  it("never merges across files or lines", () => {
+    assert.equal(dedupeFindings([F({}), F({ file: "b.ts" })]).length, 2);
+    assert.equal(dedupeFindings([F({}), F({ line: 20 })]).length, 2);
+    assert.equal(dedupeFindings([F({}), F({ line: undefined })]).length, 2);
+  });
+  it("never merges token-less comments (no signal is not a match)", () => {
+    assert.equal(dedupeFindings([F({ comment: "!!" }), F({ comment: "??" })]).length, 2);
+    assert.equal(dedupeFindings([F({ comment: "!!" }), F({ comment: "!!" })]).length, 1);
+  });
+});
+
+describe("validateFindingFiles (issue #56)", () => {
+  it("drops out-of-scope files and names them", () => {
+    const fs = [
+      { file: "src/a.ts", comment: "ok" },
+      { file: "website/b.md", comment: "drift" },
+    ];
+    const { visible, dropped } = validateFindingFiles(fs, ["src/a.ts"]);
+    assert.deepEqual(visible.map((f) => f.file), ["src/a.ts"]);
+    assert.deepEqual(dropped.map((f) => f.file), ["website/b.md"]);
+  });
+  it("keeps everything when all files are in scope", () => {
+    const fs = [{ file: "a.ts", comment: "x" }];
+    const { visible, dropped } = validateFindingFiles(fs, ["a.ts"]);
+    assert.equal(visible.length, 1);
+    assert.equal(dropped.length, 0);
   });
 });

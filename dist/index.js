@@ -45483,6 +45483,16 @@ Below are the previous round's open findings with their OLD line numbers - locat
 For EACH prior finding, verify it against the current code and report it again with "status":"fixed" (resolved by the new changes or no longer present) or "status":"open" (still present, even if moved).
 Never re-report a prior finding as new. Report genuinely new issues from this diff with "status":"new".
 If nothing is fixed and nothing is new, reply {"findings":[]}.`;
+/** Model confidence in [0,1] (issue #56: validate model fields). Numeric
+ * strings coerce ("0.9" used to become the 0.7 default); out-of-range values
+ * clamp instead of passing through (confidence: 5 used to pass every floor);
+ * anything else falls back to the 0.7 default. */
+function normalizeConfidence(value) {
+    const n = typeof value === "string" && value.trim() !== "" ? Number(value) : value;
+    if (typeof n !== "number" || !Number.isFinite(n))
+        return 0.7;
+    return Math.min(1, Math.max(0, n));
+}
 /** Incremental validation label (issue #18). Unknown values degrade to
  * "new": a finding that is not confirmed fixed keeps voting. */
 function normalizeStatus(value) {
@@ -46119,7 +46129,7 @@ async function runAgent(opts) {
                 severity: sev,
                 category: String(f.category ?? "general"),
                 comment: String(f.comment).slice(0, 1200),
-                confidence: typeof f.confidence === "number" ? f.confidence : 0.7,
+                confidence: normalizeConfidence(f.confidence),
                 agent: opts.agentName,
                 provider: opts.providerName,
                 model: opts.provider.model,
@@ -46540,17 +46550,80 @@ function parseHunkRanges(patch) {
 function lineInRanges(line, ranges) {
     return ranges.some((r) => line >= r.start && line <= r.end);
 }
+const DEDUPE_JACCARD = 0.8;
+function commentTokens(s) {
+    return new Set(s.toLowerCase().split(/[^a-z0-9_]+/).filter((t) => t.length >= 3));
+}
+function tokenJaccard(a, b) {
+    // No qualifying tokens on either side is no signal, not a perfect match:
+    // identical comments already merge via the exact-equality fast path.
+    if (a.size === 0 || b.size === 0)
+        return 0;
+    let inter = 0;
+    for (const t of a)
+        if (b.has(t))
+            inter++;
+    return inter / (a.size + b.size - inter);
+}
+const SEVERITY_RANK = { high: 0, medium: 1, suggestion: 2 };
+/**
+ * Near-duplicate merging (issue #56). Exact duplicates collapse with
+ * combined attribution, and same-file/same-line findings whose comments
+ * are near-identical (token-set Jaccard >= 0.8) merge into one row
+ * attributed to every reporting agent (confidence = max, severity = max),
+ * so two agents confirming one bug render once instead of twice — and the
+ * merged row keeps voting in each source provider's ballot via `voters`.
+ * Two genuinely different findings that merely share an 80-char comment
+ * prefix no longer collapse (the old key), and findings on different lines
+ * never merge even when the prose matches (repeated code patterns are
+ * distinct bugs until proven otherwise).
+ */
 function dedupeFindings(findings) {
-    const seen = new Set();
     const out = [];
+    const toks = [];
     for (const f of findings) {
-        const k = `${f.file}:${f.line ?? 0}:${f.comment.slice(0, 80)}`;
-        if (seen.has(k))
+        let at = -1;
+        for (let i = 0; i < out.length; i++) {
+            const o = out[i];
+            if (o.file !== f.file || (o.line ?? -1) !== (f.line ?? -1))
+                continue;
+            if (o.comment === f.comment || tokenJaccard(toks[i], commentTokens(f.comment)) >= DEDUPE_JACCARD) {
+                at = i;
+                break;
+            }
+        }
+        if (at < 0) {
+            out.push(f);
+            toks.push(commentTokens(f.comment));
             continue;
-        seen.add(k);
-        out.push(f);
+        }
+        const o = out[at];
+        const agents = [...new Set([...o.agent.split("+"), ...f.agent.split("+")])];
+        const voters = [...new Set([...(o.voters ?? [o.provider]), ...(f.voters ?? [f.provider])])];
+        out[at] = {
+            ...o,
+            severity: SEVERITY_RANK[o.severity] <= SEVERITY_RANK[f.severity] ? o.severity : f.severity,
+            confidence: Math.max(o.confidence, f.confidence),
+            agent: agents.join("+"),
+            voters,
+        };
+        toks[at] = new Set([...toks[at], ...commentTokens(f.comment)]);
     }
     return out;
+}
+/**
+ * Drop findings on files outside the review's scope (issue #56, field
+ * validation). Model output is untrusted: a finding on a file the review
+ * was never sent must neither show nor vote. Dropped findings are returned
+ * (not silently lost) so the caller can name them in the logs.
+ */
+function validateFindingFiles(findings, scopedFiles) {
+    const allowed = new Set(scopedFiles);
+    const visible = [];
+    const dropped = [];
+    for (const f of findings)
+        (allowed.has(f.file) ? visible : dropped).push(f);
+    return { visible, dropped };
 }
 /**
  * Drop findings matching decided-item patterns (rebutted items that must not
@@ -48595,6 +48668,16 @@ async function run() {
             const agentErrors = results.filter((r) => r.error).map((r) => `- \`${r.agent}\`: ${r.error}`);
             if (review.verdict.deduplicate)
                 findings = dedupeFindings(findings);
+            // Grounding (issue #56): a finding on a file this review never saw is
+            // model drift, not signal — it neither shows nor votes. Dropped files
+            // are named in the logs, never silently lost.
+            const fileCheck = validateFindingFiles(findings, scopedFiles);
+            if (fileCheck.dropped.length > 0) {
+                logWarning(`Review ${review.id}: dropped ${fileCheck.dropped.length} finding(s) on files outside the review scope: ` +
+                    fileCheck.dropped.slice(0, 3).map((f) => `\`${f.file}\``).join(", ") +
+                    (fileCheck.dropped.length > 3 ? ", ..." : ""));
+                findings = fileCheck.visible;
+            }
             // Decided items: rebutted patterns suppressed before verdict math —
             // they neither show nor vote. Per-review wins over defaults.suppress.
             const suppress = review.suppress ?? config.defaults.suppress ?? [];

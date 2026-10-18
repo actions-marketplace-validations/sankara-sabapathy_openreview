@@ -15,6 +15,7 @@ import {
   countsAsReview,
   normalizeStatus,
   normalizeSuggestion,
+  normalizeConfidence,
   findingSchema,
   SUGGESTION_CAP,
 } from "./providers.js";
@@ -764,6 +765,27 @@ describe("normalizeSuggestion (issue #22)", () => {
     assert.equal(normalizeSuggestion("   "), undefined);
     assert.equal(normalizeSuggestion(undefined), undefined);
     assert.equal(normalizeSuggestion(42), undefined);
+  });
+});
+
+describe("normalizeConfidence (issue #56)", () => {
+  it("passes through in-range numbers", () => {
+    assert.equal(normalizeConfidence(0.9), 0.9);
+    assert.equal(normalizeConfidence(0), 0);
+    assert.equal(normalizeConfidence(1), 1);
+  });
+  it("clamps out-of-range values instead of passing them through", () => {
+    assert.equal(normalizeConfidence(5), 1);
+    assert.equal(normalizeConfidence(-2), 0);
+  });
+  it("coerces numeric strings", () => {
+    assert.equal(normalizeConfidence("0.9"), 0.9);
+    assert.equal(normalizeConfidence(" 0.5 "), 0.5);
+  });
+  it("falls back to 0.7 for garbage", () => {
+    assert.equal(normalizeConfidence(undefined), 0.7);
+    assert.equal(normalizeConfidence("high"), 0.7);
+    assert.equal(normalizeConfidence(Number.NaN), 0.7);
   });
 });
 
