@@ -46555,8 +46555,10 @@ function commentTokens(s) {
     return new Set(s.toLowerCase().split(/[^a-z0-9_]+/).filter((t) => t.length >= 3));
 }
 function tokenJaccard(a, b) {
+    // No qualifying tokens on either side is no signal, not a perfect match:
+    // identical comments already merge via the exact-equality fast path.
     if (a.size === 0 || b.size === 0)
-        return a.size === b.size ? 1 : 0;
+        return 0;
     let inter = 0;
     for (const t of a)
         if (b.has(t))

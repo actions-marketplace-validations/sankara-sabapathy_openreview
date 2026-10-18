@@ -525,6 +525,10 @@ describe("dedupeFindings merging (issue #56)", () => {
     assert.equal(dedupeFindings([F({}), F({ line: 20 })]).length, 2);
     assert.equal(dedupeFindings([F({}), F({ line: undefined })]).length, 2);
   });
+  it("never merges token-less comments (no signal is not a match)", () => {
+    assert.equal(dedupeFindings([F({ comment: "!!" }), F({ comment: "??" })]).length, 2);
+    assert.equal(dedupeFindings([F({ comment: "!!" }), F({ comment: "!!" })]).length, 1);
+  });
 });
 
 describe("validateFindingFiles (issue #56)", () => {

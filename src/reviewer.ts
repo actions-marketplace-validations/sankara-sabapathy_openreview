@@ -238,7 +238,9 @@ function commentTokens(s: string): Set<string> {
 }
 
 function tokenJaccard(a: Set<string>, b: Set<string>): number {
-  if (a.size === 0 || b.size === 0) return a.size === b.size ? 1 : 0;
+  // No qualifying tokens on either side is no signal, not a perfect match:
+  // identical comments already merge via the exact-equality fast path.
+  if (a.size === 0 || b.size === 0) return 0;
   let inter = 0;
   for (const t of a) if (b.has(t)) inter++;
   return inter / (a.size + b.size - inter);
