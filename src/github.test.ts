@@ -434,4 +434,34 @@ describe("sticky run state (issue #18 slice 0)", () => {
     });
     assert.ok(!without.includes("openreview:state"));
   });
+  it("renderAppendSection embeds state that parses back", () => {
+    const section = renderAppendSection({
+      verdict: "comment",
+      perReview: [{ id: "general-quality", verdict: "comment", count: 1, counted: true }],
+      findings: [],
+      headSha: "def456",
+      stateReviews: reviews,
+    });
+    assert.ok(section.includes("openreview:state"));
+    const parsed = parseStickyState(section);
+    assert.ok(parsed);
+    assert.equal(parsed.sha, "def456");
+    assert.equal(parsed.reviews[0].id, "general-quality");
+    const bare = renderAppendSection({
+      verdict: "comment",
+      perReview: [{ id: "general-quality", verdict: "comment", count: 1, counted: true }],
+      findings: [],
+      headSha: "def456",
+    });
+    assert.ok(!bare.includes("openreview:state"));
+  });
+  it("truncated:true round-trips through parse", () => {
+    const body = renderStickyState("s", [
+      { id: "r", verdict: "comment", findings: [{ file: "a.ts", severity: "high", category: "bugs", comment: "x" }] },
+    ]);
+    const withTrunc = body.replace('"truncated":false', '"truncated":true');
+    const parsed = parseStickyState(withTrunc);
+    assert.ok(parsed);
+    assert.equal(parsed.reviews[0].truncated, true);
+  });
 });
