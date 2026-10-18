@@ -61,6 +61,32 @@ async function loadConfig(configPath: string) {
   );
 }
 
+/** How a review should run on this push (issue #18). Pure so the
+ * orchestration branches (carry / fallback / incremental) are unit-tested;
+ * run() only executes the decision. */
+export type IncrementalMode =
+  | { kind: "full"; reason: string }
+  | { kind: "incremental"; baseShort: string }
+  | { kind: "carry"; reason: "no-new-commits" | "no-new-in-scope-changes" };
+
+export function decideIncremental(opts: {
+  incremental: boolean;
+  isSynchronize: boolean;
+  prior: { sha: string; truncated: boolean } | null;
+  headSha: string;
+  incDiffOk: boolean;
+  incScopedEmpty: boolean;
+}): IncrementalMode {
+  if (!opts.incremental) return { kind: "full", reason: "review not opted in" };
+  if (!opts.isSynchronize) return { kind: "full", reason: "manual review always runs full" };
+  if (!opts.prior) return { kind: "full", reason: "no prior run state" };
+  if (opts.prior.truncated) return { kind: "full", reason: "prior state truncated" };
+  if (opts.prior.sha === opts.headSha) return { kind: "carry", reason: "no-new-commits" };
+  if (!opts.incDiffOk) return { kind: "full", reason: "incremental diff unavailable" };
+  if (opts.incScopedEmpty) return { kind: "carry", reason: "no-new-in-scope-changes" };
+  return { kind: "incremental", baseShort: opts.prior.sha.slice(0, 7) };
+}
+
 /** Cap for paginated file listing (issue #50). GitHub renders at most one page
  * of 100 files per listFiles call; a 150-file PR used to silently review only
  * the first 100. We paginate everything and review up to this many, reporting
@@ -497,23 +523,35 @@ export async function run(): Promise<void> {
     const parsedInc = incDiff ? splitDiff(incDiff.diff) : [];
     const incIgnore = config.defaults.ignore ?? [];
     for (const review of config.reviews) {
-      const prior = priorByReview.get(review.id);
-      const incWanted =
-        review.incremental && isSynchronize && !!prior && !prior.truncated && !!incDiff;
-      // No new commits since the last review, or no new in-scope changes:
-      // carry the previous verdict forward without spending provider budget.
-      // Fixes cannot have landed where nothing changed, so unvalidated
-      // priors stay open by construction, never silently dropped.
-      const carryReason =
-        review.incremental && isSynchronize && prior && !prior.truncated && prior.sha === headSha
-          ? "no new commits since the last review"
-          : null;
-      if (carryReason) {
-        const baseShort = prior!.sha.slice(0, 7);
-        logInfo(`Review ${review.id}: incremental carry (${carryReason}); ${prior!.findings.length} prior finding(s) stand.`);
+      const prior = priorByReview.get(review.id) ?? null;
+      const fullScoped = inScope.filter((f) => matchesAny(f, review.if_paths));
+      const incFiles = incDiff ? filterIgnored(incDiff.fileNames, incIgnore) : null;
+      const incScoped = incFiles ? incFiles.filter((f) => matchesAny(f, review.if_paths)) : null;
+      // One decision point for all three paths (issue #18): full review,
+      // incremental review of the additive diff, or carry without agents.
+      const mode = decideIncremental({
+        incremental: review.incremental,
+        isSynchronize,
+        prior: prior ? { sha: prior.sha, truncated: prior.truncated } : null,
+        headSha,
+        incDiffOk: incDiff !== null,
+        incScopedEmpty: incScoped !== null && incScoped.length === 0,
+      });
+      if (mode.kind === "carry") {
+        // No new commits, or no new in-scope changes: carry the previous
+        // verdict forward without spending provider budget. Fixes cannot
+        // have landed where nothing changed, so priors stay open by
+        // construction, never silently dropped. Carry implies prior state
+        // by decideIncremental's construction.
+        const p = prior!;
+        const why =
+          mode.reason === "no-new-commits"
+            ? "no new commits since the last review"
+            : "no new in-scope changes";
+        logInfo(`Review ${review.id}: incremental carry (${why}); ${p.findings.length} prior finding(s) stand.`);
         perReview.push({
           id: review.id,
-          verdict: prior!.verdict,
+          verdict: p.verdict,
           findings: [],
           dismissed: [],
           errors: [],
@@ -521,43 +559,18 @@ export async function run(): Promise<void> {
           postInline: review.verdict.post_inline !== false,
           agents: [],
           usage: [],
-          carried: prior!.findings,
+          carried: p.findings,
           ledger: [
-            `\n> 🔁 Incremental since \`${baseShort}\`: ${carryReason}; ` +
-              `${prior!.findings.length} prior finding(s) carried, verdict stands at ${prior!.verdict}.`,
+            `\n> 🔁 Incremental since \`${p.sha.slice(0, 7)}\`: ${why}; ` +
+              `${p.findings.length} prior finding(s) carried, verdict stands at ${p.verdict}.`,
           ],
         });
         continue;
       }
-      const incActive = incWanted && !!incDiff;
-      const baseFiles = incActive ? filterIgnored(incDiff!.fileNames, incIgnore) : inScope;
-      const scopedFiles = baseFiles.filter((f) => matchesAny(f, review.if_paths));
+      const incActive = mode.kind === "incremental";
+      const baseFiles = incActive ? incFiles! : inScope;
+      const scopedFiles = incActive ? incScoped! : fullScoped;
       if (scopedFiles.length === 0) {
-        if (incActive && prior) {
-          // Additive diff has nothing in scope: fixes may still have landed
-          // elsewhere, so priors stay open and the verdict stands.
-          const baseShort = prior.sha.slice(0, 7);
-          logInfo(
-            `Review ${review.id}: incremental carry (no new in-scope changes); ${prior.findings.length} prior finding(s) stand.`
-          );
-          perReview.push({
-            id: review.id,
-            verdict: prior.verdict,
-            findings: [],
-            dismissed: [],
-            errors: [],
-            counted: true,
-            postInline: review.verdict.post_inline !== false,
-            agents: [],
-            usage: [],
-            carried: prior.findings,
-            ledger: [
-              `\n> 🔁 Incremental since \`${baseShort}\`: no new in-scope changes; ` +
-                `${prior.findings.length} prior finding(s) carried, verdict stands at ${prior.verdict}.`,
-            ],
-          });
-          continue;
-        }
         logInfo(`Review ${review.id}: no matching paths, skipped.`);
         continue;
       }

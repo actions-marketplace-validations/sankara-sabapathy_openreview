@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { runPooled, getPrDiff, getIncrementalDiff, MAX_DIFF_FILES, summarizeUsage, selectInlineFindings } from "./main.js";
+import { runPooled, getPrDiff, getIncrementalDiff, decideIncremental, MAX_DIFF_FILES, summarizeUsage, selectInlineFindings } from "./main.js";
 
 describe("runPooled (issue #51)", () => {
   it("preserves result order regardless of completion order", async () => {
@@ -207,6 +207,41 @@ describe("selectInlineFindings (issue #53)", () => {
   });
   it("empty when everything opts out", () => {
     assert.deepEqual(selectInlineFindings([{ postInline: false, findings: [f("a.ts")] }]), []);
+  });
+});
+
+describe("decideIncremental (issue #18)", () => {
+  const base = {
+    incremental: true,
+    isSynchronize: true,
+    prior: { sha: "base0000", truncated: false },
+    headSha: "head1234",
+    incDiffOk: true,
+    incScopedEmpty: false,
+  };
+  it("runs incremental when opted in with usable prior state and new changes", () => {
+    const m = decideIncremental(base);
+    assert.equal(m.kind, "incremental");
+    if (m.kind === "incremental") assert.equal(m.baseShort, "base000");
+  });
+  it("falls back to full without opt-in, off synchronize, or without prior", () => {
+    assert.equal(decideIncremental({ ...base, incremental: false }).kind, "full");
+    assert.equal(decideIncremental({ ...base, isSynchronize: false }).kind, "full");
+    assert.equal(decideIncremental({ ...base, prior: null }).kind, "full");
+  });
+  it("falls back to full on truncated state or missing diff", () => {
+    assert.equal(decideIncremental({ ...base, prior: { sha: "base0000", truncated: true } }).kind, "full");
+    assert.equal(decideIncremental({ ...base, incDiffOk: false }).kind, "full");
+  });
+  it("carries when nothing new landed or nothing new is in scope", () => {
+    assert.deepEqual(decideIncremental({ ...base, headSha: "base0000" }), {
+      kind: "carry",
+      reason: "no-new-commits",
+    });
+    assert.deepEqual(decideIncremental({ ...base, incScopedEmpty: true }), {
+      kind: "carry",
+      reason: "no-new-in-scope-changes",
+    });
   });
 });
 
