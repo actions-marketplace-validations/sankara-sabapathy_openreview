@@ -58,6 +58,14 @@ describe("maskTemplateLiterals (issue #87)", () => {
     const names = extractDefinedNames('const s = "`";\nexport function real() {}');
     assert.ok(names.includes("real"));
   });
+  it("does not let a backtick inside a line comment mask real code", () => {
+    const names = extractDefinedNames("// use `ticks` for code\n// a lone ` here\nexport function real() {}");
+    assert.ok(names.includes("real"));
+  });
+  it("keeps http:// inside strings untouched", () => {
+    const names = extractDefinedNames('const u = "http://x";\nexport function real() {}');
+    assert.ok(names.includes("real"));
+  });
   it("preserves length and newline positions", () => {
     const src = "export function real() {}\nconst t = `a${x}b\nc`;\n/* c */\n";
     const masked = maskTemplateLiterals(src);

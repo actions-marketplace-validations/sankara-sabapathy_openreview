@@ -46990,6 +46990,21 @@ function maskTemplateLiterals(content) {
                 }
                 continue;
             }
+            if (ch === "/" && next === "/") {
+                // `//` line comment: mask to end of line. A backtick inside the
+                // comment must not open template masking (dogfood on #89). Runs
+                // after string skipping, so `http://...` inside quotes is safe.
+                // Masking stops at the newline, so a `}` closing an interpolation
+                // on a later line is still seen; a `}` after `//` on the same
+                // line is a real comment and correctly ignored.
+                out.push(" ", " ");
+                i += 2;
+                while (i < n && content[i] !== "\n") {
+                    out.push(" ");
+                    i++;
+                }
+                continue;
+            }
             if (stack.length > 0) {
                 if (ch === "{") {
                     stack[stack.length - 1]++;
