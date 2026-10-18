@@ -8,6 +8,7 @@ import {
   extractFindingsJson,
   describeResponseShape,
   runAgent,
+  runTextAgent,
   AgentFailedError,
   resolveDottedProvider,
   assertProviderRefs,
@@ -763,5 +764,81 @@ describe("normalizeSuggestion (issue #22)", () => {
     assert.equal(normalizeSuggestion("   "), undefined);
     assert.equal(normalizeSuggestion(undefined), undefined);
     assert.equal(normalizeSuggestion(42), undefined);
+  });
+});
+
+describe("runTextAgent (issue #23)", () => {
+  const cfg = parseConfig({
+    version: 1,
+    providers: { oai: { model: "m", kind: "openai", base_url: "http://127.0.0.1:1/v1" } },
+    reviews: [{ id: "r", main: { provider: "oai", instructions: "i" } }],
+  });
+  const keys = {
+    anthropicApiKey: "",
+    openaiApiKey: "k",
+    opencodeApiKey: "",
+    opencodeBaseUrl: "",
+    githubToken: "",
+  };
+  const base = {
+    agentName: "ask",
+    providerName: "oai",
+    provider: cfg.providers.oai,
+    system: "s",
+    user: "u",
+    keys,
+    sessionId: "s",
+  };
+  const chat = (content: string, usage: any) =>
+    new Response(JSON.stringify({ choices: [{ message: { content } }], usage }));
+  const withFetch = async (impl: (url: any, init: any) => Promise<Response>, fn: () => Promise<any>) => {
+    const real = globalThis.fetch;
+    globalThis.fetch = impl as any;
+    try {
+      return await fn();
+    } finally {
+      globalThis.fetch = real;
+    }
+  };
+
+  it("returns trimmed prose with spend accounted", async () => {
+    const r = await withFetch(
+      async () => chat("  The bug is fixed.  ", { prompt_tokens: 100, completion_tokens: 20 }),
+      () => runTextAgent(base)
+    );
+    assert.equal(r.text, "The bug is fixed.");
+    assert.equal(r.outcome, "ok");
+    assert.deepEqual(r.usage, { in: 100, out: 20 });
+    assert.equal(r.attempts, 1);
+  });
+
+  it("sends no response_format so the answer stays prose", async () => {
+    let sent: any = null;
+    await withFetch(
+      async (_url: any, init: any) => {
+        sent = JSON.parse(init.body);
+        return chat("hi", { prompt_tokens: 1, completion_tokens: 1 });
+      },
+      () => runTextAgent(base)
+    );
+    assert.ok(!("response_format" in sent), "prose call must not force JSON");
+  });
+
+  it("retries an empty answer once, then throws with spend", async () => {
+    let n = 0;
+    const err = await withFetch(async () => {
+      n++;
+      return chat("", { prompt_tokens: 10, completion_tokens: 5 });
+    }, () => runTextAgent(base).then(() => null, (e) => e));
+    assert.ok(err instanceof AgentFailedError);
+    assert.equal(n, 2);
+    assert.deepEqual(err.usageTotal, { in: 20, out: 10 });
+  });
+
+  it("skips without a key and refuses past the deadline", async () => {
+    const noKey = await runTextAgent({ ...base, keys: { ...keys, openaiApiKey: "" } });
+    assert.equal(noKey.outcome, "skipped-no-key");
+    const late = await runTextAgent({ ...base, deadlineAt: Date.now() - 1 });
+    assert.equal(late.outcome, "budget-exhausted");
   });
 });
