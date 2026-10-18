@@ -424,9 +424,12 @@ async function runAskFlow(opts: AskFlowOpts): Promise<void> {
     logInfo(`DRY RUN ask answer (model ${provider.model}):\n${(answer || "(no answer)").slice(0, 2000)}`);
     return;
   }
+  // The answer carries its own marker so reaction collection (which scans
+  // bot comments by `<!-- openreview:` prefix) includes answers. It is NOT
+  // the sticky marker, so sticky lookup (first-line match) never selects it.
   const body = answer
-    ? `**OpenReview answer** (to \`${opts.question.slice(0, 120)}\`)\n\n${answer}\n\n<sub>Answered with \`${modelLine || provider.model}\` · react on this comment to teach future reviews · ask again with \`/ask\`</sub>`
-    : `OpenReview could not answer that (model ${provider.model} returned nothing usable). Try rephrasing, or run a fresh review with \`/review\`.`;
+    ? `<!-- openreview:answer -->\n**OpenReview answer** (to \`${opts.question.slice(0, 120)}\`)\n\n${answer}\n\n<sub>Answered with \`${modelLine || provider.model}\` · react on this comment to teach future reviews · ask again with \`/ask\`</sub>`
+    : `<!-- openreview:answer -->\nOpenReview could not answer that (model ${provider.model} returned nothing usable). Try rephrasing, or run a fresh review with \`/review\`.`;
   await octokit.rest.issues.createComment({ owner, repo, issue_number: prNumber, body });
   logInfo(`Ask: answered question (${opts.question.slice(0, 80)}).`);
   const signals = await collectFeedbackSignals(octokit, owner, repo, prNumber);
