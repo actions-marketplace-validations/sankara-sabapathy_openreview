@@ -465,18 +465,7 @@ describe("sticky run state (issue #18 slice 0)", () => {
     assert.equal(parsed.reviews[0].truncated, true);
   });
   it("truncated fires on sliced comments as well as dropped findings", () => {
-
-  it("finding text containing --> or <!-- round-trips without breaking the comment", () => {
-    const comment = "Fix `a --> b` and <!-- note --> then done.";
-    const body = renderStickyState("s", [
-      { id: "r", verdict: "comment", findings: [{ file: "a.ts", severity: "high", category: "bugs", comment }] },
-    ]);
-    // Only the block's own closer may contain -->.
-    assert.equal(body.split("-->").length - 1, 1);
-    const parsed = parseStickyState(body);
-    assert.ok(parsed);
-    assert.equal(parsed.reviews[0].findings[0].comment, comment);
-  });    const sliced = renderStickyState("s", [
+    const sliced = renderStickyState("s", [
       {
         id: "r",
         verdict: "comment",
@@ -488,5 +477,16 @@ describe("sticky run state (issue #18 slice 0)", () => {
       { id: "r", verdict: "comment", findings: [{ file: "a.ts", severity: "high", category: "bugs", comment: "short" }] },
     ]);
     assert.equal(parseStickyState(intact)?.reviews[0].truncated, false);
+  });
+  it("finding text containing --> or <!-- round-trips without breaking the comment", () => {
+    const comment = "Fix `a --> b` and <!-- note --> then done.";
+    const body = renderStickyState("s", [
+      { id: "r", verdict: "comment", findings: [{ file: "a.ts", severity: "high", category: "bugs", comment }] },
+    ]);
+    // Only the block's own closer may contain -->.
+    assert.equal(body.split("-->").length - 1, 1);
+    const parsed = parseStickyState(body);
+    assert.ok(parsed);
+    assert.equal(parsed.reviews[0].findings[0].comment, comment);
   });
 });
