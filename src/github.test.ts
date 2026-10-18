@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { renderStickyBody, upsertStickyComment, createInlineReview, renderAppendSection, appendToSticky, appendStickySection, STICKY_MARKER, STICKY_LIMIT } from "./github.js";
+import { renderStickyBody, upsertStickyComment, createInlineReview, renderAppendSection, appendToSticky, appendStickySection, STICKY_MARKER, STICKY_LIMIT, renderStickyState, parseStickyState, STICKY_STATE_COMMENT_CAP, STICKY_STATE_FINDINGS_CAP } from "./github.js";
 import { countsAsReview, type AgentOutcome } from "./providers.js";
 
 const base = { findings: [], runUrl: "https://example.test/run/1" };
@@ -358,5 +358,135 @@ describe("rotation bookkeeping (dogfood on #75)", () => {
     ];
     const found = await findStickyComment(octokit, "o", "r", 7);
     assert.equal(found?.id, 5);
+  });
+});
+
+describe("sticky run state (issue #18 slice 0)", () => {
+  const reviews = [
+    {
+      id: "general-quality",
+      verdict: "comment",
+      findings: [
+        { file: "src/a.ts", line: 12, severity: "high", category: "bugs", comment: "Null deref." },
+        { file: "docs/b.md", severity: "suggestion", category: "docs", comment: "Typo." },
+      ],
+    },
+  ];
+  it("round-trips through render and parse", () => {
+    const body = `header\n${renderStickyState("abc123", reviews)}\ntrailer`;
+    const parsed = parseStickyState(body);
+    assert.ok(parsed);
+    assert.equal(parsed.sha, "abc123");
+    assert.equal(parsed.v, 1);
+    assert.deepEqual(parsed.reviews, [
+      {
+        id: "general-quality",
+        verdict: "comment",
+        findings: [
+          { file: "src/a.ts", line: 12, severity: "high", category: "bugs", comment: "Null deref." },
+          { file: "docs/b.md", severity: "suggestion", category: "docs", comment: "Typo." },
+        ],
+        truncated: false,
+      },
+    ]);
+  });
+  it("returns null when no block, on corrupt JSON, or on wrong version", () => {
+    assert.equal(parseStickyState("no state here"), null);
+    assert.equal(parseStickyState("<!-- openreview:state {oops -->"), null);
+    assert.equal(parseStickyState('<!-- openreview:state {"v":99,"sha":"x","reviews":[]} -->'), null);
+    assert.equal(parseStickyState('<!-- openreview:state {"v":1,"reviews":[]} -->'), null);
+    assert.equal(
+      parseStickyState('<!-- openreview:state {"v":1,"sha":"x","reviews":[{"id":"r"}]} -->'),
+      null
+    );
+  });
+  it("last valid block wins (append mode history)", () => {
+    const body = [renderStickyState("old", []), "### run 2", renderStickyState("new", [])].join("\n");
+    assert.equal(parseStickyState(body)?.sha, "new");
+  });
+  it("caps comment length and finding count, flagging truncation", () => {
+    const many = Array.from({ length: STICKY_STATE_FINDINGS_CAP + 5 }, (_, i) => ({
+      file: `f${i}.ts`,
+      severity: "medium",
+      category: "style",
+      comment: "x".repeat(STICKY_STATE_COMMENT_CAP + 10),
+    }));
+    const parsed = parseStickyState(renderStickyState("s", [{ id: "r", verdict: "comment", findings: many }]));
+    assert.ok(parsed);
+    assert.equal(parsed.reviews[0].findings.length, STICKY_STATE_FINDINGS_CAP);
+    assert.equal(parsed.reviews[0].truncated, true);
+    assert.equal(parsed.reviews[0].findings[0].comment.length, STICKY_STATE_COMMENT_CAP);
+  });
+  it("renderStickyBody embeds state only when headSha and reviews are given", () => {
+    const withState = renderStickyBody({
+      ...base,
+      verdict: "comment",
+      perReview: [{ id: "general-quality", verdict: "comment", count: 1, counted: true }],
+      headSha: "abc123",
+      stateReviews: reviews,
+    });
+    assert.ok(withState.includes("openreview:state"));
+    assert.equal(parseStickyState(withState)?.sha, "abc123");
+    const without = renderStickyBody({
+      ...base,
+      verdict: "comment",
+      perReview: [{ id: "general-quality", verdict: "comment", count: 1, counted: true }],
+    });
+    assert.ok(!without.includes("openreview:state"));
+  });
+  it("renderAppendSection embeds state that parses back", () => {
+    const section = renderAppendSection({
+      verdict: "comment",
+      perReview: [{ id: "general-quality", verdict: "comment", count: 1, counted: true }],
+      findings: [],
+      headSha: "def456",
+      stateReviews: reviews,
+    });
+    assert.ok(section.includes("openreview:state"));
+    const parsed = parseStickyState(section);
+    assert.ok(parsed);
+    assert.equal(parsed.sha, "def456");
+    assert.equal(parsed.reviews[0].id, "general-quality");
+    const bare = renderAppendSection({
+      verdict: "comment",
+      perReview: [{ id: "general-quality", verdict: "comment", count: 1, counted: true }],
+      findings: [],
+      headSha: "def456",
+    });
+    assert.ok(!bare.includes("openreview:state"));
+  });
+  it("truncated:true round-trips through parse", () => {
+    const body = renderStickyState("s", [
+      { id: "r", verdict: "comment", findings: [{ file: "a.ts", severity: "high", category: "bugs", comment: "x" }] },
+    ]);
+    const withTrunc = body.replace('"truncated":false', '"truncated":true');
+    const parsed = parseStickyState(withTrunc);
+    assert.ok(parsed);
+    assert.equal(parsed.reviews[0].truncated, true);
+  });
+  it("truncated fires on sliced comments as well as dropped findings", () => {
+    const sliced = renderStickyState("s", [
+      {
+        id: "r",
+        verdict: "comment",
+        findings: [{ file: "a.ts", severity: "high", category: "bugs", comment: "x".repeat(STICKY_STATE_COMMENT_CAP + 1) }],
+      },
+    ]);
+    assert.equal(parseStickyState(sliced)?.reviews[0].truncated, true);
+    const intact = renderStickyState("s", [
+      { id: "r", verdict: "comment", findings: [{ file: "a.ts", severity: "high", category: "bugs", comment: "short" }] },
+    ]);
+    assert.equal(parseStickyState(intact)?.reviews[0].truncated, false);
+  });
+  it("finding text containing --> or <!-- round-trips without breaking the comment", () => {
+    const comment = "Fix `a --> b` and <!-- note --> then done.";
+    const body = renderStickyState("s", [
+      { id: "r", verdict: "comment", findings: [{ file: "a.ts", severity: "high", category: "bugs", comment }] },
+    ]);
+    // Only the block's own closer may contain -->.
+    assert.equal(body.split("-->").length - 1, 1);
+    const parsed = parseStickyState(body);
+    assert.ok(parsed);
+    assert.equal(parsed.reviews[0].findings[0].comment, comment);
   });
 });
