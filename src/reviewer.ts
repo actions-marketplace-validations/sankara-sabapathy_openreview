@@ -217,18 +217,95 @@ export function lineInRanges(line: number, ranges: { start: number; end: number 
   return ranges.some((r) => line >= r.start && line <= r.end);
 }
 
-export function dedupeFindings<T extends { file: string; line?: number; comment: string }>(
-  findings: T[]
-): T[] {
-  const seen = new Set<string>();
+/** Findings that can be merged by dedupeFindings: identity plus the fields
+ * a merge combines (agents, providers, confidence, severity). */
+export type MergeableFinding = {
+  file: string;
+  line?: number;
+  comment: string;
+  severity: "high" | "medium" | "suggestion";
+  confidence: number;
+  agent: string;
+  provider: string;
+  model: string;
+  voters?: string[];
+};
+
+const DEDUPE_JACCARD = 0.8;
+
+function commentTokens(s: string): Set<string> {
+  return new Set(s.toLowerCase().split(/[^a-z0-9_]+/).filter((t) => t.length >= 3));
+}
+
+function tokenJaccard(a: Set<string>, b: Set<string>): number {
+  if (a.size === 0 || b.size === 0) return a.size === b.size ? 1 : 0;
+  let inter = 0;
+  for (const t of a) if (b.has(t)) inter++;
+  return inter / (a.size + b.size - inter);
+}
+
+const SEVERITY_RANK = { high: 0, medium: 1, suggestion: 2 } as const;
+
+/**
+ * Near-duplicate merging (issue #56). Exact duplicates collapse with
+ * combined attribution, and same-file/same-line findings whose comments
+ * are near-identical (token-set Jaccard >= 0.8) merge into one row
+ * attributed to every reporting agent (confidence = max, severity = max),
+ * so two agents confirming one bug render once instead of twice — and the
+ * merged row keeps voting in each source provider's ballot via `voters`.
+ * Two genuinely different findings that merely share an 80-char comment
+ * prefix no longer collapse (the old key), and findings on different lines
+ * never merge even when the prose matches (repeated code patterns are
+ * distinct bugs until proven otherwise).
+ */
+export function dedupeFindings<T extends MergeableFinding>(findings: T[]): T[] {
   const out: T[] = [];
+  const toks: Set<string>[] = [];
   for (const f of findings) {
-    const k = `${f.file}:${f.line ?? 0}:${f.comment.slice(0, 80)}`;
-    if (seen.has(k)) continue;
-    seen.add(k);
-    out.push(f);
+    let at = -1;
+    for (let i = 0; i < out.length; i++) {
+      const o = out[i];
+      if (o.file !== f.file || (o.line ?? -1) !== (f.line ?? -1)) continue;
+      if (o.comment === f.comment || tokenJaccard(toks[i], commentTokens(f.comment)) >= DEDUPE_JACCARD) {
+        at = i;
+        break;
+      }
+    }
+    if (at < 0) {
+      out.push(f);
+      toks.push(commentTokens(f.comment));
+      continue;
+    }
+    const o = out[at];
+    const agents = [...new Set([...o.agent.split("+"), ...f.agent.split("+")])];
+    const voters = [...new Set([...(o.voters ?? [o.provider]), ...(f.voters ?? [f.provider])])];
+    out[at] = {
+      ...o,
+      severity: SEVERITY_RANK[o.severity] <= SEVERITY_RANK[f.severity] ? o.severity : f.severity,
+      confidence: Math.max(o.confidence, f.confidence),
+      agent: agents.join("+"),
+      voters,
+    };
+    toks[at] = new Set([...toks[at], ...commentTokens(f.comment)]);
   }
   return out;
+}
+
+/**
+ * Drop findings on files outside the review's scope (issue #56, field
+ * validation). Model output is untrusted: a finding on a file the review
+ * was never sent must neither show nor vote. Dropped findings are returned
+ * (not silently lost) so the caller can name them in the logs.
+ */
+export function validateFindingFiles<T extends { file: string; comment: string }>(
+  findings: T[],
+  scopedFiles: string[]
+): { visible: T[]; dropped: T[] } {
+  const allowed = new Set(scopedFiles);
+  const visible: T[] = [];
+  const dropped: T[] = [];
+  for (const f of findings) (allowed.has(f.file) ? visible : dropped).push(f);
+  return { visible, dropped };
 }
 
 /**

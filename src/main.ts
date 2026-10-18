@@ -20,7 +20,7 @@ import {
 import {
   matchesAny, filterIgnored, dedupeFindings, applySuppression, decideReviewVerdict, combineVerdicts, combineBallots,
   applyDegradedFloor, resolveNoise, applyNoiseControls, splitDiff, scopeDiff, parseHunkRanges, type Verdict,
-  satisfiesActionVersion, runningActionVersion, renderPriorReview, matchCarriedFindings,
+  satisfiesActionVersion, runningActionVersion, renderPriorReview, matchCarriedFindings, validateFindingFiles,
 } from "./reviewer.js";
 import { parseAskComment, buildAskPrompt, collectFeedbackSignals, isAskAllowed, resolveAskProvider } from "./ask.js";
 import { renderStickyBody, upsertStickyComment, appendStickySection, renderAppendSection, createInlineReview, findStickyComment, parseStickyState, type RunStatus, type StickyFindingState } from "./github.js";
@@ -864,6 +864,18 @@ export async function run(): Promise<void> {
       }
       const agentErrors = results.filter((r) => r.error).map((r) => `- \`${r.agent}\`: ${r.error}`);
       if (review.verdict.deduplicate) findings = dedupeFindings(findings);
+      // Grounding (issue #56): a finding on a file this review never saw is
+      // model drift, not signal — it neither shows nor votes. Dropped files
+      // are named in the logs, never silently lost.
+      const fileCheck = validateFindingFiles(findings, scopedFiles);
+      if (fileCheck.dropped.length > 0) {
+        logWarning(
+          `Review ${review.id}: dropped ${fileCheck.dropped.length} finding(s) on files outside the review scope: ` +
+            fileCheck.dropped.slice(0, 3).map((f) => `\`${f.file}\``).join(", ") +
+            (fileCheck.dropped.length > 3 ? ", ..." : "")
+        );
+        findings = fileCheck.visible;
+      }
       // Decided items: rebutted patterns suppressed before verdict math —
       // they neither show nor vote. Per-review wins over defaults.suppress.
       const suppress = review.suppress ?? config.defaults.suppress ?? [];
