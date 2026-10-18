@@ -168,6 +168,12 @@ describe("mergeSynthesis", () => {
     const out = mergeSynthesis(labeled, [main({ comment: "done", status: "fixed" })], synth({ sources: [["F1"]] }));
     assert.equal(out.findings[0].status, "fixed");
   });
+
+  it("carries suggestions through the merge (issue #22)", () => {
+    const labeled = labelFindings([f({ comment: "bug", status: "open", suggestion: "fix();" })]);
+    const out = mergeSynthesis(labeled, [main({ comment: "merged bug" })], synth({ sources: [["F1"]] }));
+    assert.equal(out.findings[0].suggestion, "fix();");
+  });
 });
 
 describe("runReviewAgents", () => {

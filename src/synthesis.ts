@@ -148,9 +148,17 @@ export function mergeSynthesis(
         : origins.some((o) => (o.status ?? "new") === "new")
           ? ("new" as const)
           : ("open" as const);
+    // Suggestions ride the same path (issue #22): an explicit synthesizer
+    // suggestion wins, otherwise the first cited source's survives.
+    const inheritedSuggestion = origins.map((o) => o.suggestion).find((s) => s !== undefined);
     out.push({
       ...f,
       status: f.status ?? inherited,
+      ...(f.suggestion !== undefined
+        ? {}
+        : inheritedSuggestion !== undefined
+          ? { suggestion: inheritedSuggestion }
+          : {}),
       agent: agents.join("+"),
       provider: origins[0].provider,
       model: origins[0].model,

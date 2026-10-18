@@ -45032,6 +45032,10 @@ const ReviewConfig = objectType({
     // the previous round's open findings for fix validation, instead of
     // re-reviewing base..head from scratch. Manual `/review` always runs full.
     incremental: booleanType().default(false),
+    // One-click fixes (issue #22): agents attach full replacement lines as
+    // `suggestion`, rendered as GitHub ```suggestion blocks when the finding
+    // is line-mappable and fenced code otherwise. Off saves output tokens.
+    suggest_fixes: booleanType().default(true),
     main: AgentConfig,
     subagents: arrayType(AgentConfig).default([]),
     verdict: VerdictConfig.default({}),
@@ -45412,9 +45416,17 @@ function mergeSynthesis(labeled, synthFindings, synth) {
             : origins.some((o) => (o.status ?? "new") === "new")
                 ? "new"
                 : "open";
+        // Suggestions ride the same path (issue #22): an explicit synthesizer
+        // suggestion wins, otherwise the first cited source's survives.
+        const inheritedSuggestion = origins.map((o) => o.suggestion).find((s) => s !== undefined);
         out.push({
             ...f,
             status: f.status ?? inherited,
+            ...(f.suggestion !== undefined
+                ? {}
+                : inheritedSuggestion !== undefined
+                    ? { suggestion: inheritedSuggestion }
+                    : {}),
             agent: agents.join("+"),
             provider: origins[0].provider,
             model: origins[0].model,
@@ -45450,11 +45462,22 @@ function resolveKeysFromEnv(env) {
     };
 }
 const FINDINGS_SCHEMA = '{"findings":[{"file":string,"line":number|null,"severity":"high|medium|suggestion","category":string,"comment":string,"confidence":0-1}]}';
-// Incremental reviews (issue #18) add per-finding validation against the
-// previous round, carried in the user message (see renderPriorReview).
-// The extra field is optional and defaults to "new", so a model that
-// ignores it degrades to reporting everything as new findings.
-const INCREMENTAL_SCHEMA = '{"findings":[{"file":string,"line":number|null,"severity":"high|medium|suggestion","category":string,"comment":string,"confidence":0-1,"status":"fixed|open|new"}]}';
+// Incremental reviews (issue #18) and suggested fixes (issue #22) extend the
+// contract via findingSchema() below. Extra fields are optional and degrade
+// gracefully, so a model that ignores one still returns usable findings.
+// One-click fixes (issue #22): full replacement lines, rendered as a
+// ```suggestion block when the finding posts inline on a valid line.
+const SUGGESTION_FIELD = `,"suggestion":"string, full replacement lines for the flagged code (omit when unsure)"`;
+const SUGGESTION_GUIDANCE = `When you know the fix, add "suggestion" with the FULL replacement lines for the flagged code (complete lines, not a diff, no fences). Only suggest code you are confident compiles and fixes the issue; omit the field when unsure.`;
+/** Output contract variant for the extra optional fields a review enables.
+ * Additive only: a model that ignores an extra field degrades gracefully
+ * (status defaults to new, a missing suggestion just renders no fix block). */
+function findingSchema(opts) {
+    const status = opts.status ? `,"status":"fixed|open|new"` : "";
+    const suggestion = opts.suggestion ? SUGGESTION_FIELD : "";
+    return ('{"findings":[{"file":string,"line":number|null,"severity":"high|medium|suggestion",' +
+        `"category":string,"comment":string,"confidence":0-1${status}${suggestion}}]}`);
+}
 const INCREMENTAL_GUIDANCE = (baseShort, headShort) => `This is an INCREMENTAL review: the diff above shows only what changed since the last review (${baseShort}..${headShort}), not the whole PR.
 Below are the previous round's open findings with their OLD line numbers - locations may have shifted, match by file and issue, never by exact line.
 For EACH prior finding, verify it against the current code and report it again with "status":"fixed" (resolved by the new changes or no longer present) or "status":"open" (still present, even if moved).
@@ -45464,6 +45487,18 @@ If nothing is fixed and nothing is new, reply {"findings":[]}.`;
  * "new": a finding that is not confirmed fixed keeps voting. */
 function normalizeStatus(value) {
     return value === "fixed" || value === "open" ? value : "new";
+}
+/** Suggested replacement lines (issue #22). Empty or non-string values mean
+ * "no suggestion"; overlong blocks are cut (a suggestion must fit in a
+ * review comment). Fences are stripped at render time, not here. */
+const SUGGESTION_CAP = 1500;
+function normalizeSuggestion(value) {
+    if (typeof value !== "string")
+        return undefined;
+    const trimmed = value.trim();
+    if (!trimmed)
+        return undefined;
+    return trimmed.slice(0, SUGGESTION_CAP);
 }
 // The output contract is enforced in the prompt because `response_format` is
 // NOT reliable across gateways: some ignore it, and a free/preview model that
@@ -45479,8 +45514,8 @@ Schema: ${FINDINGS_SCHEMA}
 
 Be strict on bugs/security, lenient on style. Skip low-confidence nits.`;
 /** Final line of the user message: restating the contract at the end of a long
- * prompt works far better than stating it once at the top. */
-const SCHEMA_REMINDER = (/* unused pure expression or super */ null && (`\n\nReminder: your entire reply must be one JSON object of this exact shape, nothing else:\n${FINDINGS_SCHEMA}`));
+ * prompt works far better than stating it once at the top. Built per call
+ * (see runAgent) since incremental reviews and suggested fixes extend it. */
 function truncate(s, n) {
     return s.length > n ? s.slice(0, n) + "\n...[truncated]" : s;
 }
@@ -45904,12 +45939,13 @@ function isRetryableError(message) {
 async function runAgent(opts) {
     const synth = opts.priorFindings !== undefined;
     const incremental = opts.priorReview !== undefined;
+    const suggest = opts.suggestFixes === true;
     // The synthesizer also writes a summary and a per-file walkthrough, so it
     // gets twice the plain reviewer's output budget. extra_body.max_tokens
     // still overrides either (it is spread after this default).
     const maxTokens = synth ? 4000 : 2000;
     const system = synth ? SYNTH_SYSTEM(opts.lang, opts.instructions) : SYSTEM_WRAPPER(opts.lang, opts.instructions);
-    const schema = incremental && !synth ? INCREMENTAL_SCHEMA : FINDINGS_SCHEMA;
+    const schema = synth ? FINDINGS_SCHEMA : findingSchema({ status: incremental, suggestion: suggest });
     let user = `Review this unified diff (truncated):\n\n${truncate(opts.diff, opts.maxDiffChars)}`;
     if (opts.contextBlock) {
         user += `\n\n${opts.contextBlock}\nGround every finding in the diff above; use <context> only as cross-file evidence (callers, types, contracts). Never flag context-only code.`;
@@ -45919,6 +45955,8 @@ async function runAgent(opts) {
     if (incremental) {
         user += `\n\n${INCREMENTAL_GUIDANCE(opts.priorReview.baseShort, opts.priorReview.headShort)}\n\nPrior round's open findings:\n${opts.priorReview.block}`;
     }
+    if (suggest && !synth)
+        user += `\n\n${SUGGESTION_GUIDANCE}`;
     // Restate the output contract last, after a long diff + context block.
     user += synth ? SYNTH_REMINDER : `\n\nReminder: your entire reply must be one JSON object of this exact shape, nothing else:\n${schema}`;
     const rp = resolveProvider(opts.provider, opts.keys, process.env, opts.sessionId);
@@ -46074,6 +46112,7 @@ async function runAgent(opts) {
             if (!f?.file || !f?.comment)
                 continue;
             const sev = f.severity === "high" || f.severity === "medium" ? f.severity : "suggestion";
+            const suggestion = normalizeSuggestion(f.suggestion);
             out.push({
                 file: String(f.file),
                 line: typeof f.line === "number" ? f.line : undefined,
@@ -46085,6 +46124,7 @@ async function runAgent(opts) {
                 provider: opts.providerName,
                 model: opts.provider.model,
                 status: normalizeStatus(f.status),
+                ...(suggestion !== undefined ? { suggestion } : {}),
             });
         }
         const synthesis = synth ? parseSynthesis(parsed, rawFindings, kept) : undefined;
@@ -46728,6 +46768,7 @@ function renderRunBody(opts) {
         if (findings.length > 50)
             lines.push(`\n… and ${findings.length - 50} more (see inline comments).`);
     }
+    lines.push(...renderSuggestedFixes(findings));
     const agents = opts.agents ?? [];
     const rough = agents.filter((a) => a.outcome !== "ok" && a.outcome !== "no-findings");
     if (agents.length > 0) {
@@ -46745,6 +46786,57 @@ function renderRunBody(opts) {
     return lines;
 }
 const REREVIEW_LINE = "<sub>Re-review with `/review`. Config: `.github/openreview.yml`.</sub>";
+/** Cap for the sticky suggested-fixes section (issue #22). */
+const SUGGESTED_FIXES_SHOWN = 10;
+const SUGGEST_LANG = [
+    [/\.tsx?$/, "ts"],
+    [/\.jsx?$/, "js"],
+    [/\.py$/, "python"],
+    [/\.go$/, "go"],
+    [/\.rs$/, "rust"],
+    [/\.java$/, "java"],
+    [/\.md$/, "markdown"],
+    [/\.ya?ml$/, "yaml"],
+    [/\.json$/, "json"],
+    [/\.sh$/, "bash"],
+];
+/** Strip fences so model output cannot break out of our code block. */
+function sanitizeSuggestion(code) {
+    return code.replace(/```/g, "").trim();
+}
+function suggestLang(file) {
+    for (const [re, lang] of SUGGEST_LANG)
+        if (re.test(file))
+            return lang;
+    return "";
+}
+/**
+ * One-click fixes (issue #22): findings carrying `suggestion` get a
+ * collapsed section with fenced replacement blocks. Inline comments carry
+ * the appliable ```suggestion form instead (see createInlineReview); the
+ * sticky shows plain fences since table cells cannot hold them and the
+ * section has no diff position to apply against.
+ */
+function renderSuggestedFixes(findings) {
+    const withFix = findings.filter((f) => f.suggestion && f.suggestion.trim().length > 0);
+    if (withFix.length === 0)
+        return [];
+    const shown = withFix.slice(0, SUGGESTED_FIXES_SHOWN);
+    const lines = [
+        "",
+        `<details><summary>Suggested fixes (${withFix.length})</summary>`,
+        "",
+    ];
+    for (const f of shown) {
+        const loc = f.line ? `${f.file}:${f.line}` : f.file;
+        lines.push(`**\`${loc}\`** — ${f.comment.replace(/\s+/g, " ").slice(0, 160)}`, "");
+        lines.push(`\`\`\`${suggestLang(f.file)}`, sanitizeSuggestion(f.suggestion), "```", "");
+    }
+    if (withFix.length > shown.length)
+        lines.push(`… and ${withFix.length - shown.length} more (see inline comments).`, "");
+    lines.push("</details>");
+    return lines;
+}
 /**
  * Machine-readable run state for incremental re-review (issue #18).
  *
@@ -46987,7 +47079,7 @@ validLines) {
                 dropped++;
                 continue;
             }
-            fileLevel.push({ file: f.file, comment: f.comment });
+            fileLevel.push({ file: f.file, comment: f.comment, ...(f.suggestion ? { suggestion: f.suggestion } : {}) });
             continue;
         }
         const ranges = validLines.get(f.file);
@@ -46995,8 +47087,13 @@ validLines) {
             dropped++;
             continue;
         }
+        // One-click fix (issue #22): a ```suggestion block on a valid diff
+        // position renders as an appliable suggestion in the GitHub UI.
+        const body = f.suggestion && f.suggestion.trim()
+            ? `${f.comment}\n\n\`\`\`suggestion\n${sanitizeSuggestion(f.suggestion)}\n\`\`\``
+            : f.comment;
         if (comments.length < 20)
-            comments.push({ path: f.file, line: f.line, body: f.comment });
+            comments.push({ path: f.file, line: f.line, body });
         else
             dropped++; // valid but over the cap — counted, not silently lost
     }
@@ -47008,6 +47105,12 @@ validLines) {
         body += "\n\n**File-level notes:**\n" + shown.map((f) => `- \`${f.file}\`: ${f.comment}`).join("\n");
         if (fileLevel.length > shown.length)
             body += `\n… and ${fileLevel.length - shown.length} more (see sticky comment).`;
+        // Suggestions without a diff position cannot apply; show them fenced.
+        for (const f of shown) {
+            if (f.suggestion && f.suggestion.trim()) {
+                body += `\n\n**Suggested fix for \`${f.file}\`:**\n\`\`\`\n${sanitizeSuggestion(f.suggestion)}\n\`\`\``;
+            }
+        }
     }
     await octokit.rest.pulls.createReview({
         owner, repo, pull_number: pullNumber, commit_id: commitSha, event: event,
@@ -48116,6 +48219,7 @@ async function run() {
                     // Validation duty sits with the subagents; the synthesizer
                     // inherits each finding's status through its cited sources.
                     priorReview: !isMain ? priorReview : undefined,
+                    suggestFixes: review.suggest_fixes ?? true,
                 })
                     .then((result) => ({
                     findings: result.findings,

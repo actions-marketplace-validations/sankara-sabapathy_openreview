@@ -41,6 +41,10 @@ export type Finding = {
   /** Provider refs this finding votes under. Absent means `[provider]`; a
    * synthesized finding merging several agents' reports votes for each. */
   voters?: string[];
+  /** One-click fix (issue #22): full replacement lines for the flagged code.
+   * Rendered as a ```suggestion block when the finding posts inline on a
+   * valid line, fenced code otherwise. */
+  suggestion?: string;
   /** Incremental-review validation (issue #18): how the reporter classifies
    * this finding against the previous round. Absent means "new". "fixed"
    * findings are confirmed resolved: they neither show nor vote. */
@@ -50,12 +54,27 @@ export type Finding = {
 const FINDINGS_SCHEMA =
   '{"findings":[{"file":string,"line":number|null,"severity":"high|medium|suggestion","category":string,"comment":string,"confidence":0-1}]}';
 
-// Incremental reviews (issue #18) add per-finding validation against the
-// previous round, carried in the user message (see renderPriorReview).
-// The extra field is optional and defaults to "new", so a model that
-// ignores it degrades to reporting everything as new findings.
-const INCREMENTAL_SCHEMA =
-  '{"findings":[{"file":string,"line":number|null,"severity":"high|medium|suggestion","category":string,"comment":string,"confidence":0-1,"status":"fixed|open|new"}]}';
+// Incremental reviews (issue #18) and suggested fixes (issue #22) extend the
+// contract via findingSchema() below. Extra fields are optional and degrade
+// gracefully, so a model that ignores one still returns usable findings.
+
+// One-click fixes (issue #22): full replacement lines, rendered as a
+// ```suggestion block when the finding posts inline on a valid line.
+const SUGGESTION_FIELD = `,"suggestion":"string, full replacement lines for the flagged code (omit when unsure)"`;
+const SUGGESTION_GUIDANCE =
+  `When you know the fix, add "suggestion" with the FULL replacement lines for the flagged code (complete lines, not a diff, no fences). Only suggest code you are confident compiles and fixes the issue; omit the field when unsure.`;
+
+/** Output contract variant for the extra optional fields a review enables.
+ * Additive only: a model that ignores an extra field degrades gracefully
+ * (status defaults to new, a missing suggestion just renders no fix block). */
+export function findingSchema(opts: { status: boolean; suggestion: boolean }): string {
+  const status = opts.status ? `,"status":"fixed|open|new"` : "";
+  const suggestion = opts.suggestion ? SUGGESTION_FIELD : "";
+  return (
+    '{"findings":[{"file":string,"line":number|null,"severity":"high|medium|suggestion",' +
+    `"category":string,"comment":string,"confidence":0-1${status}${suggestion}}]}`
+  );
+}
 
 const INCREMENTAL_GUIDANCE = (baseShort: string, headShort: string) =>
   `This is an INCREMENTAL review: the diff above shows only what changed since the last review (${baseShort}..${headShort}), not the whole PR.
@@ -68,6 +87,18 @@ If nothing is fixed and nothing is new, reply {"findings":[]}.`;
  * "new": a finding that is not confirmed fixed keeps voting. */
 export function normalizeStatus(value: unknown): "fixed" | "open" | "new" {
   return value === "fixed" || value === "open" ? value : "new";
+}
+
+/** Suggested replacement lines (issue #22). Empty or non-string values mean
+ * "no suggestion"; overlong blocks are cut (a suggestion must fit in a
+ * review comment). Fences are stripped at render time, not here. */
+export const SUGGESTION_CAP = 1500;
+
+export function normalizeSuggestion(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  return trimmed.slice(0, SUGGESTION_CAP);
 }
 
 // The output contract is enforced in the prompt because `response_format` is
@@ -86,8 +117,8 @@ Schema: ${FINDINGS_SCHEMA}
 Be strict on bugs/security, lenient on style. Skip low-confidence nits.`;
 
 /** Final line of the user message: restating the contract at the end of a long
- * prompt works far better than stating it once at the top. */
-const SCHEMA_REMINDER = `\n\nReminder: your entire reply must be one JSON object of this exact shape, nothing else:\n${FINDINGS_SCHEMA}`;
+ * prompt works far better than stating it once at the top. Built per call
+ * (see runAgent) since incremental reviews and suggested fixes extend it. */
 
 function truncate(s: string, n: number): string {
   return s.length > n ? s.slice(0, n) + "\n...[truncated]" : s;
@@ -610,15 +641,19 @@ export async function runAgent(opts: {
    * synthesizer channel above; subagents get this, the synthesizer
    * inherits validation through its cited sources. */
   priorReview?: { baseShort: string; headShort: string; block: string };
+  /** One-click fixes (issue #22): when true the model is asked for full
+   * replacement lines per finding. Rendered as ```suggestion blocks. */
+  suggestFixes?: boolean;
 }): Promise<AgentResult> {
   const synth = opts.priorFindings !== undefined;
   const incremental = opts.priorReview !== undefined;
+  const suggest = opts.suggestFixes === true;
   // The synthesizer also writes a summary and a per-file walkthrough, so it
   // gets twice the plain reviewer's output budget. extra_body.max_tokens
   // still overrides either (it is spread after this default).
   const maxTokens = synth ? 4000 : 2000;
   const system = synth ? SYNTH_SYSTEM(opts.lang, opts.instructions) : SYSTEM_WRAPPER(opts.lang, opts.instructions);
-  const schema = incremental && !synth ? INCREMENTAL_SCHEMA : FINDINGS_SCHEMA;
+  const schema = synth ? FINDINGS_SCHEMA : findingSchema({ status: incremental, suggestion: suggest });
   let user = `Review this unified diff (truncated):\n\n${truncate(opts.diff, opts.maxDiffChars)}`;
   if (opts.contextBlock) {
     user += `\n\n${opts.contextBlock}\nGround every finding in the diff above; use <context> only as cross-file evidence (callers, types, contracts). Never flag context-only code.`;
@@ -627,6 +662,7 @@ export async function runAgent(opts: {
   if (incremental) {
     user += `\n\n${INCREMENTAL_GUIDANCE(opts.priorReview!.baseShort, opts.priorReview!.headShort)}\n\nPrior round's open findings:\n${opts.priorReview!.block}`;
   }
+  if (suggest && !synth) user += `\n\n${SUGGESTION_GUIDANCE}`;
   // Restate the output contract last, after a long diff + context block.
   user += synth ? SYNTH_REMINDER : `\n\nReminder: your entire reply must be one JSON object of this exact shape, nothing else:\n${schema}`;
   const rp = resolveProvider(opts.provider, opts.keys, process.env as any, opts.sessionId);
@@ -793,6 +829,7 @@ export async function runAgent(opts: {
       if (!f?.file || !f?.comment) continue;
       const sev =
         f.severity === "high" || f.severity === "medium" ? f.severity : "suggestion";
+      const suggestion = normalizeSuggestion((f as { suggestion?: unknown }).suggestion);
       out.push({
         file: String(f.file),
         line: typeof f.line === "number" ? f.line : undefined,
@@ -804,6 +841,7 @@ export async function runAgent(opts: {
         provider: opts.providerName,
         model: opts.provider.model,
         status: normalizeStatus((f as { status?: unknown }).status),
+        ...(suggestion !== undefined ? { suggestion } : {}),
       });
     }
     const synthesis = synth ? parseSynthesis(parsed, rawFindings, kept) : undefined;

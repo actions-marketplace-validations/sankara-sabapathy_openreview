@@ -519,6 +519,10 @@ export const ReviewConfig = z.object({
   // the previous round's open findings for fix validation, instead of
   // re-reviewing base..head from scratch. Manual `/review` always runs full.
   incremental: z.boolean().default(false),
+  // One-click fixes (issue #22): agents attach full replacement lines as
+  // `suggestion`, rendered as GitHub ```suggestion blocks when the finding
+  // is line-mappable and fenced code otherwise. Off saves output tokens.
+  suggest_fixes: z.boolean().default(true),
   main: AgentConfig,
   subagents: z.array(AgentConfig).default([]),
   verdict: VerdictConfig.default({}),

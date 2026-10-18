@@ -668,6 +668,7 @@ export async function run(): Promise<void> {
             // Validation duty sits with the subagents; the synthesizer
             // inherits each finding's status through its cited sources.
             priorReview: !isMain ? priorReview : undefined,
+            suggestFixes: review.suggest_fixes ?? true,
           })
             .then((result): TaskResult => ({
               findings: result.findings,

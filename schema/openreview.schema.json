@@ -102,6 +102,7 @@
           "max_findings": { "type": "integer", "minimum": 1 },
           "suppress": { "type": "array", "items": { "type": "string" } },
           "incremental": { "type": "boolean", "default": false, "description": "Re-review only head-vs-last-reviewed-SHA on synchronize, carrying prior findings for fix validation." },
+          "suggest_fixes": { "type": "boolean", "default": true, "description": "Ask agents for full replacement lines, rendered as appliable suggestion blocks." },
           "verdict": {
             "type": "object",
             "properties": {

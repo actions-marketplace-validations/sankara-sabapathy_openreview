@@ -13,6 +13,9 @@ import {
   assertProviderRefs,
   countsAsReview,
   normalizeStatus,
+  normalizeSuggestion,
+  findingSchema,
+  SUGGESTION_CAP,
 } from "./providers.js";
 import { parseConfig } from "./config.js";
 import { hasNestedQuantifier } from "./config.js";
@@ -731,5 +734,34 @@ describe("normalizeStatus (issue #18)", () => {
     assert.equal(normalizeStatus(undefined), "new");
     assert.equal(normalizeStatus("bogus"), "new");
     assert.equal(normalizeStatus(42), "new");
+  });
+});
+
+describe("findingSchema variants (issues #18, #22)", () => {
+  it("base contract is unchanged", () => {
+    assert.equal(
+      findingSchema({ status: false, suggestion: false }),
+      '{"findings":[{"file":string,"line":number|null,"severity":"high|medium|suggestion","category":string,"comment":string,"confidence":0-1}]}'
+    );
+  });
+  it("adds each optional field independently", () => {
+    assert.match(findingSchema({ status: true, suggestion: false }), /"status":"fixed\|open\|new"/);
+    assert.doesNotMatch(findingSchema({ status: true, suggestion: false }), /"suggestion":/);
+    assert.match(findingSchema({ status: false, suggestion: true }), /"suggestion":/);
+    assert.doesNotMatch(findingSchema({ status: false, suggestion: true }), /"status":/);
+    assert.match(findingSchema({ status: true, suggestion: true }), /"status":"fixed\|open\|new"/);
+    assert.match(findingSchema({ status: true, suggestion: true }), /"suggestion":/);
+  });
+});
+
+describe("normalizeSuggestion (issue #22)", () => {
+  it("keeps real suggestions, capped", () => {
+    assert.equal(normalizeSuggestion("  fix();\n"), "fix();");
+    assert.equal(normalizeSuggestion("x".repeat(SUGGESTION_CAP + 100))?.length, SUGGESTION_CAP);
+  });
+  it("drops empty and non-string values", () => {
+    assert.equal(normalizeSuggestion("   "), undefined);
+    assert.equal(normalizeSuggestion(undefined), undefined);
+    assert.equal(normalizeSuggestion(42), undefined);
   });
 });
