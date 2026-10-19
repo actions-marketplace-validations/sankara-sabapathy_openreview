@@ -3,6 +3,26 @@ import { lineInRanges } from "./reviewer.js";
 
 export const STICKY_MARKER = "<!-- openreview:sticky -->";
 
+/** Scrub key-shaped secrets out of error text (issue #58f). Provider error
+ * bodies travel into the sticky's agent-error block; a gateway that echoes
+ * request material must never leak a credential into a PR comment. */
+const SECRET_RES = [
+  /sk-[A-Za-z0-9-_]{10,}/g,
+  /gh[pousr]_[A-Za-z0-9]{10,}/g,
+  /xox[bpas]-[A-Za-z0-9-]{10,}/g,
+  /AKIA[0-9A-Z]{16}/g,
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----/g,
+];
+
+/** Truncate to ~300 chars and scrub key-shaped strings. Best-effort: exact
+ * originals stay in the Actions log for debugging. */
+export function sanitizeErrorDetail(text: string, cap = 300): string {
+  let out = text;
+  for (const re of SECRET_RES) out = out.replace(re, "[redacted]");
+  out = out.replace(/\s+/g, " ").trim();
+  return out.length > cap ? out.slice(0, cap) + "…" : out;
+}
+
 function actionBase(): { repo: string; ref: string } {
   // Prefer the action's own coordinates so forks/renames keep working; the
   // hardcoded default matches this repo's published location.
@@ -192,9 +212,13 @@ function renderRunBody(opts: RunContentOpts): string[] {
     lines.push("| Severity | File | Finding | Agent |");
     lines.push("|---|---|---|---|");
     for (const f of findings.slice(0, 50)) {
-      const loc = f.line ? `${f.file}:${f.line}` : f.file;
+      // Every cell is model-controlled text: escape pipes everywhere and
+      // neutralize backticks in the file cell (an unmatched ` would break
+      // out of the code span and reshape the table) (issue #58).
+      const loc = (f.line ? `${f.file}:${f.line}` : f.file).replace(/\|/g, "\\|").replace(/`/g, "'");
       const one = f.comment.replace(/\n+/g, " ").replace(/\|/g, "\\|").slice(0, 220);
-      lines.push(`| ${f.severity} | \`${loc}\` | ${one} | ${f.agent}/${f.provider}/${f.model} |`);
+      const by = `${f.agent}/${f.provider}/${f.model}`.replace(/\|/g, "\\|");
+      lines.push(`| ${f.severity} | \`${loc}\` | ${one} | ${by} |`);
     }
     if (findings.length > 50)
       lines.push(`\n… and ${findings.length - 50} more (see inline comments).`);

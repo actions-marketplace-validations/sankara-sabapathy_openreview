@@ -864,3 +864,36 @@ describe("runTextAgent (issue #23)", () => {
     assert.equal(late.outcome, "budget-exhausted");
   });
 });
+
+describe("system prompt (issue #58a)", () => {
+  it("marks the diff as untrusted data, not instructions", async () => {
+    const cfg = parseConfig({
+      version: 1,
+      providers: { oai: { model: "m", kind: "openai", base_url: "http://127.0.0.1:1/v1" } },
+      reviews: [{ id: "r", main: { provider: "oai", instructions: "i" } }],
+    });
+    let sent: any = null;
+    const real = globalThis.fetch;
+    globalThis.fetch = (async (_url: any, init: any) => {
+      sent = JSON.parse(init.body);
+      return new Response(JSON.stringify({ choices: [{ message: { content: '{"findings":[]}' } }], usage: {} }));
+    }) as any;
+    try {
+      await runAgent({
+        agentName: "a",
+        providerName: "oai",
+        provider: cfg.providers.oai,
+        instructions: "i",
+        diff: "d",
+        lang: "en",
+        keys: { anthropicApiKey: "", openaiApiKey: "k", opencodeApiKey: "", opencodeBaseUrl: "", githubToken: "" },
+        maxDiffChars: 100,
+        sessionId: "s",
+      });
+    } finally {
+      globalThis.fetch = real;
+    }
+    const system = sent.messages.find((m: any) => m.role === "system").content;
+    assert.match(system, /UNTRUSTED DATA/);
+  });
+});

@@ -1,4 +1,4 @@
-import { z } from "zod";
+import { z, ZodError } from "zod";
 
 export const ProviderKind = z.enum([
   "anthropic",
@@ -581,4 +581,32 @@ export type OpenReviewConfig = z.infer<typeof OpenReviewConfig>;
 
 export function parseConfig(raw: unknown): OpenReviewConfig {
   return OpenReviewConfig.parse(raw);
+}
+
+/**
+ * Human-readable Zod failures (issue #58e). The raw `e.message` is a JSON
+ * array dump — the first thing every new user hits deserves field paths
+ * and a docs pointer instead.
+ */
+export function formatZodError(e: ZodError, where: string): string {
+  const bits = e.issues.map((i) => {
+    const at = i.path.length > 0 ? i.path.map(String).join(".") : "(root)";
+    return `${at}: expected ${expectedOf(i)}, received ${receivedOf(i)}`;
+  });
+  return `Invalid config in ${where}:\n- ${bits.join("\n- ")}\nSee website/docs/configuration.md for the full reference.`;
+}
+
+function expectedOf(i: { code: string; options?: readonly unknown[]; expected?: unknown }): string {
+  if (i.code === "invalid_enum_value" && Array.isArray(i.options)) return i.options.map(String).join("|");
+  if (i.expected !== undefined) return String(i.expected);
+  return i.code;
+}
+
+function receivedOf(i: unknown): string {
+  const received = (i as { received?: unknown } | null | undefined)?.received;
+  // Zod reports a missing value as the string "undefined" (its parsed-type
+  // name); collapse both spellings to "missing" for humans.
+  if (received === undefined || received === "undefined") return "missing";
+  const t = typeof received;
+  return t === "string" ? JSON.stringify(received) : t;
 }
