@@ -61,8 +61,8 @@ reviews:
       mode: comment # comment | approve | request_changes
       min_severity: medium # suggestion | medium | high
       post_inline: true
-      deduplicate: true
-      # consensus_escalation: true # escalate 2+-agent-confirmed findings one severity (opt-in; default false). # merge near-duplicate findings (same file+line, ~same comment) into one row attributed to every reporting agent; model fields are validated (confidence clamped to 0-1, numeric strings coerced) and findings on files outside if_paths are dropped with a log line
+      deduplicate: true # merge near-duplicate findings (same file+line, ~same comment) into one row attributed to every reporting agent; model fields are validated (confidence clamped to 0-1, numeric strings coerced) and findings on files outside if_paths are dropped with a log line
+      # consensus_escalation: true # escalate 2+-agent-confirmed findings one severity (opt-in; default false)
 
 ## File context (beyond the diff)
 
