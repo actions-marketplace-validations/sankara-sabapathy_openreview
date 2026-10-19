@@ -109,3 +109,16 @@ describe("formatZodError (issue #58e)", () => {
     assert.match(msg, /missing/);
   });
 });
+
+describe("verdict defaults (issues #21, #56)", () => {
+  it("consensus escalation defaults off, incremental/suggest_fixes on their defaults", () => {
+    const cfg = OpenReviewConfig.parse({
+      version: 1,
+      providers: { p: { model: "m" } },
+      reviews: [{ id: "r", main: { provider: "p", instructions: "i" } }],
+    });
+    assert.equal(cfg.reviews[0].verdict.consensus_escalation, false);
+    assert.equal(cfg.reviews[0].incremental, false);
+    assert.equal(cfg.reviews[0].suggest_fixes, true);
+  });
+});

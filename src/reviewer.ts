@@ -335,10 +335,66 @@ export function validateFindingFiles<T extends { file: string; comment: string }
 }
 
 /**
+ * Group findings into one ballot per agent (issue #56a). A finding merged
+ * from several agents' reports (agent "sec+corr") counts in each source
+ * agent's ballot, so `strategy: all | majority` resolves real multi-agent
+ * disagreement instead of degenerating to a single voter when every agent
+ * shares one provider. The old per-provider grouping collapsed main and all
+ * subagents on the same transport into one ballot.
+ */
+export function groupByAgent<T extends { agent: string }>(findings: T[]): Map<string, T[]> {
+  const by = new Map<string, T[]>();
+  for (const f of findings) {
+    const agents = f.agent
+      .split("+")
+      .map((a) => a.trim())
+      .filter(Boolean);
+    for (const a of agents.length > 0 ? agents : [f.agent]) {
+      const list = by.get(a) ?? [];
+      list.push(f);
+      by.set(a, list);
+    }
+  }
+  return by;
+}
+
+const ESCALATE_TO: Record<string, "high" | "medium" | "suggestion"> = {
+  suggestion: "medium",
+  medium: "high",
+  high: "high",
+};
+
+/**
+ * Consensus escalation (issue #56c): a finding confirmed by >=2 independent
+ * agents (merged attribution from dedupe or synthesis) escalates one
+ * severity level before verdict math. Two independent agents agreeing is a
+ * stronger signal than one. Returns the escalated list plus the count, so
+ * callers can log what changed. Single-agent findings pass through
+ * untouched; already-high findings stay high.
+ */
+export function escalateConsensus<T extends { agent: string; severity: "high" | "medium" | "suggestion" }>(
+  findings: T[]
+): { findings: T[]; escalated: number } {
+  let escalated = 0;
+  const out = findings.map((f) => {
+    const distinct = new Set(
+      f.agent
+        .split("+")
+        .map((a) => a.trim())
+        .filter(Boolean)
+    );
+    if (distinct.size < 2 || f.severity === "high") return f;
+    escalated++;
+    return { ...f, severity: ESCALATE_TO[f.severity] };
+  });
+  return { findings: out, escalated };
+}
+
+/**
  * Drop findings matching decided-item patterns (rebutted items that must not
  * resurrect). Each pattern is a case-insensitive regex against
  * "<file> <comment>". Runs after dedupe, before noise controls and verdict
- * math — suppressed findings neither show nor vote.
+ * math - suppressed findings neither show nor vote.
  */
 export function applySuppression<T extends { file: string; comment: string }>(
   findings: T[],
@@ -462,8 +518,9 @@ function cmpSemver(a: Semver, b: Semver): number {
   return 0;
 }
 
-// Per-review provider ballots (issue #12). Each distinct provider used by a
-// review's agents casts one ballot: its own verdict over its own findings.
+// Per-review agent ballots (issues #12, #56a). Each agent casts one ballot:
+// its own verdict over its own findings. A merged finding votes in each
+// contributing agent's ballot.
 // - any: most severe ballot wins (identical to the old pooled behavior).
 // - all: unanimous to escalate (minimum severity wins).
 // - majority: median ballot; even-count ties break toward more severe.

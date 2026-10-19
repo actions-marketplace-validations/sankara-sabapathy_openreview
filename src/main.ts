@@ -22,7 +22,7 @@ import {
   matchesAny, filterIgnored, dedupeFindings, applySuppression, decideReviewVerdict, combineVerdicts, combineBallots,
   applyDegradedFloor, resolveNoise, applyNoiseControls, splitDiff, scopeDiff, parseHunkRanges, type Verdict,
   satisfiesActionVersion, runningActionVersion, builtActionVersion, renderPriorReview, matchCarriedFindings, validateFindingFiles,
-  scanPromptInjection,
+  scanPromptInjection, groupByAgent, escalateConsensus,
 } from "./reviewer.js";
 import { parseAskComment, buildAskPrompt, collectFeedbackSignals, isAskAllowed, resolveAskProvider } from "./ask.js";
 import { renderStickyBody, upsertStickyComment, appendStickySection, renderAppendSection, createInlineReview, findStickyComment, parseStickyState, sanitizeErrorDetail, type RunStatus, type StickyFindingState } from "./github.js";
@@ -930,6 +930,15 @@ export async function run(): Promise<void> {
           );
         }
       }
+      // Consensus escalation (issue #56c, opt-in): findings confirmed by
+      // >=2 independent agents escalate one severity before verdict math.
+      if (review.verdict.consensus_escalation) {
+        const esc = escalateConsensus(findings);
+        if (esc.escalated > 0) {
+          logInfo(`Review ${review.id}: consensus escalation raised ${esc.escalated} finding(s) one severity.`);
+        }
+        findings = esc.findings;
+      }
       // Noise controls (issue #21): confidence floor + cap, then verdict on survivors.
       const noise = resolveNoise({
         profile: review.profile ?? config.defaults.profile,
@@ -996,21 +1005,14 @@ export async function run(): Promise<void> {
       const degraded = counted > 0 && counted < results.length;
       let verdict = (() => {
         if (counted === 0) return "approve" as Verdict; // placeholder, excluded below
-        // One ballot per distinct provider (issue #12). `any` reproduces the
-        // old pooled behavior exactly; `all`/`majority` resolve disagreement.
-        // Dotted refs (`opencode.flash`) vote under their full ref, so two
-        // models on one transport disagree as two ballots (issue #67).
-        const byProvider = new Map<string, typeof findings>();
-        // A synthesized finding merging several agents' reports votes in
-        // each source provider's ballot.
-        for (const f of findings) {
-          for (const v of f.voters?.length ? f.voters : [f.provider]) {
-            const list = byProvider.get(v) ?? [];
-            list.push(f);
-            byProvider.set(v, list);
-          }
-        }
-        const ballots = [...byProvider.entries()].map(([name, fs]) => {
+        // One ballot per agent (issue #56a). `any` reproduces the old pooled
+        // behavior exactly (max of maxes); `all`/`majority` now resolve real
+        // multi-agent disagreement instead of degenerating to a single voter
+        // when every agent shares one provider (issue #12's per-provider
+        // ballots did that). A merged finding votes in each contributing
+        // agent's ballot.
+        const byAgent = groupByAgent(findings);
+        const ballots = [...byAgent.entries()].map(([name, fs]) => {
           const v = decideReviewVerdict(review.verdict.mode, review.verdict.min_severity, fs);
           logInfo(`Review ${review.id}: ballot ${name} -> ${v} (${fs.length} findings)`);
           return v;

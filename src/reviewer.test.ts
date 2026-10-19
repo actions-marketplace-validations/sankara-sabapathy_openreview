@@ -23,6 +23,8 @@ import {
   validateFindingFiles,
   scanPromptInjection,
   builtActionVersion,
+  groupByAgent,
+  escalateConsensus,
 } from "./reviewer.js";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -591,5 +593,62 @@ describe("builtActionVersion (issue #58c)", () => {
   it("returns null when nothing version-shaped exists", () => {
     assert.equal(builtActionVersion({}), null);
     assert.equal(builtActionVersion({ actionPath: join(tmpdir(), "or-no-such-dir-xyz") }), null);
+  });
+});
+
+describe("groupByAgent (issue #56a)", () => {
+  const F = (agent: string, comment = "x") => ({
+    file: "a.ts",
+    comment,
+    severity: "medium" as const,
+    confidence: 0.7,
+    agent,
+    provider: "p1",
+    model: "m1",
+  });
+  it("gives each agent its own ballot", () => {
+    const by = groupByAgent([F("main"), F("corr")]);
+    assert.deepEqual([...by.keys()].sort(), ["corr", "main"]);
+    assert.equal(by.get("main")?.length, 1);
+  });
+  it("counts a merged finding in every contributing agent's ballot", () => {
+    const by = groupByAgent([F("sec+corr")]);
+    assert.equal(by.get("sec")?.length, 1);
+    assert.equal(by.get("corr")?.length, 1);
+  });
+  it("keeps degenerate agent names on their own ballot", () => {
+    const by = groupByAgent([F(""), F("+")]);
+    assert.equal(by.size, 2);
+  });
+});
+
+describe("escalateConsensus (issue #56c)", () => {
+  const F = (agent: string, severity: "high" | "medium" | "suggestion") => ({
+    file: "a.ts",
+    comment: "x",
+    severity,
+    confidence: 0.7,
+    agent,
+    provider: "p1",
+    model: "m1",
+  });
+  it("leaves single-agent findings alone", () => {
+    const { findings, escalated } = escalateConsensus([F("a", "medium")]);
+    assert.equal(escalated, 0);
+    assert.equal(findings[0].severity, "medium");
+  });
+  it("escalates multi-agent findings one step, capped at high", () => {
+    const { findings, escalated } = escalateConsensus([
+      F("a+b", "suggestion"),
+      F("a+b+c", "medium"),
+      F("a+b", "high"),
+    ]);
+    assert.equal(escalated, 2);
+    assert.deepEqual(findings.map((f) => f.severity), ["medium", "high", "high"]);
+  });
+  it("does not mutate the input", () => {
+    const f = F("a+b", "medium");
+    escalateConsensus([f]);
+    assert.equal(f.severity, "medium");
   });
 });

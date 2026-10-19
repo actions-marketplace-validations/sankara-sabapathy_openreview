@@ -109,7 +109,8 @@
               "mode": { "enum": ["comment", "approve", "request_changes"] },
               "min_severity": { "enum": ["suggestion", "medium", "high"] },
               "post_inline": { "type": "boolean" },
-              "deduplicate": { "type": "boolean" }
+              "deduplicate": { "type": "boolean" },
+              "consensus_escalation": { "type": "boolean", "default": false, "description": "Escalate findings confirmed by 2+ agents one severity before verdict math." }
             }
           }
         }
