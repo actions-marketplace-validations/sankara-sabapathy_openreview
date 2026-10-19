@@ -10,7 +10,9 @@ import {
   VerdictConfig,
   AgentConfig,
   AuthConfig,
+  formatZodError,
 } from "./config.js";
+import { ZodError } from "zod";
 
 // Mechanical guard for issue #57: every fixed config key must be read by the
 // engine. Rule: a property access `.key`, `["key"]`, `['key']` or a
@@ -83,5 +85,27 @@ describe("config surface (issue #57)", () => {
       [],
       `dead config fields (parsed, documented, never read): ${dead.join(", ")} — implement or delete per #57`
     );
+  });
+});
+
+describe("formatZodError (issue #58e)", () => {
+  const bad = { version: 1, providers: { p: { model: "m", retries: "many" } }, reviews: [] };
+  it("names field paths instead of dumping a JSON array", () => {
+    const parsed = OpenReviewConfig.safeParse(bad);
+    assert.equal(parsed.success, false);
+    if (parsed.success) return;
+    assert.ok(parsed.error instanceof ZodError);
+    const msg = formatZodError(parsed.error, "openreview.yml");
+    assert.match(msg, /openreview\.yml/);
+    assert.match(msg, /providers\.p\.retries/);
+    assert.doesNotMatch(msg, /^\s*\[/);
+    assert.match(msg, /configuration\.md/);
+  });
+  it("labels missing fields instead of crashing", () => {
+    const parsed = OpenReviewConfig.safeParse({ version: 1, providers: {}, reviews: [{}] });
+    assert.equal(parsed.success, false);
+    if (parsed.success) return;
+    const msg = formatZodError(parsed.error, "x.yml");
+    assert.match(msg, /missing/);
   });
 });

@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { renderStickyBody, upsertStickyComment, createInlineReview, renderAppendSection, appendToSticky, appendStickySection, STICKY_MARKER, STICKY_LIMIT, renderStickyState, parseStickyState, STICKY_STATE_COMMENT_CAP, STICKY_STATE_FINDINGS_CAP, renderSuggestedFixes, sanitizeSuggestion, SUGGESTED_FIXES_SHOWN } from "./github.js";
+import { renderStickyBody, upsertStickyComment, createInlineReview, renderAppendSection, appendToSticky, appendStickySection, STICKY_MARKER, STICKY_LIMIT, renderStickyState, parseStickyState, STICKY_STATE_COMMENT_CAP, STICKY_STATE_FINDINGS_CAP, renderSuggestedFixes, sanitizeSuggestion, sanitizeErrorDetail, SUGGESTED_FIXES_SHOWN } from "./github.js";
 import { countsAsReview, type AgentOutcome } from "./providers.js";
 
 const base = { findings: [], runUrl: "https://example.test/run/1" };
@@ -335,7 +335,6 @@ describe("rotation bookkeeping (dogfood on #75)", () => {
   });
 
   it("a rotated comment is never reselected", async () => {
-    const { markSuperseded } = await import("./github.js");
     const calls: any = {};
     const octokit = {
       paginate: async () => calls.comments,
@@ -555,5 +554,32 @@ describe("createInlineReview suggestions (issue #22)", () => {
     assert.match(calls.review.body, /Suggested fix for `src\/a\.ts`/);
     assert.match(calls.review.body, /key: value/);
     assert.doesNotMatch(calls.review.body, /```suggestion/);
+  });
+});
+
+describe("sanitizeErrorDetail (issue #58f)", () => {
+  it("redacts key-shaped strings", () => {
+    const out = sanitizeErrorDetail("llm 500: key=sk-ant-oat01-abcdef1234567890 rejected");
+    assert.doesNotMatch(out, /sk-ant/);
+    assert.match(out, /\[redacted\]/);
+    assert.match(out, /rejected/);
+  });
+  it("truncates long bodies but keeps short ones intact", () => {
+    assert.equal(sanitizeErrorDetail("boom", 300), "boom");
+    const out = sanitizeErrorDetail("x".repeat(400));
+    assert.ok(out.length <= 301);
+  });
+});
+
+describe("sticky table escaping (issue #58g)", () => {
+  it("neutralizes pipes and backticks in file cells", () => {
+    const body = renderStickyBody({
+      runUrl: "https://example.test/run/1",
+      verdict: "comment",
+      perReview: [{ id: "r", verdict: "comment", count: 1, counted: true }],
+      findings: [{ file: "a`b|c.ts", line: 1, severity: "high", category: "x", comment: "c", agent: "a", provider: "p", model: "m" }],
+    });
+    assert.doesNotMatch(body, /`a`b/);
+    assert.match(body, /a'b\\|c\.ts/);
   });
 });

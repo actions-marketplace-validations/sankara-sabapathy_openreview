@@ -1,6 +1,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { runPooled, getPrDiff, getIncrementalDiff, decideIncremental, MAX_DIFF_FILES, summarizeUsage, selectInlineFindings } from "./main.js";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { runPooled, getPrDiff, getIncrementalDiff, decideIncremental, loadConfig, MAX_DIFF_FILES, summarizeUsage, selectInlineFindings } from "./main.js";
 
 describe("runPooled (issue #51)", () => {
   it("preserves result order regardless of completion order", async () => {
@@ -288,5 +290,12 @@ describe("getIncrementalDiff (issue #18)", () => {
       },
     } as any;
     await assert.rejects(() => getIncrementalDiff(octokit, "o", "r", 7, "gone0000", "head1234"), /404/);
+  });
+});
+
+describe("loadConfig explicit path (issue #58d)", () => {
+  it("fails hard when an explicit config-path names nothing", async () => {
+    const missing = join(tmpdir(), "openreview-no-such-config-xyz.yml");
+    await assert.rejects(() => loadConfig(missing, true), /not falling back/);
   });
 });

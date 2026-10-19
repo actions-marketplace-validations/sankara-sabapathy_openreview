@@ -44,6 +44,30 @@ export function filterIgnored(files: string[], ignore: string[]): string[] {
 export type DiffFile = { file: string; patch: string };
 
 /**
+ * Cheap prompt-injection tripwire (issue #58a). The diff is untrusted
+ * PR-author text inside every agent prompt; instruction-shaped lines get
+ * flagged in the logs and the sticky so a human sees them. Heuristic, not
+ * a block: a flagged line is still reviewed as code.
+ */
+const INJECTION_RES = [
+  /\bignore\s+(all\s+)?(previous|prior|above|all)\s+instructions?\b/i,
+  /\bdisregard\b[^\n]{0,80}\binstructions?\b/i,
+  /\byou are now\b/i,
+];
+
+export function scanPromptInjection(diff: string, cap = 5): string[] {
+  const hits: string[] = [];
+  for (const line of diff.split("\n")) {
+    const t = /^[+\- ]/.test(line) ? line.slice(1).trim() : line.trim();
+    if (t && INJECTION_RES.some((re) => re.test(t))) {
+      hits.push(t.slice(0, 120));
+      if (hits.length >= cap) break;
+    }
+  }
+  return hits;
+}
+
+/**
  * Render the previous round's open findings for an incremental review
  * prompt (issue #18). Numbered, capped, locations flagged as stale: line
  * numbers refer to the OLD head and may have shifted, so agents must match
@@ -336,6 +360,9 @@ export function applyDegradedFloor(verdict: Verdict, counted: number, total: num
   return verdict === "approve" ? "comment" : verdict;
 }
 
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+
 export type Verdict = "approve" | "comment" | "request_changes";
 
 export type NoiseProfile = "quiet" | "balanced" | "assertive";
@@ -485,5 +512,33 @@ export function runningActionVersion(env: NodeJS.ProcessEnv): string | null {
   if (env["OPENREVIEW_ACTION_VERSION"]) return env["OPENREVIEW_ACTION_VERSION"] as string;
   const ref = env["GITHUB_ACTION_REF"] ?? "";
   if (/^v?\d+\.\d+\.\d+/.test(ref)) return ref;
+  return null;
+}
+
+/**
+ * The release version the action is running as (issue #58c). The workflow
+ * usually pins a floating ref (`@v1`), which `GITHUB_ACTION_REF` cannot
+ * resolve — so the `requires_action` floor used to skip silently. Instead,
+ * read the action's own `package.json` (present both in the marketplace
+ * download and in a local `./` checkout via GITHUB_ACTION_PATH), falling
+ * back to the bundle directory. No new committed artifact: release-please
+ * already bumps the version, and any extra dist file would go stale on
+ * every release and trip the dist-fresh check. Returns null when nothing
+ * version-shaped is found — the floor keeps its old skip-if-unknown
+ * behavior. Takes directories explicitly so tests can use fixtures.
+ */
+export function builtActionVersion(dirs: { actionPath?: string; distDir?: string }): string | null {
+  for (const dir of [dirs.actionPath, dirs.distDir]) {
+    if (!dir) continue;
+    try {
+      const pkg: unknown = JSON.parse(readFileSync(join(dir, "package.json"), "utf8"));
+      if (pkg && typeof pkg === "object" && typeof (pkg as { version?: unknown }).version === "string") {
+        const v = (pkg as { version: string }).version.trim();
+        if (/^v?\d+\.\d+\.\d+/.test(v)) return v;
+      }
+    } catch {
+      // Missing or unparseable: try the next location.
+    }
+  }
   return null;
 }

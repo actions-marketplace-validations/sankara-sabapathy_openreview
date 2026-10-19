@@ -49,6 +49,25 @@ leftover workspace state), so:
 - Prefer `pull_request_target` with an explicit pinned checkout, or gate reviews
   behind a maintainer-applied label, or use ephemeral (one-job) runners.
 
+## Fork PRs and your provider budget (issue #58b)
+
+`pull_request` events from forks run the workflow with your BYOK secrets
+available to the job (same-repo PRs; forks get no secrets by default, in
+which case agents skip with a no-key warning instead of spending). If you
+want belt and suspenders — never run the reviewer on a fork's code, only on
+maintainer branches — add an allowlist recipe to the job:
+
+```yaml
+if: >-
+  github.event.pull_request.head.repo.full_name == github.repository
+```
+
+Combine it with the existing `&&` conditions in the reference workflow
+(`.github/workflows/ai-review.yml`). Fork PRs then skip the job entirely:
+no diff fetch, no provider spend. The in-action association gate stays as
+the second layer (it cannot be misconfigured out of existence the way a
+workflow `if:` can).
+
 Verified matrix: `ubuntu-latest` ✅ (dogfood, every PR). Self-hosted/ARC: config
 compatible, awaiting verification on a contributor runner — report yours in
 [issue #24](https://github.com/sankara-sabapathy/openreview/issues/24).

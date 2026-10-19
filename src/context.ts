@@ -1,6 +1,5 @@
 import { readFileSync, readdirSync, statSync, realpathSync, type Dirent } from "node:fs";
 import * as path from "node:path";
-import * as core from "@actions/core";
 import { logInfo, logWarning } from "./logger.js";
 import { matchesAny } from "./reviewer.js";
 

@@ -3,7 +3,8 @@ import * as github from "@actions/github";
 import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import * as YAML from "yaml";
-import { parseConfig } from "./config.js";
+import { parseConfig, formatZodError, type OpenReviewConfig } from "./config.js";
+import { ZodError } from "zod";
 import { templateContextFor, resolveExtends, mergeConfigs, parseConfigLoose } from "./templates.js";
 import {
   resolveKeysFromEnv,
@@ -20,10 +21,11 @@ import {
 import {
   matchesAny, filterIgnored, dedupeFindings, applySuppression, decideReviewVerdict, combineVerdicts, combineBallots,
   applyDegradedFloor, resolveNoise, applyNoiseControls, splitDiff, scopeDiff, parseHunkRanges, type Verdict,
-  satisfiesActionVersion, runningActionVersion, renderPriorReview, matchCarriedFindings, validateFindingFiles,
+  satisfiesActionVersion, runningActionVersion, builtActionVersion, renderPriorReview, matchCarriedFindings, validateFindingFiles,
+  scanPromptInjection,
 } from "./reviewer.js";
 import { parseAskComment, buildAskPrompt, collectFeedbackSignals, isAskAllowed, resolveAskProvider } from "./ask.js";
-import { renderStickyBody, upsertStickyComment, appendStickySection, renderAppendSection, createInlineReview, findStickyComment, parseStickyState, type RunStatus, type StickyFindingState } from "./github.js";
+import { renderStickyBody, upsertStickyComment, appendStickySection, renderAppendSection, createInlineReview, findStickyComment, parseStickyState, sanitizeErrorDetail, type RunStatus, type StickyFindingState } from "./github.js";
 import { initLogger, logInfo, logWarning, logDebug } from "./logger.js";
 import { buildContextBlock, buildRepoIndex } from "./context.js";
 import { authorizeTrigger } from "./authorize.js";
@@ -36,7 +38,15 @@ const CONFIG_CANDIDATES = [
   "openreview.yaml",
 ];
 
-async function loadConfig(configPath: string) {
+export async function loadConfig(configPath: string, explicit = false) {
+  // An explicit config-path that names nothing is a typo, not a default
+  // (issue #58d): fail hard instead of silently reviewing another file.
+  if (explicit && !existsSync(configPath)) {
+    throw new Error(
+      `Config file not found: ${configPath} (explicit config-path; not falling back to .github/openreview.yml). ` +
+        `See website/docs/configuration.md.`
+    );
+  }
   const candidates = [configPath, ...CONFIG_CANDIDATES.filter((c) => c !== configPath)];
   for (const p of candidates) {
     if (!existsSync(p)) continue;
@@ -44,13 +54,24 @@ async function loadConfig(configPath: string) {
     const loose = parseConfigLoose(raw);
     const extendsEntries = (loose.extends as string[] | undefined) ?? [];
     if (extendsEntries.length === 0) {
-      return { config: parseConfig(raw), path: p };
+      try {
+        return { config: parseConfig(raw), path: p };
+      } catch (e) {
+        if (e instanceof ZodError) throw new Error(formatZodError(e, p));
+        throw e;
+      }
     }
     // Templates resolve in order; this file overlays on top (child wins).
     const ctx = templateContextFor(p, process.env as any);
     const { merged, sources } = await resolveExtends(extendsEntries, ctx);
     const { extends: _ignored, ...top } = loose;
-    const config = parseConfig(mergeConfigs(merged, top) as unknown);
+    let config: OpenReviewConfig;
+    try {
+      config = parseConfig(mergeConfigs(merged, top) as unknown);
+    } catch (e) {
+      if (e instanceof ZodError) throw new Error(formatZodError(e, p));
+      throw e;
+    }
     logInfo(
       `Resolved ${sources.length} template(s): ${sources
         .map((s) => (s.sha ? `${s.source} @${s.sha.slice(0, 7)}` : s.source))
@@ -360,7 +381,7 @@ type AskFlowOpts = {
  */
 async function runAskFlow(opts: AskFlowOpts): Promise<void> {
   const { octokit, owner, repo, prNumber, config, keys } = opts;
-  const { fileNames, diff, headSha, omitted, stale } = await getPrDiff(
+  const { fileNames, diff, stale } = await getPrDiff(
     octokit, owner, repo, prNumber, (github.context.payload as any).pull_request?.head?.sha
   );
   if (stale) {
@@ -450,14 +471,19 @@ export async function run(): Promise<void> {
     const configPath = core.getInput("config-path") || ".github/openreview.yml";
     const dryRun = (core.getInput("dry-run") || "false").toLowerCase() === "true";
 
-    const { config, path } = await loadConfig(configPath);
+    const { config, path } = await loadConfig(configPath, core.getInput("config-path") !== "");
     logInfo(`Loaded config: ${path} (${config.reviews.length} reviews)`);
     // Fail fast on dotted provider refs that resolve to nothing (issue #67):
     // a typo'd `opencode.flah` errors here naming both halves, before any
     // budget is spent. Legacy plain-unknown names keep warn-and-skip per agent.
     assertProviderRefs(config);
     if (config.requires_action) {
-      const running = runningActionVersion(process.env as any);
+      // Prefer the action's own package.json (issue #58c): the workflow
+      // usually pins a floating ref (@v1) that GITHUB_ACTION_REF cannot
+      // resolve, which used to skip the check.
+      const running =
+        runningActionVersion(process.env as any) ??
+        builtActionVersion({ actionPath: process.env.GITHUB_ACTION_PATH, distDir: import.meta.dirname });
       if (running && !satisfiesActionVersion(config.requires_action, running)) {
         throw new Error(
           `This openreview.yml needs action ${config.requires_action} but the runner is ${running}. ` +
@@ -552,6 +578,17 @@ export async function run(): Promise<void> {
     }
     logInfo(`Diff: ${fileNames.length} files, ${diff.length} chars (head ${headSha.slice(0, 7)})`);
     logDebug(`Diff files: ${fileNames.join(", ")}`);
+    // Prompt-injection tripwire (issue #58a): the diff is untrusted
+    // PR-author text. Flagged lines are still reviewed as code; the note
+    // tells a human where to look harder.
+    const injectionHits = scanPromptInjection(diff);
+    let injectionNote: string | null = null;
+    if (injectionHits.length > 0) {
+      injectionNote =
+        `${injectionHits.length} instruction-shaped line(s) in the diff ` +
+        `(treating the diff as untrusted data): ${injectionHits.slice(0, 3).join(" | ")}`;
+      logWarning(`Prompt-injection scan: ${injectionNote}`);
+    }
     // Incremental re-review (issue #18): recover the last-reviewed SHA and
     // open findings from the sticky's machine-readable state (slice 0).
     // Only `synchronize` pushes qualify — a manual /review is an explicit
@@ -862,7 +899,11 @@ export async function run(): Promise<void> {
           `Review ${review.id}: synthesizer produced no usable result; keeping all ${reported} subagent finding(s).`
         );
       }
-      const agentErrors = results.filter((r) => r.error).map((r) => `- \`${r.agent}\`: ${r.error}`);
+      const agentErrors = results
+        .filter((r) => r.error)
+        // Sanitized for the sticky (issue #58f): provider error bodies may
+        // echo request material. Full text stays in the Actions log above.
+        .map((r) => `- \`${r.agent}\`: ${sanitizeErrorDetail(r.error!)}`);
       if (review.verdict.deduplicate) findings = dedupeFindings(findings);
       // Grounding (issue #56): a finding on a file this review never saw is
       // model drift, not signal — it neither shows nor votes. Dropped files
@@ -1118,6 +1159,9 @@ export async function run(): Promise<void> {
     // Per-run footer extras: shared by update mode (appended to the sticky)
     // and append mode (inside the run's section) — issue #69.
     const extras: string[] = [];
+    if (injectionNote) {
+      extras.push(`\n\n> ⚠️ ${injectionNote}.`);
+    }
     if (truncated || omitted.length > 0) {
       const bits: string[] = [];
       if (truncated) bits.push(`only the first ${MAX_DIFF_FILES} of ${totalFiles} changed files were reviewed`);
