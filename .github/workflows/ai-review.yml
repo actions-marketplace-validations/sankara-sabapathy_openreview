@@ -42,7 +42,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: ./
+      - uses: sankara-sabapathy/openreview@v1
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           config-path: .github/openreview.yml
