@@ -489,6 +489,10 @@ export const VerdictConfig = z.object({
   min_severity: z.enum(["suggestion", "medium", "high"]).default("medium"),
   post_inline: z.boolean().default(true),
   deduplicate: z.boolean().default(true),
+  // Consensus escalation (issue #56): a finding confirmed by >=2 independent
+  // agents (merged attribution) escalates one severity level before verdict
+  // math. Off by default: it makes verdicts stricter.
+  consensus_escalation: z.boolean().default(false),
 });
 export type VerdictConfig = z.infer<typeof VerdictConfig>;
 

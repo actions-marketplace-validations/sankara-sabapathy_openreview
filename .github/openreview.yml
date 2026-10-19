@@ -110,7 +110,7 @@ reviews:
   # --- Active review: everything in this repo gets the general pass ---
   - id: general-quality
     if_paths: ["**"]
-    strategy: any # any | all | majority: per-provider ballots; see website/docs/multi-review
+    strategy: any # any | all | majority: per-agent ballots; see website/docs/multi-review
     # Noise controls (issue #21): profile preset + explicit overrides (win).
     # quiet: high-confidence top-3 · balanced (default): passthrough ·
     # assertive: everything up to 100.
@@ -148,6 +148,8 @@ reviews:
       min_severity: medium # suggestion | medium | high
       post_inline: true
       deduplicate: true
+      # consensus_escalation: true # escalate 2+-agent-confirmed findings one severity (opt-in; default false).
+      # Stays off here: dogfood verdicts stay comparable run over run.
 
   # --- Commented example: scoped strict review with a blocking verdict ---
   # - id: security-strict

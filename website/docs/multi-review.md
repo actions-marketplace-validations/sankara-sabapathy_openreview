@@ -35,13 +35,11 @@ global_verdict:
   review. The cost is latency: `main` waits for the slowest subagent. Set
   `main_mode: parallel` to run `main` alongside the subagents as one more
   reviewer (the behavior before 0.13), with no summary or walkthrough.
-- Each distinct provider used by a review's agents casts one **ballot**: its own
-  verdict over its own findings (`mode` + `min_severity`). `strategy` combines them:
-  `any` = most severe ballot wins, `all` = unanimous to escalate, `majority` =
-  median ballot (even-count ties break toward more severe). Single-provider reviews
-  behave identically under all three. A finding the synthesizer merged from
-  several agents counts in each source provider's ballot; one it added itself
-  counts under `main`'s provider; a dismissed one counts nowhere.
+- Each agent in a review casts one **ballot**: its own verdict over its own findings (`mode` + `min_severity`). `strategy` combines them:
+  `any` = most severe ballot wins (identical to the old pooled behavior), `all` = unanimous to escalate, `majority` =
+  median ballot (even-count ties break toward more severe). A finding the synthesizer merged from
+  several agents counts in each contributing agent's ballot; one it added itself
+  counts under `main`; a dismissed one counts nowhere. Opt-in `verdict.consensus_escalation` escalates a finding confirmed by 2+ agents one severity before the ballots are counted.
 - **`if_paths` scopes the diff, not just the trigger.** A review only receives
   patches for files matching its own `if_paths`, and its prompt ends with a note
   saying how many of the in-scope files were withheld:

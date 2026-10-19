@@ -45004,6 +45004,10 @@ const VerdictConfig = objectType({
     min_severity: enumType(["suggestion", "medium", "high"]).default("medium"),
     post_inline: booleanType().default(true),
     deduplicate: booleanType().default(true),
+    // Consensus escalation (issue #56): a finding confirmed by >=2 independent
+    // agents (merged attribution) escalates one severity level before verdict
+    // math. Off by default: it makes verdicts stricter.
+    consensus_escalation: booleanType().default(false),
 });
 const ReviewConfig = objectType({
     id: stringType(),
@@ -45416,8 +45420,8 @@ function parseSynthesis(holder, rawFindings, kept) {
 /**
  * Merge the synthesizer's verdict on the prior findings into one list.
  * - A synthesized finding citing known ids inherits their attribution and
- *   votes under every source provider (so `strategy: all|majority` keeps
- *   meaning one ballot per provider). One citing none is the main agent's own.
+ *   votes under every source agent (so `strategy: all|majority` keeps
+ *   meaning one ballot per agent). One citing none is the main agent's own.
  * - A prior id named in `dismissed` (and cited by no finding) is removed and
  *   reported with its reason, never dropped silently.
  * - A prior id the synthesizer never mentions is kept unchanged.
@@ -46679,10 +46683,60 @@ function validateFindingFiles(findings, scopedFiles) {
     return { visible, dropped };
 }
 /**
+ * Group findings into one ballot per agent (issue #56a). A finding merged
+ * from several agents' reports (agent "sec+corr") counts in each source
+ * agent's ballot, so `strategy: all | majority` resolves real multi-agent
+ * disagreement instead of degenerating to a single voter when every agent
+ * shares one provider. The old per-provider grouping collapsed main and all
+ * subagents on the same transport into one ballot.
+ */
+function groupByAgent(findings) {
+    const by = new Map();
+    for (const f of findings) {
+        const agents = f.agent
+            .split("+")
+            .map((a) => a.trim())
+            .filter(Boolean);
+        for (const a of agents.length > 0 ? agents : [f.agent]) {
+            const list = by.get(a) ?? [];
+            list.push(f);
+            by.set(a, list);
+        }
+    }
+    return by;
+}
+const ESCALATE_TO = {
+    suggestion: "medium",
+    medium: "high",
+    high: "high",
+};
+/**
+ * Consensus escalation (issue #56c): a finding confirmed by >=2 independent
+ * agents (merged attribution from dedupe or synthesis) escalates one
+ * severity level before verdict math. Two independent agents agreeing is a
+ * stronger signal than one. Returns the escalated list plus the count, so
+ * callers can log what changed. Single-agent findings pass through
+ * untouched; already-high findings stay high.
+ */
+function escalateConsensus(findings) {
+    let escalated = 0;
+    const out = findings.map((f) => {
+        const distinct = new Set(f.agent
+            .split("+")
+            .map((a) => a.trim())
+            .filter(Boolean));
+        if (distinct.size < 2 || f.severity === "high")
+            return f;
+        escalated++;
+        return { ...f, severity: ESCALATE_TO[f.severity] };
+    });
+    return { findings: out, escalated };
+}
+/**
  * Drop findings matching decided-item patterns (rebutted items that must not
  * resurrect). Each pattern is a case-insensitive regex against
  * "<file> <comment>". Runs after dedupe, before noise controls and verdict
- * math — suppressed findings neither show nor vote.
+ * math - suppressed findings neither show nor vote.
  */
 function applySuppression(findings, patterns) {
     if (patterns.length === 0)
@@ -46771,8 +46825,9 @@ function cmpSemver(a, b) {
     }
     return 0;
 }
-// Per-review provider ballots (issue #12). Each distinct provider used by a
-// review's agents casts one ballot: its own verdict over its own findings.
+// Per-review agent ballots (issues #12, #56a). Each agent casts one ballot:
+// its own verdict over its own findings. A merged finding votes in each
+// contributing agent's ballot.
 // - any: most severe ballot wins (identical to the old pooled behavior).
 // - all: unanimous to escalate (minimum severity wins).
 // - majority: median ballot; even-count ties break toward more severe.
@@ -48838,6 +48893,15 @@ async function run() {
                         `(${suppress.length} pattern(s))`);
                 }
             }
+            // Consensus escalation (issue #56c, opt-in): findings confirmed by
+            // >=2 independent agents escalate one severity before verdict math.
+            if (review.verdict.consensus_escalation) {
+                const esc = escalateConsensus(findings);
+                if (esc.escalated > 0) {
+                    logInfo(`Review ${review.id}: consensus escalation raised ${esc.escalated} finding(s) one severity.`);
+                }
+                findings = esc.findings;
+            }
             // Noise controls (issue #21): confidence floor + cap, then verdict on survivors.
             const noise = resolveNoise({
                 profile: review.profile ?? config.defaults.profile,
@@ -48897,21 +48961,14 @@ async function run() {
             let verdict = (() => {
                 if (counted === 0)
                     return "approve"; // placeholder, excluded below
-                // One ballot per distinct provider (issue #12). `any` reproduces the
-                // old pooled behavior exactly; `all`/`majority` resolve disagreement.
-                // Dotted refs (`opencode.flash`) vote under their full ref, so two
-                // models on one transport disagree as two ballots (issue #67).
-                const byProvider = new Map();
-                // A synthesized finding merging several agents' reports votes in
-                // each source provider's ballot.
-                for (const f of findings) {
-                    for (const v of f.voters?.length ? f.voters : [f.provider]) {
-                        const list = byProvider.get(v) ?? [];
-                        list.push(f);
-                        byProvider.set(v, list);
-                    }
-                }
-                const ballots = [...byProvider.entries()].map(([name, fs]) => {
+                // One ballot per agent (issue #56a). `any` reproduces the old pooled
+                // behavior exactly (max of maxes); `all`/`majority` now resolve real
+                // multi-agent disagreement instead of degenerating to a single voter
+                // when every agent shares one provider (issue #12's per-provider
+                // ballots did that). A merged finding votes in each contributing
+                // agent's ballot.
+                const byAgent = groupByAgent(findings);
+                const ballots = [...byAgent.entries()].map(([name, fs]) => {
                     const v = decideReviewVerdict(review.verdict.mode, review.verdict.min_severity, fs);
                     logInfo(`Review ${review.id}: ballot ${name} -> ${v} (${fs.length} findings)`);
                     return v;
