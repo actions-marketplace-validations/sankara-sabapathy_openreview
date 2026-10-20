@@ -8,10 +8,16 @@ import {
   extractFindingsJson,
   describeResponseShape,
   runAgent,
+  runTextAgent,
   AgentFailedError,
   resolveDottedProvider,
   assertProviderRefs,
   countsAsReview,
+  normalizeStatus,
+  normalizeSuggestion,
+  normalizeConfidence,
+  findingSchema,
+  SUGGESTION_CAP,
 } from "./providers.js";
 import { parseConfig } from "./config.js";
 import { hasNestedQuantifier } from "./config.js";
@@ -718,5 +724,176 @@ describe("catastrophic patterns (dogfood on #81)", () => {
         }),
       /catastrophically slow/
     );
+  });
+});
+
+describe("normalizeStatus (issue #18)", () => {
+  it("passes through fixed and open", () => {
+    assert.equal(normalizeStatus("fixed"), "fixed");
+    assert.equal(normalizeStatus("open"), "open");
+  });
+  it("degrades anything else to new so unconfirmed findings keep voting", () => {
+    assert.equal(normalizeStatus(undefined), "new");
+    assert.equal(normalizeStatus("bogus"), "new");
+    assert.equal(normalizeStatus(42), "new");
+  });
+});
+
+describe("findingSchema variants (issues #18, #22)", () => {
+  it("base contract is unchanged", () => {
+    assert.equal(
+      findingSchema({ status: false, suggestion: false }),
+      '{"findings":[{"file":string,"line":number|null,"severity":"high|medium|suggestion","category":string,"comment":string,"confidence":0-1}]}'
+    );
+  });
+  it("adds each optional field independently", () => {
+    assert.match(findingSchema({ status: true, suggestion: false }), /"status":"fixed\|open\|new"/);
+    assert.doesNotMatch(findingSchema({ status: true, suggestion: false }), /"suggestion":/);
+    assert.match(findingSchema({ status: false, suggestion: true }), /"suggestion":/);
+    assert.doesNotMatch(findingSchema({ status: false, suggestion: true }), /"status":/);
+    assert.match(findingSchema({ status: true, suggestion: true }), /"status":"fixed\|open\|new"/);
+    assert.match(findingSchema({ status: true, suggestion: true }), /"suggestion":/);
+  });
+});
+
+describe("normalizeSuggestion (issue #22)", () => {
+  it("keeps real suggestions, capped", () => {
+    assert.equal(normalizeSuggestion("  fix();\n"), "fix();");
+    assert.equal(normalizeSuggestion("x".repeat(SUGGESTION_CAP + 100))?.length, SUGGESTION_CAP);
+  });
+  it("drops empty and non-string values", () => {
+    assert.equal(normalizeSuggestion("   "), undefined);
+    assert.equal(normalizeSuggestion(undefined), undefined);
+    assert.equal(normalizeSuggestion(42), undefined);
+  });
+});
+
+describe("normalizeConfidence (issue #56)", () => {
+  it("passes through in-range numbers", () => {
+    assert.equal(normalizeConfidence(0.9), 0.9);
+    assert.equal(normalizeConfidence(0), 0);
+    assert.equal(normalizeConfidence(1), 1);
+  });
+  it("clamps out-of-range values instead of passing them through", () => {
+    assert.equal(normalizeConfidence(5), 1);
+    assert.equal(normalizeConfidence(-2), 0);
+  });
+  it("coerces numeric strings", () => {
+    assert.equal(normalizeConfidence("0.9"), 0.9);
+    assert.equal(normalizeConfidence(" 0.5 "), 0.5);
+  });
+  it("falls back to 0.7 for garbage", () => {
+    assert.equal(normalizeConfidence(undefined), 0.7);
+    assert.equal(normalizeConfidence("high"), 0.7);
+    assert.equal(normalizeConfidence(Number.NaN), 0.7);
+  });
+});
+
+describe("runTextAgent (issue #23)", () => {
+  const cfg = parseConfig({
+    version: 1,
+    providers: { oai: { model: "m", kind: "openai", base_url: "http://127.0.0.1:1/v1" } },
+    reviews: [{ id: "r", main: { provider: "oai", instructions: "i" } }],
+  });
+  const keys = {
+    anthropicApiKey: "",
+    openaiApiKey: "k",
+    opencodeApiKey: "",
+    opencodeBaseUrl: "",
+    githubToken: "",
+  };
+  const base = {
+    agentName: "ask",
+    providerName: "oai",
+    provider: cfg.providers.oai,
+    system: "s",
+    user: "u",
+    keys,
+    sessionId: "s",
+  };
+  const chat = (content: string, usage: any) =>
+    new Response(JSON.stringify({ choices: [{ message: { content } }], usage }));
+  const withFetch = async (impl: (url: any, init: any) => Promise<Response>, fn: () => Promise<any>) => {
+    const real = globalThis.fetch;
+    globalThis.fetch = impl as any;
+    try {
+      return await fn();
+    } finally {
+      globalThis.fetch = real;
+    }
+  };
+
+  it("returns trimmed prose with spend accounted", async () => {
+    const r = await withFetch(
+      async () => chat("  The bug is fixed.  ", { prompt_tokens: 100, completion_tokens: 20 }),
+      () => runTextAgent(base)
+    );
+    assert.equal(r.text, "The bug is fixed.");
+    assert.equal(r.outcome, "ok");
+    assert.deepEqual(r.usage, { in: 100, out: 20 });
+    assert.equal(r.attempts, 1);
+  });
+
+  it("sends no response_format so the answer stays prose", async () => {
+    let sent: any = null;
+    await withFetch(
+      async (_url: any, init: any) => {
+        sent = JSON.parse(init.body);
+        return chat("hi", { prompt_tokens: 1, completion_tokens: 1 });
+      },
+      () => runTextAgent(base)
+    );
+    assert.ok(!("response_format" in sent), "prose call must not force JSON");
+  });
+
+  it("retries an empty answer once, then throws with spend", async () => {
+    let n = 0;
+    const err = await withFetch(async () => {
+      n++;
+      return chat("", { prompt_tokens: 10, completion_tokens: 5 });
+    }, () => runTextAgent(base).then(() => null, (e) => e));
+    assert.ok(err instanceof AgentFailedError);
+    assert.equal(n, 2);
+    assert.deepEqual(err.usageTotal, { in: 20, out: 10 });
+  });
+
+  it("skips without a key and refuses past the deadline", async () => {
+    const noKey = await runTextAgent({ ...base, keys: { ...keys, openaiApiKey: "" } });
+    assert.equal(noKey.outcome, "skipped-no-key");
+    const late = await runTextAgent({ ...base, deadlineAt: Date.now() - 1 });
+    assert.equal(late.outcome, "budget-exhausted");
+  });
+});
+
+describe("system prompt (issue #58a)", () => {
+  it("marks the diff as untrusted data, not instructions", async () => {
+    const cfg = parseConfig({
+      version: 1,
+      providers: { oai: { model: "m", kind: "openai", base_url: "http://127.0.0.1:1/v1" } },
+      reviews: [{ id: "r", main: { provider: "oai", instructions: "i" } }],
+    });
+    let sent: any = null;
+    const real = globalThis.fetch;
+    globalThis.fetch = (async (_url: any, init: any) => {
+      sent = JSON.parse(init.body);
+      return new Response(JSON.stringify({ choices: [{ message: { content: '{"findings":[]}' } }], usage: {} }));
+    }) as any;
+    try {
+      await runAgent({
+        agentName: "a",
+        providerName: "oai",
+        provider: cfg.providers.oai,
+        instructions: "i",
+        diff: "d",
+        lang: "en",
+        keys: { anthropicApiKey: "", openaiApiKey: "k", opencodeApiKey: "", opencodeBaseUrl: "", githubToken: "" },
+        maxDiffChars: 100,
+        sessionId: "s",
+      });
+    } finally {
+      globalThis.fetch = real;
+    }
+    const system = sent.messages.find((m: any) => m.role === "system").content;
+    assert.match(system, /UNTRUSTED DATA/);
   });
 });

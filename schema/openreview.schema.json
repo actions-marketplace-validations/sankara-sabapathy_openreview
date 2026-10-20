@@ -101,13 +101,16 @@
           "min_confidence": { "type": "number", "minimum": 0, "maximum": 1 },
           "max_findings": { "type": "integer", "minimum": 1 },
           "suppress": { "type": "array", "items": { "type": "string" } },
+          "incremental": { "type": "boolean", "default": false, "description": "Re-review only head-vs-last-reviewed-SHA on synchronize, carrying prior findings for fix validation." },
+          "suggest_fixes": { "type": "boolean", "default": true, "description": "Ask agents for full replacement lines, rendered as appliable suggestion blocks." },
           "verdict": {
             "type": "object",
             "properties": {
               "mode": { "enum": ["comment", "approve", "request_changes"] },
               "min_severity": { "enum": ["suggestion", "medium", "high"] },
               "post_inline": { "type": "boolean" },
-              "deduplicate": { "type": "boolean" }
+              "deduplicate": { "type": "boolean" },
+              "consensus_escalation": { "type": "boolean", "default": false, "description": "Escalate findings confirmed by 2+ agents one severity before verdict math." }
             }
           }
         }

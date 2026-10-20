@@ -3,6 +3,26 @@ import { lineInRanges } from "./reviewer.js";
 
 export const STICKY_MARKER = "<!-- openreview:sticky -->";
 
+/** Scrub key-shaped secrets out of error text (issue #58f). Provider error
+ * bodies travel into the sticky's agent-error block; a gateway that echoes
+ * request material must never leak a credential into a PR comment. */
+const SECRET_RES = [
+  /sk-[A-Za-z0-9-_]{10,}/g,
+  /gh[pousr]_[A-Za-z0-9]{10,}/g,
+  /xox[bpas]-[A-Za-z0-9-]{10,}/g,
+  /AKIA[0-9A-Z]{16}/g,
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----/g,
+];
+
+/** Truncate to ~300 chars and scrub key-shaped strings. Best-effort: exact
+ * originals stay in the Actions log for debugging. */
+export function sanitizeErrorDetail(text: string, cap = 300): string {
+  let out = text;
+  for (const re of SECRET_RES) out = out.replace(re, "[redacted]");
+  out = out.replace(/\s+/g, " ").trim();
+  return out.length > cap ? out.slice(0, cap) + "…" : out;
+}
+
 function actionBase(): { repo: string; ref: string } {
   // Prefer the action's own coordinates so forks/renames keep working; the
   // hardcoded default matches this repo's published location.
@@ -139,6 +159,7 @@ type RunContentOpts = {
     severity: string;
     category: string;
     comment: string;
+    suggestion?: string;
     agent: string;
     provider: string;
     model: string;
@@ -191,13 +212,18 @@ function renderRunBody(opts: RunContentOpts): string[] {
     lines.push("| Severity | File | Finding | Agent |");
     lines.push("|---|---|---|---|");
     for (const f of findings.slice(0, 50)) {
-      const loc = f.line ? `${f.file}:${f.line}` : f.file;
+      // Every cell is model-controlled text: escape pipes everywhere and
+      // neutralize backticks in the file cell (an unmatched ` would break
+      // out of the code span and reshape the table) (issue #58).
+      const loc = (f.line ? `${f.file}:${f.line}` : f.file).replace(/\|/g, "\\|").replace(/`/g, "'");
       const one = f.comment.replace(/\n+/g, " ").replace(/\|/g, "\\|").slice(0, 220);
-      lines.push(`| ${f.severity} | \`${loc}\` | ${one} | ${f.agent}/${f.provider}/${f.model} |`);
+      const by = `${f.agent}/${f.provider}/${f.model}`.replace(/\|/g, "\\|");
+      lines.push(`| ${f.severity} | \`${loc}\` | ${one} | ${by} |`);
     }
     if (findings.length > 50)
       lines.push(`\n… and ${findings.length - 50} more (see inline comments).`);
   }
+  lines.push(...renderSuggestedFixes(findings));
   const agents = opts.agents ?? [];
   const rough = agents.filter((a) => a.outcome !== "ok" && a.outcome !== "no-findings");
   if (agents.length > 0) {
@@ -220,6 +246,61 @@ function renderRunBody(opts: RunContentOpts): string[] {
 }
 
 const REREVIEW_LINE = "<sub>Re-review with `/review`. Config: `.github/openreview.yml`.</sub>";
+
+/** Cap for the sticky suggested-fixes section (issue #22). */
+export const SUGGESTED_FIXES_SHOWN = 10;
+
+const SUGGEST_LANG: [RegExp, string][] = [
+  [/\.tsx?$/, "ts"],
+  [/\.jsx?$/, "js"],
+  [/\.py$/, "python"],
+  [/\.go$/, "go"],
+  [/\.rs$/, "rust"],
+  [/\.java$/, "java"],
+  [/\.md$/, "markdown"],
+  [/\.ya?ml$/, "yaml"],
+  [/\.json$/, "json"],
+  [/\.sh$/, "bash"],
+];
+
+/** Strip fences so model output cannot break out of our code block. */
+export function sanitizeSuggestion(code: string): string {
+  return code.replace(/```/g, "").trim();
+}
+
+function suggestLang(file: string): string {
+  for (const [re, lang] of SUGGEST_LANG) if (re.test(file)) return lang;
+  return "";
+}
+
+/**
+ * One-click fixes (issue #22): findings carrying `suggestion` get a
+ * collapsed section with fenced replacement blocks. Inline comments carry
+ * the appliable ```suggestion form instead (see createInlineReview); the
+ * sticky shows plain fences since table cells cannot hold them and the
+ * section has no diff position to apply against.
+ */
+export function renderSuggestedFixes(
+  findings: { file: string; line?: number; comment: string; suggestion?: string }[]
+): string[] {
+  const withFix = findings.filter((f) => f.suggestion && f.suggestion.trim().length > 0);
+  if (withFix.length === 0) return [];
+  const shown = withFix.slice(0, SUGGESTED_FIXES_SHOWN);
+  const lines = [
+    "",
+    `<details><summary>Suggested fixes (${withFix.length})</summary>`,
+    "",
+  ];
+  for (const f of shown) {
+    const loc = f.line ? `${f.file}:${f.line}` : f.file;
+    lines.push(`**\`${loc}\`** — ${f.comment.replace(/\s+/g, " ").slice(0, 160)}`, "");
+    lines.push(`\`\`\`${suggestLang(f.file)}`, sanitizeSuggestion(f.suggestion!), "```", "");
+  }
+  if (withFix.length > shown.length)
+    lines.push(`… and ${withFix.length - shown.length} more (see inline comments).`, "");
+  lines.push("</details>");
+  return lines;
+}
 
 /**
  * Machine-readable run state for incremental re-review (issue #18).
@@ -536,7 +617,7 @@ export async function createInlineReview(
   pullNumber: number,
   commitSha: string,
   verdict: "approve" | "comment" | "request_changes",
-  findings: { file: string; line?: number; comment: string }[],
+  findings: { file: string; line?: number; comment: string; suggestion?: string }[],
   /** Commentable line ranges per changed file (new-file coordinates). */
   validLines: Map<string, { start: number; end: number }[]>
 ): Promise<InlineResult> {
@@ -547,7 +628,7 @@ export async function createInlineReview(
   // the dropped count on the sticky instead of failing silently.
   let dropped = 0;
   const comments = [];
-  const fileLevel: { file: string; comment: string }[] = [];
+  const fileLevel: { file: string; comment: string; suggestion?: string }[] = [];
   // No early exit at the 20-comment cap: the loop must still collect later
   // file-level notes and count later drops, or the sticky understates what
   // never made it inline (dogfood on #73).
@@ -559,7 +640,7 @@ export async function createInlineReview(
         dropped++;
         continue;
       }
-      fileLevel.push({ file: f.file, comment: f.comment });
+      fileLevel.push({ file: f.file, comment: f.comment, ...(f.suggestion ? { suggestion: f.suggestion } : {}) });
       continue;
     }
     const ranges = validLines.get(f.file);
@@ -567,7 +648,13 @@ export async function createInlineReview(
       dropped++;
       continue;
     }
-    if (comments.length < 20) comments.push({ path: f.file, line: f.line as number, body: f.comment });
+    // One-click fix (issue #22): a ```suggestion block on a valid diff
+    // position renders as an appliable suggestion in the GitHub UI.
+    const body =
+      f.suggestion && f.suggestion.trim()
+        ? `${f.comment}\n\n\`\`\`suggestion\n${sanitizeSuggestion(f.suggestion)}\n\`\`\``
+        : f.comment;
+    if (comments.length < 20) comments.push({ path: f.file, line: f.line as number, body });
     else dropped++; // valid but over the cap — counted, not silently lost
   }
   // File-level (line-less) findings used to be silently discarded by the
@@ -579,6 +666,12 @@ export async function createInlineReview(
     body += "\n\n**File-level notes:**\n" + shown.map((f) => `- \`${f.file}\`: ${f.comment}`).join("\n");
     if (fileLevel.length > shown.length)
       body += `\n… and ${fileLevel.length - shown.length} more (see sticky comment).`;
+    // Suggestions without a diff position cannot apply; show them fenced.
+    for (const f of shown) {
+      if (f.suggestion && f.suggestion.trim()) {
+        body += `\n\n**Suggested fix for \`${f.file}\`:**\n\`\`\`\n${sanitizeSuggestion(f.suggestion)}\n\`\`\``;
+      }
+    }
   }
   await octokit.rest.pulls.createReview({
     owner, repo, pull_number: pullNumber, commit_id: commitSha, event: event as any,

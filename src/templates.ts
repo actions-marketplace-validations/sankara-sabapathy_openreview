@@ -2,7 +2,6 @@ import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import * as path from "node:path";
 import * as YAML from "yaml";
-import * as core from "@actions/core";
 import { logInfo } from "./logger.js";
 import { OpenReviewConfig, type OpenReviewConfig as Config } from "./config.js";
 

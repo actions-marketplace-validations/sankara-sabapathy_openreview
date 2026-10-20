@@ -46,6 +46,10 @@ reviews:
   - id: general-quality
     if_paths: ["**"] # which files this review SEES (the diff is scoped to these, too)
     main_mode: synthesize # default: main runs after the subagents and merges their findings; `parallel` = main is one more reviewer
+    # incremental: false # default: on synchronize, review head-vs-last-reviewed-SHA and
+    # carry prior findings for fix validation (see multi-review); /review always runs full
+    # suggest_fixes: false # default true: agents attach full replacement lines, rendered
+    # as appliable ```suggestion blocks inline and a Suggested fixes section on the sticky
     main: # synthesizer; name defaults to "<id>:main"
       provider: go # or go.flash for a models entry; unknown `go.typo` fails the run naming both
       instructions: "Synthesize sub-agent findings. Strict on bugs, lenient on style."
@@ -57,7 +61,8 @@ reviews:
       mode: comment # comment | approve | request_changes
       min_severity: medium # suggestion | medium | high
       post_inline: true
-      deduplicate: true
+      deduplicate: true # merge near-duplicate findings (same file+line, ~same comment) into one row attributed to every reporting agent; model fields are validated (confidence clamped to 0-1, numeric strings coerced) and findings on files outside if_paths are dropped with a log line
+      # consensus_escalation: true # escalate 2+-agent-confirmed findings one severity (opt-in; default false)
 
 ## File context (beyond the diff)
 

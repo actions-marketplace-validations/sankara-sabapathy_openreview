@@ -44,6 +44,109 @@ export function filterIgnored(files: string[], ignore: string[]): string[] {
 export type DiffFile = { file: string; patch: string };
 
 /**
+ * Cheap prompt-injection tripwire (issue #58a). The diff is untrusted
+ * PR-author text inside every agent prompt; instruction-shaped lines get
+ * flagged in the logs and the sticky so a human sees them. Heuristic, not
+ * a block: a flagged line is still reviewed as code.
+ */
+const INJECTION_RES = [
+  /\bignore\s+(all\s+)?(previous|prior|above|all)\s+instructions?\b/i,
+  /\bdisregard\b[^\n]{0,80}\binstructions?\b/i,
+  /\byou are now\b/i,
+];
+
+export function scanPromptInjection(diff: string, cap = 5): string[] {
+  const hits: string[] = [];
+  for (const line of diff.split("\n")) {
+    const t = /^[+\- ]/.test(line) ? line.slice(1).trim() : line.trim();
+    if (t && INJECTION_RES.some((re) => re.test(t))) {
+      hits.push(t.slice(0, 120));
+      if (hits.length >= cap) break;
+    }
+  }
+  return hits;
+}
+
+/**
+ * Render the previous round's open findings for an incremental review
+ * prompt (issue #18). Numbered, capped, locations flagged as stale: line
+ * numbers refer to the OLD head and may have shifted, so agents must match
+ * by file and issue, never by exact line. Callers treat unlisted remainder
+ * as still open (fail-safe: only an explicit "fixed" label resolves).
+ */
+export const PRIOR_FINDINGS_CAP = 20;
+
+export function renderPriorReview(
+  findings: { file: string; line?: number; severity: string; category: string; comment: string }[]
+): { block: string; shown: number; total: number } {
+  const shown = findings.slice(0, PRIOR_FINDINGS_CAP);
+  const lines = shown.map((f, i) => {
+    const at = f.line !== undefined ? `:${f.line}` : "";
+    return `P${i + 1}. [${f.severity}] ${f.file}${at} (${f.category}) — ${f.comment.replace(/\s+/g, " ").slice(0, 300)}`;
+  });
+  lines.unshift("Prior round's open findings (OLD head line numbers - locations may have shifted, match by file and issue):");
+  if (findings.length > shown.length) {
+    lines.push(`(+${findings.length - shown.length} more prior findings not shown; treat them as still open.)`);
+  }
+  return { block: lines.join("\n"), shown: shown.length, total: findings.length };
+}
+
+const normHead = (s: string) => s.toLowerCase().replace(/\s+/g, " ").trim().slice(0, 60);
+
+/**
+ * Link this round's findings back to the prior round's (issue #18).
+ * A carried finding is "fixed" only when an agent explicitly labeled a
+ * matching finding fixed AND no agent reports it open/new: disagreement
+ * resolves toward open, and an unmentioned prior finding stays open
+ * (fail-safe — an incremental diff cannot prove a negative). Matching is
+ * same-file plus close line (±5, tolerating shifted hunks) or equal
+ * comment head, falling back to comment head alone for line-less findings.
+ * Unmatched current findings are new by definition: the review can only
+ * validate what the previous round recorded.
+ */
+export function matchCarriedFindings<
+  P extends { file: string; line?: number; comment: string },
+  C extends { file: string; line?: number; comment: string; status?: "fixed" | "open" | "new" },
+>(
+  prior: P[],
+  current: C[]
+): { fixed: P[]; open: P[]; unverified: P[]; fresh: C[]; confirmed: C[]; resolved: C[] } {
+  const used = new Set<number>();
+  const fixed: P[] = [];
+  const open: P[] = [];
+  const unverified: P[] = [];
+  const confirmed: C[] = [];
+  const resolved: C[] = [];
+  for (const p of prior) {
+    const hits = current
+      .map((c, i) => ({ c, i }))
+      .filter(
+        ({ c, i }) =>
+          !used.has(i) &&
+          c.file === p.file &&
+          (p.line !== undefined && c.line !== undefined
+            ? Math.abs(p.line - c.line) <= 5
+            : normHead(p.comment) === normHead(c.comment))
+      );
+    if (hits.length === 0) {
+      open.push(p);
+      unverified.push(p);
+      continue;
+    }
+    const anyOpen = hits.some(({ c }) => (c.status ?? "new") !== "fixed");
+    for (const { c, i } of hits) {
+      used.add(i);
+      ((c.status ?? "new") === "fixed" ? resolved : confirmed).push(c);
+    }
+    (anyOpen ? open : fixed).push(p);
+  }
+  const fresh = current
+    .filter((_, i) => !used.has(i))
+    .map((c) => ((c.status ?? "new") === "fixed" ? { ...c, status: "new" as const } : c));
+  return { fixed, open, unverified, fresh, confirmed, resolved };
+}
+
+/**
  * Split a multi-file unified diff into per-file patches (issue #47).
  * GitHub hands us one blob built as
  *   --- a/<file>\n+++ b/<file>\n<patch>
@@ -138,25 +241,160 @@ export function lineInRanges(line: number, ranges: { start: number; end: number 
   return ranges.some((r) => line >= r.start && line <= r.end);
 }
 
-export function dedupeFindings<T extends { file: string; line?: number; comment: string }>(
-  findings: T[]
-): T[] {
-  const seen = new Set<string>();
+/** Findings that can be merged by dedupeFindings: identity plus the fields
+ * a merge combines (agents, providers, confidence, severity). */
+export type MergeableFinding = {
+  file: string;
+  line?: number;
+  comment: string;
+  severity: "high" | "medium" | "suggestion";
+  confidence: number;
+  agent: string;
+  provider: string;
+  model: string;
+  voters?: string[];
+};
+
+const DEDUPE_JACCARD = 0.8;
+
+function commentTokens(s: string): Set<string> {
+  return new Set(s.toLowerCase().split(/[^a-z0-9_]+/).filter((t) => t.length >= 3));
+}
+
+function tokenJaccard(a: Set<string>, b: Set<string>): number {
+  // No qualifying tokens on either side is no signal, not a perfect match:
+  // identical comments already merge via the exact-equality fast path.
+  if (a.size === 0 || b.size === 0) return 0;
+  let inter = 0;
+  for (const t of a) if (b.has(t)) inter++;
+  return inter / (a.size + b.size - inter);
+}
+
+const SEVERITY_RANK = { high: 0, medium: 1, suggestion: 2 } as const;
+
+/**
+ * Near-duplicate merging (issue #56). Exact duplicates collapse with
+ * combined attribution, and same-file/same-line findings whose comments
+ * are near-identical (token-set Jaccard >= 0.8) merge into one row
+ * attributed to every reporting agent (confidence = max, severity = max),
+ * so two agents confirming one bug render once instead of twice — and the
+ * merged row keeps voting in each source provider's ballot via `voters`.
+ * Two genuinely different findings that merely share an 80-char comment
+ * prefix no longer collapse (the old key), and findings on different lines
+ * never merge even when the prose matches (repeated code patterns are
+ * distinct bugs until proven otherwise).
+ */
+export function dedupeFindings<T extends MergeableFinding>(findings: T[]): T[] {
   const out: T[] = [];
+  const toks: Set<string>[] = [];
   for (const f of findings) {
-    const k = `${f.file}:${f.line ?? 0}:${f.comment.slice(0, 80)}`;
-    if (seen.has(k)) continue;
-    seen.add(k);
-    out.push(f);
+    let at = -1;
+    for (let i = 0; i < out.length; i++) {
+      const o = out[i];
+      if (o.file !== f.file || (o.line ?? -1) !== (f.line ?? -1)) continue;
+      if (o.comment === f.comment || tokenJaccard(toks[i], commentTokens(f.comment)) >= DEDUPE_JACCARD) {
+        at = i;
+        break;
+      }
+    }
+    if (at < 0) {
+      out.push(f);
+      toks.push(commentTokens(f.comment));
+      continue;
+    }
+    const o = out[at];
+    const agents = [...new Set([...o.agent.split("+"), ...f.agent.split("+")])];
+    const voters = [...new Set([...(o.voters ?? [o.provider]), ...(f.voters ?? [f.provider])])];
+    out[at] = {
+      ...o,
+      severity: SEVERITY_RANK[o.severity] <= SEVERITY_RANK[f.severity] ? o.severity : f.severity,
+      confidence: Math.max(o.confidence, f.confidence),
+      agent: agents.join("+"),
+      voters,
+    };
+    toks[at] = new Set([...toks[at], ...commentTokens(f.comment)]);
   }
   return out;
+}
+
+/**
+ * Drop findings on files outside the review's scope (issue #56, field
+ * validation). Model output is untrusted: a finding on a file the review
+ * was never sent must neither show nor vote. Dropped findings are returned
+ * (not silently lost) so the caller can name them in the logs.
+ */
+export function validateFindingFiles<T extends { file: string; comment: string }>(
+  findings: T[],
+  scopedFiles: string[]
+): { visible: T[]; dropped: T[] } {
+  const allowed = new Set(scopedFiles);
+  const visible: T[] = [];
+  const dropped: T[] = [];
+  for (const f of findings) (allowed.has(f.file) ? visible : dropped).push(f);
+  return { visible, dropped };
+}
+
+/**
+ * Group findings into one ballot per agent (issue #56a). A finding merged
+ * from several agents' reports (agent "sec+corr") counts in each source
+ * agent's ballot, so `strategy: all | majority` resolves real multi-agent
+ * disagreement instead of degenerating to a single voter when every agent
+ * shares one provider. The old per-provider grouping collapsed main and all
+ * subagents on the same transport into one ballot.
+ */
+export function groupByAgent<T extends { agent: string }>(findings: T[]): Map<string, T[]> {
+  const by = new Map<string, T[]>();
+  for (const f of findings) {
+    const agents = f.agent
+      .split("+")
+      .map((a) => a.trim())
+      .filter(Boolean);
+    for (const a of agents.length > 0 ? agents : [f.agent]) {
+      const list = by.get(a) ?? [];
+      list.push(f);
+      by.set(a, list);
+    }
+  }
+  return by;
+}
+
+const ESCALATE_TO: Record<string, "high" | "medium" | "suggestion"> = {
+  suggestion: "medium",
+  medium: "high",
+  high: "high",
+};
+
+/**
+ * Consensus escalation (issue #56c): a finding confirmed by >=2 independent
+ * agents (merged attribution from dedupe or synthesis) escalates one
+ * severity level before verdict math. Two independent agents agreeing is a
+ * stronger signal than one. Returns the escalated list plus the count, so
+ * callers can log what changed. Single-agent findings pass through
+ * untouched; already-high findings stay high.
+ */
+export function escalateConsensus<T extends { agent: string; severity: "high" | "medium" | "suggestion" }>(
+  findings: T[]
+): { findings: T[]; escalated: number } {
+  let escalated = 0;
+  const out = findings.map((f) => {
+    const distinct = new Set(
+      f.agent
+        .split("+")
+        .map((a) => a.trim())
+        .filter(Boolean)
+    );
+    if (distinct.size < 2 || f.severity === "high") return f;
+    escalated++;
+    return { ...f, severity: ESCALATE_TO[f.severity] };
+  });
+  return { findings: out, escalated };
 }
 
 /**
  * Drop findings matching decided-item patterns (rebutted items that must not
  * resurrect). Each pattern is a case-insensitive regex against
  * "<file> <comment>". Runs after dedupe, before noise controls and verdict
- * math — suppressed findings neither show nor vote.
+ * math - suppressed findings neither show nor vote.
  */
 export function applySuppression<T extends { file: string; comment: string }>(
   findings: T[],
@@ -177,6 +415,9 @@ export function applyDegradedFloor(verdict: Verdict, counted: number, total: num
   if (counted <= 0 || counted >= total) return verdict;
   return verdict === "approve" ? "comment" : verdict;
 }
+
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 
 export type Verdict = "approve" | "comment" | "request_changes";
 
@@ -277,8 +518,9 @@ function cmpSemver(a: Semver, b: Semver): number {
   return 0;
 }
 
-// Per-review provider ballots (issue #12). Each distinct provider used by a
-// review's agents casts one ballot: its own verdict over its own findings.
+// Per-review agent ballots (issues #12, #56a). Each agent casts one ballot:
+// its own verdict over its own findings. A merged finding votes in each
+// contributing agent's ballot.
 // - any: most severe ballot wins (identical to the old pooled behavior).
 // - all: unanimous to escalate (minimum severity wins).
 // - majority: median ballot; even-count ties break toward more severe.
@@ -327,5 +569,33 @@ export function runningActionVersion(env: NodeJS.ProcessEnv): string | null {
   if (env["OPENREVIEW_ACTION_VERSION"]) return env["OPENREVIEW_ACTION_VERSION"] as string;
   const ref = env["GITHUB_ACTION_REF"] ?? "";
   if (/^v?\d+\.\d+\.\d+/.test(ref)) return ref;
+  return null;
+}
+
+/**
+ * The release version the action is running as (issue #58c). The workflow
+ * usually pins a floating ref (`@v1`), which `GITHUB_ACTION_REF` cannot
+ * resolve — so the `requires_action` floor used to skip silently. Instead,
+ * read the action's own `package.json` (present both in the marketplace
+ * download and in a local `./` checkout via GITHUB_ACTION_PATH), falling
+ * back to the bundle directory. No new committed artifact: release-please
+ * already bumps the version, and any extra dist file would go stale on
+ * every release and trip the dist-fresh check. Returns null when nothing
+ * version-shaped is found — the floor keeps its old skip-if-unknown
+ * behavior. Takes directories explicitly so tests can use fixtures.
+ */
+export function builtActionVersion(dirs: { actionPath?: string; distDir?: string }): string | null {
+  for (const dir of [dirs.actionPath, dirs.distDir]) {
+    if (!dir) continue;
+    try {
+      const pkg: unknown = JSON.parse(readFileSync(join(dir, "package.json"), "utf8"));
+      if (pkg && typeof pkg === "object" && typeof (pkg as { version?: unknown }).version === "string") {
+        const v = (pkg as { version: string }).version.trim();
+        if (/^v?\d+\.\d+\.\d+/.test(v)) return v;
+      }
+    } catch {
+      // Missing or unparseable: try the next location.
+    }
+  }
   return null;
 }

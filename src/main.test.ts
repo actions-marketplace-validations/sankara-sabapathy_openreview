@@ -1,6 +1,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { runPooled, getPrDiff, MAX_DIFF_FILES, summarizeUsage, selectInlineFindings } from "./main.js";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { runPooled, getPrDiff, getIncrementalDiff, decideIncremental, loadConfig, MAX_DIFF_FILES, summarizeUsage, selectInlineFindings } from "./main.js";
 
 describe("runPooled (issue #51)", () => {
   it("preserves result order regardless of completion order", async () => {
@@ -207,5 +209,93 @@ describe("selectInlineFindings (issue #53)", () => {
   });
   it("empty when everything opts out", () => {
     assert.deepEqual(selectInlineFindings([{ postInline: false, findings: [f("a.ts")] }]), []);
+  });
+});
+
+describe("decideIncremental (issue #18)", () => {
+  const base = {
+    incremental: true,
+    isSynchronize: true,
+    prior: { sha: "base0000", truncated: false },
+    headSha: "head1234",
+    incDiffOk: true,
+    incScopedEmpty: false,
+  };
+  it("runs incremental when opted in with usable prior state and new changes", () => {
+    const m = decideIncremental(base);
+    assert.equal(m.kind, "incremental");
+    if (m.kind === "incremental") assert.equal(m.baseShort, "base000");
+  });
+  it("falls back to full without opt-in, off synchronize, or without prior", () => {
+    assert.equal(decideIncremental({ ...base, incremental: false }).kind, "full");
+    assert.equal(decideIncremental({ ...base, isSynchronize: false }).kind, "full");
+    assert.equal(decideIncremental({ ...base, prior: null }).kind, "full");
+  });
+  it("falls back to full on truncated state or missing diff", () => {
+    assert.equal(decideIncremental({ ...base, prior: { sha: "base0000", truncated: true } }).kind, "full");
+    assert.equal(decideIncremental({ ...base, incDiffOk: false }).kind, "full");
+  });
+  it("carries when nothing new landed or nothing new is in scope", () => {
+    assert.deepEqual(decideIncremental({ ...base, headSha: "base0000" }), {
+      kind: "carry",
+      reason: "no-new-commits",
+    });
+    assert.deepEqual(decideIncremental({ ...base, incScopedEmpty: true }), {
+      kind: "carry",
+      reason: "no-new-in-scope-changes",
+    });
+  });
+});
+
+describe("getIncrementalDiff (issue #18)", () => {
+  const fake = (files: { filename: string; patch?: string }[], headSha = "head1234") => ({
+    rest: {
+      repos: { compareCommits: async () => ({ data: { files } }) },
+      pulls: { get: async () => ({ data: { head: { sha: headSha } } }) },
+    },
+  }) as any;
+
+  it("returns base..head patches in DiffFile shape", async () => {
+    const out = await getIncrementalDiff(
+      fake([{ filename: "a.ts", patch: "@@ -1 +1 @@\n+x" }, { filename: "logo.png" }]),
+      "o",
+      "r",
+      7,
+      "base0000",
+      "head1234"
+    );
+    assert.deepEqual(out.fileNames, ["a.ts", "logo.png"]);
+    assert.deepEqual(out.omitted, ["logo.png"]);
+    assert.equal(out.headSha, "head1234");
+    assert.equal(out.truncated, false);
+    assert.ok(out.diff.includes("+++ b/a.ts"));
+  });
+
+  it("flags a mid-fetch head move as stale", async () => {
+    const octokit = fake([{ filename: "a.ts", patch: "@@ -1 +1 @@\n+x" }], "newhead99");
+    const out = await getIncrementalDiff(octokit, "o", "r", 7, "base0000", "head1234");
+    assert.equal(out.stale, true);
+    assert.equal(out.headSha, "newhead99");
+  });
+
+  it("throws on an unresolvable base so the caller falls back to full diff", async () => {
+    const octokit = {
+      rest: {
+        repos: {
+          compareCommits: async () => {
+            throw new Error("404 base not found (force-push rewrote history)");
+          },
+        },
+        pulls: { get: async () => ({ data: { head: { sha: "head1234" } } }) },
+      },
+    } as any;
+    await assert.rejects(() => getIncrementalDiff(octokit, "o", "r", 7, "gone0000", "head1234"), /404/);
+  });
+});
+
+describe("loadConfig explicit path (issue #58d)", () => {
+  it("fails hard when an explicit config-path names nothing", async () => {
+    const missing = join(tmpdir(), "openreview-no-such-config-xyz.yml");
+    await assert.rejects(() => loadConfig(missing, true), /not falling back/);
   });
 });

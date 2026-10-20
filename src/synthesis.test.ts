@@ -144,6 +144,36 @@ describe("mergeSynthesis", () => {
     const out = mergeSynthesis(prior, [], synth());
     assert.deepEqual(out.findings, prior.map((p) => p.finding));
   });
+
+  it("inherits validation status through the merge (issue #18)", () => {
+    const labeled = labelFindings([
+      f({ comment: "fixed bug", status: "fixed" }),
+      f({ comment: "fixed bug again", status: "fixed" }),
+      f({ comment: "open bug", status: "open" }),
+      f({ comment: "fresh bug", status: "new" }),
+    ]);
+    const out = mergeSynthesis(
+      labeled,
+      [main({ comment: "merged fix" }), main({ comment: "merged open" }), main({ comment: "own addition" })],
+      synth({ sources: [["F1", "F2"], ["F3", "F4"], []] })
+    );
+    const byComment = new Map(out.findings.map((x) => [x.comment, x]));
+    assert.equal(byComment.get("merged fix")?.status, "fixed");
+    assert.equal(byComment.get("merged open")?.status, "new");
+    assert.equal(byComment.get("own addition")?.status, "new");
+  });
+
+  it("an explicit synthesizer status wins over inheritance", () => {
+    const labeled = labelFindings([f({ comment: "bug", status: "open" })]);
+    const out = mergeSynthesis(labeled, [main({ comment: "done", status: "fixed" })], synth({ sources: [["F1"]] }));
+    assert.equal(out.findings[0].status, "fixed");
+  });
+
+  it("carries suggestions through the merge (issue #22)", () => {
+    const labeled = labelFindings([f({ comment: "bug", status: "open", suggestion: "fix();" })]);
+    const out = mergeSynthesis(labeled, [main({ comment: "merged bug" })], synth({ sources: [["F1"]] }));
+    assert.equal(out.findings[0].suggestion, "fix();");
+  });
 });
 
 describe("runReviewAgents", () => {

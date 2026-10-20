@@ -115,8 +115,8 @@ export function parseSynthesis(holder: any, rawFindings: any[], kept: boolean[])
 /**
  * Merge the synthesizer's verdict on the prior findings into one list.
  * - A synthesized finding citing known ids inherits their attribution and
- *   votes under every source provider (so `strategy: all|majority` keeps
- *   meaning one ballot per provider). One citing none is the main agent's own.
+ *   votes under every source agent (so `strategy: all|majority` keeps
+ *   meaning one ballot per agent). One citing none is the main agent's own.
  * - A prior id named in `dismissed` (and cited by no finding) is removed and
  *   reported with its reason, never dropped silently.
  * - A prior id the synthesizer never mentions is kept unchanged.
@@ -133,13 +133,32 @@ export function mergeSynthesis(
     const srcs = [...new Set(synth.sources[i] ?? [])].filter((id) => byId.has(id));
     srcs.forEach((id) => cited.add(id));
     if (srcs.length === 0) {
-      out.push(f);
+      // The synthesizer's own addition: new to this run (issue #18).
+      out.push(f.status ? f : { ...f, status: "new" as const });
       return;
     }
     const origins = srcs.map((id) => byId.get(id)!);
     const agents = [...new Set(origins.map((o) => o.agent))];
+    // Validation inherits through the merge (issue #18): the synthesizer
+    // never sees the prior round itself, so a merged finding keeps its
+    // sources' verdict — fixed only when every source says fixed.
+    const inherited =
+      origins.every((o) => o.status === "fixed")
+        ? ("fixed" as const)
+        : origins.some((o) => (o.status ?? "new") === "new")
+          ? ("new" as const)
+          : ("open" as const);
+    // Suggestions ride the same path (issue #22): an explicit synthesizer
+    // suggestion wins, otherwise the first cited source's survives.
+    const inheritedSuggestion = origins.map((o) => o.suggestion).find((s) => s !== undefined);
     out.push({
       ...f,
+      status: f.status ?? inherited,
+      ...(f.suggestion !== undefined
+        ? {}
+        : inheritedSuggestion !== undefined
+          ? { suggestion: inheritedSuggestion }
+          : {}),
       agent: agents.join("+"),
       provider: origins[0].provider,
       model: origins[0].model,

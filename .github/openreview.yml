@@ -110,7 +110,7 @@ reviews:
   # --- Active review: everything in this repo gets the general pass ---
   - id: general-quality
     if_paths: ["**"]
-    strategy: any # any | all | majority: per-provider ballots; see website/docs/multi-review
+    strategy: any # any | all | majority: per-agent ballots; see website/docs/multi-review
     # Noise controls (issue #21): profile preset + explicit overrides (win).
     # quiet: high-confidence top-3 · balanced (default): passthrough ·
     # assertive: everything up to 100.
@@ -118,6 +118,14 @@ reviews:
     # min_confidence: 0.6
     # max_findings: 10
     # suppress: ["decided-pattern"] # rebutted items that must not resurrect (regex, file + comment)
+    # Incremental re-review (issue #18): on synchronize, review head-vs-last-reviewed-SHA
+    # and carry prior findings for fix validation instead of re-reviewing base..head.
+    # Stays off here: dogfood reviews the whole branch every push.
+    # incremental: false
+    # One-click fixes (issue #22): agents attach full replacement lines, rendered as
+    # appliable ```suggestion blocks inline and a fenced Suggested fixes section on the sticky.
+    # Default true, shown here commented since the default already applies.
+    # suggest_fixes: false
     # Cross-file context: full changed files + call-site excerpts automatic
     # (bounded by max_context_chars below); add explicit files when needed:
     # context_files: ["src/config.ts"]
@@ -140,6 +148,8 @@ reviews:
       min_severity: medium # suggestion | medium | high
       post_inline: true
       deduplicate: true
+      # consensus_escalation: true # escalate 2+-agent-confirmed findings one severity (opt-in; default false).
+      # Stays off here: dogfood verdicts stay comparable run over run.
 
   # --- Commented example: scoped strict review with a blocking verdict ---
   # - id: security-strict

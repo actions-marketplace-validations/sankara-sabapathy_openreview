@@ -3,7 +3,8 @@ import * as github from "@actions/github";
 import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import * as YAML from "yaml";
-import { parseConfig } from "./config.js";
+import { parseConfig, formatZodError, type OpenReviewConfig } from "./config.js";
+import { ZodError } from "zod";
 import { templateContextFor, resolveExtends, mergeConfigs, parseConfigLoose } from "./templates.js";
 import {
   resolveKeysFromEnv,
@@ -13,15 +14,18 @@ import {
   AgentFailedError,
   resolveDottedProvider,
   assertProviderRefs,
+  runTextAgent,
   type Finding,
   type AgentOutcome,
 } from "./providers.js";
 import {
   matchesAny, filterIgnored, dedupeFindings, applySuppression, decideReviewVerdict, combineVerdicts, combineBallots,
   applyDegradedFloor, resolveNoise, applyNoiseControls, splitDiff, scopeDiff, parseHunkRanges, type Verdict,
-  satisfiesActionVersion, runningActionVersion,
+  satisfiesActionVersion, runningActionVersion, builtActionVersion, renderPriorReview, matchCarriedFindings, validateFindingFiles,
+  scanPromptInjection, groupByAgent, escalateConsensus,
 } from "./reviewer.js";
-import { renderStickyBody, upsertStickyComment, appendStickySection, renderAppendSection, createInlineReview, type RunStatus } from "./github.js";
+import { parseAskComment, buildAskPrompt, collectFeedbackSignals, isAskAllowed, resolveAskProvider } from "./ask.js";
+import { renderStickyBody, upsertStickyComment, appendStickySection, renderAppendSection, createInlineReview, findStickyComment, parseStickyState, sanitizeErrorDetail, type RunStatus, type StickyFindingState } from "./github.js";
 import { initLogger, logInfo, logWarning, logDebug } from "./logger.js";
 import { buildContextBlock, buildRepoIndex } from "./context.js";
 import { authorizeTrigger } from "./authorize.js";
@@ -34,7 +38,15 @@ const CONFIG_CANDIDATES = [
   "openreview.yaml",
 ];
 
-async function loadConfig(configPath: string) {
+export async function loadConfig(configPath: string, explicit = false) {
+  // An explicit config-path that names nothing is a typo, not a default
+  // (issue #58d): fail hard instead of silently reviewing another file.
+  if (explicit && !existsSync(configPath)) {
+    throw new Error(
+      `Config file not found: ${configPath} (explicit config-path; not falling back to .github/openreview.yml). ` +
+        `See website/docs/configuration.md.`
+    );
+  }
   const candidates = [configPath, ...CONFIG_CANDIDATES.filter((c) => c !== configPath)];
   for (const p of candidates) {
     if (!existsSync(p)) continue;
@@ -42,13 +54,24 @@ async function loadConfig(configPath: string) {
     const loose = parseConfigLoose(raw);
     const extendsEntries = (loose.extends as string[] | undefined) ?? [];
     if (extendsEntries.length === 0) {
-      return { config: parseConfig(raw), path: p };
+      try {
+        return { config: parseConfig(raw), path: p };
+      } catch (e) {
+        if (e instanceof ZodError) throw new Error(formatZodError(e, p));
+        throw e;
+      }
     }
     // Templates resolve in order; this file overlays on top (child wins).
     const ctx = templateContextFor(p, process.env as any);
     const { merged, sources } = await resolveExtends(extendsEntries, ctx);
     const { extends: _ignored, ...top } = loose;
-    const config = parseConfig(mergeConfigs(merged, top) as unknown);
+    let config: OpenReviewConfig;
+    try {
+      config = parseConfig(mergeConfigs(merged, top) as unknown);
+    } catch (e) {
+      if (e instanceof ZodError) throw new Error(formatZodError(e, p));
+      throw e;
+    }
     logInfo(
       `Resolved ${sources.length} template(s): ${sources
         .map((s) => (s.sha ? `${s.source} @${s.sha.slice(0, 7)}` : s.source))
@@ -59,6 +82,32 @@ async function loadConfig(configPath: string) {
   throw new Error(
     `No config found. Tried: ${candidates.join(", ")}. Add .github/openreview.yml (see openreview.example.yml).`
   );
+}
+
+/** How a review should run on this push (issue #18). Pure so the
+ * orchestration branches (carry / fallback / incremental) are unit-tested;
+ * run() only executes the decision. */
+export type IncrementalMode =
+  | { kind: "full"; reason: string }
+  | { kind: "incremental"; baseShort: string }
+  | { kind: "carry"; reason: "no-new-commits" | "no-new-in-scope-changes" };
+
+export function decideIncremental(opts: {
+  incremental: boolean;
+  isSynchronize: boolean;
+  prior: { sha: string; truncated: boolean } | null;
+  headSha: string;
+  incDiffOk: boolean;
+  incScopedEmpty: boolean;
+}): IncrementalMode {
+  if (!opts.incremental) return { kind: "full", reason: "review not opted in" };
+  if (!opts.isSynchronize) return { kind: "full", reason: "manual review always runs full" };
+  if (!opts.prior) return { kind: "full", reason: "no prior run state" };
+  if (opts.prior.truncated) return { kind: "full", reason: "prior state truncated" };
+  if (opts.prior.sha === opts.headSha) return { kind: "carry", reason: "no-new-commits" };
+  if (!opts.incDiffOk) return { kind: "full", reason: "incremental diff unavailable" };
+  if (opts.incScopedEmpty) return { kind: "carry", reason: "no-new-in-scope-changes" };
+  return { kind: "incremental", baseShort: opts.prior.sha.slice(0, 7) };
 }
 
 /** Cap for paginated file listing (issue #50). GitHub renders at most one page
@@ -128,6 +177,60 @@ export async function getPrDiff(
     logWarning(
       `PR head moved during diff fetch (${baseline.slice(0, 7)} -> ${freshSha.slice(0, 7)}); ` +
         `file list may mix both heads, inline positions revalidated before posting.`
+    );
+  return { fileNames: names, diff: parts.join("\n\n"), headSha: freshSha, omitted, truncated, totalFiles: files.length, stale };
+}
+
+/**
+ * Incremental diff for issue #18: what changed between the last-reviewed
+ * SHA and the current head, via the compare API (one call, no pagination
+ * race). Falls back to the full PR diff on any failure — a force-push that
+ * rewrote history 404s the base, in which case re-reviewing everything is
+ * the only honest option. Same shape and accounting as getPrDiff so the
+ * review loop treats both uniformly.
+ */
+export async function getIncrementalDiff(
+  octokit: ReturnType<typeof github.getOctokit>,
+  owner: string,
+  repo: string,
+  pr: number,
+  base: string,
+  head: string
+): Promise<PrDiff> {
+  const { data } = await octokit.rest.repos.compareCommits({
+    owner,
+    repo,
+    base,
+    head,
+  });
+  const files = data.files ?? [];
+  const truncated = files.length > MAX_DIFF_FILES;
+  const capped = files.slice(0, MAX_DIFF_FILES);
+  const parts: string[] = [];
+  const names: string[] = [];
+  const omitted: string[] = [];
+  for (const f of capped) {
+    names.push(f.filename);
+    if (f.patch) parts.push(`--- a/${f.filename}\n+++ b/${f.filename}\n${f.patch}`);
+    else omitted.push(f.filename);
+  }
+  if (truncated)
+    logWarning(
+      `Incremental diff truncated: ${files.length} files changed since ${base.slice(0, 7)}, reviewing the first ${MAX_DIFF_FILES}.`
+    );
+  if (omitted.length > 0)
+    logWarning(
+      `${omitted.length} file(s) have no renderable patch (binary or too large) and were not sent to reviewers: ${omitted.slice(0, 10).join(", ")}${omitted.length > 10 ? ", …" : ""}`
+    );
+  // Same mid-fetch guard as the full diff (issue #71): a push landing
+  // during the compare leaves base...head stale. Fail closed, the new push
+  // re-runs and aborts are never read as a pass (issue #46).
+  const { data: pull } = await octokit.rest.pulls.get({ owner, repo, pull_number: pr });
+  const freshSha = pull.head.sha;
+  const stale = head !== freshSha;
+  if (stale)
+    logWarning(
+      `PR head moved during incremental diff fetch (${head.slice(0, 7)} -> ${freshSha.slice(0, 7)}); aborting - a fresh review runs on the new head.`
     );
   return { fileNames: names, diff: parts.join("\n\n"), headSha: freshSha, omitted, truncated, totalFiles: files.length, stale };
 }
@@ -257,6 +360,97 @@ export async function runPooled<T>(thunks: (() => Promise<T>)[], limit: number):
   return out;
 }
 
+type AskFlowOpts = {
+  octokit: ReturnType<typeof github.getOctokit>;
+  owner: string;
+  repo: string;
+  prNumber: number;
+  config: ReturnType<typeof parseConfig>;
+  keys: ReturnType<typeof resolveKeysFromEnv>;
+  question: string;
+  quoted: string;
+  sessionId: string;
+  deadlineAt: number;
+  dryRun: boolean;
+};
+
+/**
+ * In-thread Q&A (issue #23): answer `/ask` from the PR diff plus the
+ * recorded prior findings, then log the sticky's reaction signal (the
+ * learning half of issue #43; read-only, never changes behavior).
+ */
+async function runAskFlow(opts: AskFlowOpts): Promise<void> {
+  const { octokit, owner, repo, prNumber, config, keys } = opts;
+  const { fileNames, diff, stale } = await getPrDiff(
+    octokit, owner, repo, prNumber, (github.context.payload as any).pull_request?.head?.sha
+  );
+  if (stale) {
+    logWarning("Ask: PR head moved during diff fetch; answering from the fetched (slightly old) diff.");
+  }
+  if (!diff.trim() || fileNames.length === 0) {
+    logWarning("Ask: empty diff, nothing to answer from.");
+    return;
+  }
+  // Prior findings ground follow-ups ("what about the P1?") without
+  // re-running any agent. Absent state just means a thinner prompt.
+  let prior: { file: string; line?: number; comment: string }[] = [];
+  try {
+    const sticky = await findStickyComment(octokit, owner, repo, prNumber);
+    const state = sticky?.body ? parseStickyState(sticky.body) : null;
+    if (state) prior = state.reviews.flatMap((r) => r.findings);
+  } catch {
+    logWarning("Ask: prior run state unreadable; answering from the diff alone.");
+  }
+  const mainDef = config.reviews[0]?.main;
+  const resolved = resolveAskProvider(config);
+  if (!resolved.ok || !mainDef) {
+    logWarning(`Ask: cannot pick an answering provider (${!mainDef ? "no reviews configured" : (resolved as { reason: string }).reason}).`);
+    return;
+  }
+  const { provider } = resolved;
+  const providerName = mainDef.provider;
+  const { system, user } = buildAskPrompt({
+    diff: diff.slice(0, config.defaults.max_diff_chars ?? 80000),
+    priorFindings: prior,
+    quoted: opts.quoted,
+    question: opts.question,
+  });
+  let answer: string;
+  let modelLine = "";
+  try {
+    const r = await runTextAgent({
+      agentName: "ask",
+      providerName,
+      provider,
+      system,
+      user,
+      keys,
+      sessionId: opts.sessionId,
+      deadlineAt: opts.deadlineAt,
+    });
+    answer = r.text;
+    modelLine = `${provider.model}${r.usage ? ` · ${formatTokens(r.usage.in)}/${formatTokens(r.usage.out)} in/out` : ""}`;
+  } catch (e) {
+    logWarning(`Ask: answering failed (${e instanceof Error ? e.message : String(e)}).`);
+    answer = "";
+  }
+  if (opts.dryRun) {
+    logInfo(`DRY RUN ask answer (model ${provider.model}):\n${(answer || "(no answer)").slice(0, 2000)}`);
+    return;
+  }
+  // The answer carries its own marker so reaction collection (which scans
+  // bot comments by `<!-- openreview:` prefix) includes answers. It is NOT
+  // the sticky marker, so sticky lookup (first-line match) never selects it.
+  const body = answer
+    ? `<!-- openreview:answer -->\n**OpenReview answer** (to \`${opts.question.slice(0, 120)}\`)\n\n${answer}\n\n<sub>Answered with \`${modelLine || provider.model}\` · react on this comment to teach future reviews · ask again with \`/ask\`</sub>`
+    : `<!-- openreview:answer -->\nOpenReview could not answer that (model ${provider.model} returned nothing usable). Try rephrasing, or run a fresh review with \`/review\`.`;
+  await octokit.rest.issues.createComment({ owner, repo, issue_number: prNumber, body });
+  logInfo(`Ask: answered question (${opts.question.slice(0, 80)}).`);
+  const signals = await collectFeedbackSignals(octokit, owner, repo, prNumber);
+  logInfo(`Feedback signals: ${JSON.stringify(signals.totals)} across ${signals.comments.length} bot comment(s).`);
+}
+
+
 export async function run(): Promise<void> {
   try {
     initLogger();
@@ -277,14 +471,19 @@ export async function run(): Promise<void> {
     const configPath = core.getInput("config-path") || ".github/openreview.yml";
     const dryRun = (core.getInput("dry-run") || "false").toLowerCase() === "true";
 
-    const { config, path } = await loadConfig(configPath);
+    const { config, path } = await loadConfig(configPath, core.getInput("config-path") !== "");
     logInfo(`Loaded config: ${path} (${config.reviews.length} reviews)`);
     // Fail fast on dotted provider refs that resolve to nothing (issue #67):
     // a typo'd `opencode.flah` errors here naming both halves, before any
     // budget is spent. Legacy plain-unknown names keep warn-and-skip per agent.
     assertProviderRefs(config);
     if (config.requires_action) {
-      const running = runningActionVersion(process.env as any);
+      // Prefer the action's own package.json (issue #58c): the workflow
+      // usually pins a floating ref (@v1) that GITHUB_ACTION_REF cannot
+      // resolve, which used to skip the check.
+      const running =
+        runningActionVersion(process.env as any) ??
+        builtActionVersion({ actionPath: process.env.GITHUB_ACTION_PATH, distDir: import.meta.dirname });
       if (running && !satisfiesActionVersion(config.requires_action, running)) {
         throw new Error(
           `This openreview.yml needs action ${config.requires_action} but the runner is ${running}. ` +
@@ -293,6 +492,42 @@ export async function run(): Promise<void> {
       }
     }
     const keys = resolveKeysFromEnv(process.env as any);
+    // In-thread Q&A (issue #23): `/ask <question>` on a PR is answered from
+    // the diff, before the review gate below (which would reject any body
+    // that is not exactly the review command). Same write-access rule as
+    // /review: BASE-repo secrets are live here too (issue #59).
+    const askParsed =
+      (ctx.payload as any).issue?.pull_request != null
+        ? parseAskComment((ctx.payload as any).comment?.body)
+        : null;
+    if (askParsed) {
+      if (
+        !isAskAllowed(
+          (ctx.payload as any).comment?.author_association,
+          core.getInput("allowed-author-associations")
+        )
+      ) {
+        logWarning(
+          `Ask denied: sender association '${(ctx.payload as any).comment?.author_association ?? "NONE"}' may not spend provider budget. Nothing was answered or posted.`
+        );
+        return;
+      }
+      const askDeadline = Date.now() + (config.defaults.max_runtime_s ?? 1200) * 1000;
+      await runAskFlow({
+        octokit,
+        owner,
+        repo,
+        prNumber,
+        config,
+        keys,
+        question: askParsed.question,
+        quoted: askParsed.quoted,
+        sessionId: process.env.GITHUB_RUN_ID ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        deadlineAt: askDeadline,
+        dryRun,
+      });
+      return;
+    }
     // Authorization gate (issue #59): `issue_comment` runs in the BASE repo
     // context, so the secrets are live. Without this, anyone on the internet
     // could comment the command on any PR and spend the maintainer's keys.
@@ -343,6 +578,69 @@ export async function run(): Promise<void> {
     }
     logInfo(`Diff: ${fileNames.length} files, ${diff.length} chars (head ${headSha.slice(0, 7)})`);
     logDebug(`Diff files: ${fileNames.join(", ")}`);
+    // Prompt-injection tripwire (issue #58a): the diff is untrusted
+    // PR-author text. Flagged lines are still reviewed as code; the note
+    // tells a human where to look harder.
+    const injectionHits = scanPromptInjection(diff);
+    let injectionNote: string | null = null;
+    if (injectionHits.length > 0) {
+      injectionNote =
+        `${injectionHits.length} instruction-shaped line(s) in the diff ` +
+        `(treating the diff as untrusted data): ${injectionHits.slice(0, 3).join(" | ")}`;
+      logWarning(`Prompt-injection scan: ${injectionNote}`);
+    }
+    // Incremental re-review (issue #18): recover the last-reviewed SHA and
+    // open findings from the sticky's machine-readable state (slice 0).
+    // Only `synchronize` pushes qualify — a manual /review is an explicit
+    // ask for a fresh full review. One sticky lookup per run, not per review.
+    const isSynchronize = (ctx.payload as any).action === "synchronize";
+    type PriorCarry = { sha: string; verdict: Verdict; truncated: boolean; findings: StickyFindingState[] };
+    const priorByReview = new Map<string, PriorCarry>();
+    if (isSynchronize && config.reviews.some((r) => r.incremental)) {
+      try {
+        const sticky = await findStickyComment(octokit, owner, repo, prNumber);
+        const state = sticky?.body ? parseStickyState(sticky.body) : null;
+        if (state) {
+          for (const r of state.reviews) {
+            priorByReview.set(r.id, {
+              sha: state.sha,
+              verdict: r.verdict === "approve" || r.verdict === "request_changes" ? r.verdict : "comment",
+              truncated: r.truncated,
+              findings: r.findings,
+            });
+          }
+          logInfo(
+            `Incremental carry: prior run at ${state.sha.slice(0, 7)} recorded ${state.reviews.length} review(s) with state.`
+          );
+        } else {
+          logInfo("Incremental: no prior run state in sticky; reviews fall back to full diff.");
+        }
+      } catch (e) {
+        logWarning(`Incremental: sticky lookup failed (${(e as Error).message}); falling back to full diff.`);
+      }
+    }
+    // One incremental diff per run (all reviews share the prior run's SHA).
+    // A base that no longer resolves (force-push rewrote history) 404s the
+    // compare call — then re-reviewing everything is the honest fallback.
+    const incBase = [...priorByReview.values()].map((p) => p.sha)[0];
+    let incDiff: PrDiff | null = null;
+    if (incBase && incBase !== headSha) {
+      try {
+        incDiff = await getIncrementalDiff(octokit, owner, repo, prNumber, incBase, headSha);
+        if (incDiff.stale) {
+          core.setOutput("verdict", "comment");
+          core.setOutput("review_status", "error");
+          logWarning("Head moved during incremental diff fetch; aborting - a fresh review runs on the new head.");
+          return;
+        }
+        logInfo(
+          `Incremental diff: ${incDiff.fileNames.length} files, ${incDiff.diff.length} chars (${incBase.slice(0, 7)}..${headSha.slice(0, 7)})`
+        );
+      } catch (e) {
+        logWarning(`Incremental diff failed (${(e as Error).message}); falling back to full diff.`);
+        incDiff = null;
+      }
+    }
     if (truncated)
       logWarning(`PR touches more than ${MAX_DIFF_FILES} files; only the first ${MAX_DIFF_FILES} were reviewed.`);
     if (omitted.length > 0)
@@ -382,9 +680,62 @@ export async function run(): Promise<void> {
       postInline: boolean;
       agents: AgentRun[];
       usage: AgentSpend[];
+      /** Unmatched prior findings re-entering next run's state (issue #18). */
+      carried?: StickyFindingState[];
+      /** Pre-rendered incremental ledger lines for the sticky footer. */
+      ledger?: string[];
     }[] = [];
+    // Incremental parsed diff, shared by every incremental review in the run.
+    const parsedInc = incDiff ? splitDiff(incDiff.diff) : [];
+    const incIgnore = config.defaults.ignore ?? [];
     for (const review of config.reviews) {
-      const scopedFiles = inScope.filter((f) => matchesAny(f, review.if_paths));
+      const prior = priorByReview.get(review.id) ?? null;
+      const fullScoped = inScope.filter((f) => matchesAny(f, review.if_paths));
+      const incFiles = incDiff ? filterIgnored(incDiff.fileNames, incIgnore) : null;
+      const incScoped = incFiles ? incFiles.filter((f) => matchesAny(f, review.if_paths)) : null;
+      // One decision point for all three paths (issue #18): full review,
+      // incremental review of the additive diff, or carry without agents.
+      const mode = decideIncremental({
+        incremental: review.incremental,
+        isSynchronize,
+        prior: prior ? { sha: prior.sha, truncated: prior.truncated } : null,
+        headSha,
+        incDiffOk: incDiff !== null,
+        incScopedEmpty: incScoped !== null && incScoped.length === 0,
+      });
+      if (mode.kind === "carry") {
+        // No new commits, or no new in-scope changes: carry the previous
+        // verdict forward without spending provider budget. Fixes cannot
+        // have landed where nothing changed, so priors stay open by
+        // construction, never silently dropped. Carry implies prior state
+        // by decideIncremental's construction.
+        const p = prior!;
+        const why =
+          mode.reason === "no-new-commits"
+            ? "no new commits since the last review"
+            : "no new in-scope changes";
+        logInfo(`Review ${review.id}: incremental carry (${why}); ${p.findings.length} prior finding(s) stand.`);
+        perReview.push({
+          id: review.id,
+          verdict: p.verdict,
+          findings: [],
+          dismissed: [],
+          errors: [],
+          counted: true,
+          postInline: review.verdict.post_inline !== false,
+          agents: [],
+          usage: [],
+          carried: p.findings,
+          ledger: [
+            `\n> 🔁 Incremental since \`${p.sha.slice(0, 7)}\`: ${why}; ` +
+              `${p.findings.length} prior finding(s) carried, verdict stands at ${p.verdict}.`,
+          ],
+        });
+        continue;
+      }
+      const incActive = mode.kind === "incremental";
+      const baseFiles = incActive ? incFiles! : inScope;
+      const scopedFiles = incActive ? incScoped! : fullScoped;
       if (scopedFiles.length === 0) {
         logInfo(`Review ${review.id}: no matching paths, skipped.`);
         continue;
@@ -392,10 +743,12 @@ export async function run(): Promise<void> {
       // Scoped diff (issue #47). `if_paths` used to decide only *whether* a
       // review ran — agents always got the whole PR diff, so a src/-only review
       // still paid for (and could comment on) website/ and dist/. Parsed once per
-      // run, reused by every review and agent.
-      const scopedDiff = scopeDiff(scopedFiles, parsedDiff, inScope.length);
+      // run, reused by every review and agent. Incremental reviews scope the
+      // additive diff instead (issue #18).
+      const useParsed = incActive ? parsedInc : parsedDiff;
+      const scopedDiff = scopeDiff(scopedFiles, useParsed, baseFiles.length);
       logDebug(
-        `Review ${review.id}: ${scopedFiles.length}/${inScope.length} in-scope file(s) sent ` +
+        `Review ${review.id}: ${scopedFiles.length}/${baseFiles.length} in-scope file(s) sent ` +
           `(${scopedDiff.length} chars)`
       );
       // Cross-file context (issue #20): full files + call-site excerpts, budgeted.
@@ -423,6 +776,18 @@ export async function run(): Promise<void> {
         model: string;
         synthesis?: Synthesis;
       };
+      // Prior-round carry for incremental reviews (issue #18). Rendered once
+      // per review; subagents validate each entry, the synthesizer inherits
+      // through its cited sources (see mergeSynthesis).
+      const priorRender =
+        incActive && prior && prior.findings.length > 0 ? renderPriorReview(prior.findings) : null;
+      const priorReview = priorRender
+        ? {
+            baseShort: prior!.sha.slice(0, 7),
+            headShort: headSha.slice(0, 7),
+            block: priorRender.block,
+          }
+        : undefined;
       const mainDef = { ...review.main, name: review.main.name ?? `${review.id}:main` };
       const subDefs = review.subagents.map((s, i) => ({ ...s, name: s.name ?? `${review.id}:sub${i}` }));
       const synthesize = review.main_mode !== "parallel";
@@ -430,14 +795,16 @@ export async function run(): Promise<void> {
         `Review ${review.id}: launching ${1 + subDefs.length} agent(s) [${[mainDef, ...subDefs]
           .map((a) => `${a.name}/${a.provider}`)
           .join(", ")}] on ${scopedFiles.length} file(s), strategy=${review.strategy}, ` +
-          `main_mode=${synthesize ? "synthesize" : "parallel"}`
+          `main_mode=${synthesize ? "synthesize" : "parallel"}` +
+          (priorReview ? `, incremental carry (${priorRender!.shown}/${priorRender!.total} prior findings)` : "")
       );
       // Thunks, not promises: runAgent must not start until the pool allows it
       // (an eager promise is already in flight, so the cap would be a no-op).
       // The optional argument is the synthesizer's <prior_findings> block,
       // known only once the subagents have finished.
       const makeTask = (
-        a: { name: string; provider: string; instructions: string }
+        a: { name: string; provider: string; instructions: string },
+        isMain: boolean
       ): ((priorFindings?: string) => Promise<TaskResult>) | null => {
         let provider = config.providers[a.provider];
         if (!provider) {
@@ -464,6 +831,10 @@ export async function run(): Promise<void> {
             contextBlock,
             deadlineAt,
             priorFindings,
+            // Validation duty sits with the subagents; the synthesizer
+            // inherits each finding's status through its cited sources.
+            priorReview: !isMain ? priorReview : undefined,
+            suggestFixes: review.suggest_fixes ?? true,
           })
             .then((result): TaskResult => ({
               findings: result.findings,
@@ -504,10 +875,10 @@ export async function run(): Promise<void> {
             });
       };
       const subTasks = subDefs
-        .map((a) => makeTask(a))
+        .map((a) => makeTask(a, false))
         .filter((t): t is (p?: string) => Promise<TaskResult> => t !== null)
         .map((t) => () => t());
-      const mainTask = makeTask(mainDef);
+      const mainTask = makeTask(mainDef, true);
       // Bounded fan-out (issue #51): run at most `max_concurrency` agents at a
       // time instead of bursting every agent at the provider at once. The
       // thunk is what makes the cap real — see runPooled.
@@ -528,8 +899,24 @@ export async function run(): Promise<void> {
           `Review ${review.id}: synthesizer produced no usable result; keeping all ${reported} subagent finding(s).`
         );
       }
-      const agentErrors = results.filter((r) => r.error).map((r) => `- \`${r.agent}\`: ${r.error}`);
+      const agentErrors = results
+        .filter((r) => r.error)
+        // Sanitized for the sticky (issue #58f): provider error bodies may
+        // echo request material. Full text stays in the Actions log above.
+        .map((r) => `- \`${r.agent}\`: ${sanitizeErrorDetail(r.error!)}`);
       if (review.verdict.deduplicate) findings = dedupeFindings(findings);
+      // Grounding (issue #56): a finding on a file this review never saw is
+      // model drift, not signal — it neither shows nor votes. Dropped files
+      // are named in the logs, never silently lost.
+      const fileCheck = validateFindingFiles(findings, scopedFiles);
+      if (fileCheck.dropped.length > 0) {
+        logWarning(
+          `Review ${review.id}: dropped ${fileCheck.dropped.length} finding(s) on files outside the review scope: ` +
+            fileCheck.dropped.slice(0, 3).map((f) => `\`${f.file}\``).join(", ") +
+            (fileCheck.dropped.length > 3 ? ", ..." : "")
+        );
+        findings = fileCheck.visible;
+      }
       // Decided items: rebutted patterns suppressed before verdict math —
       // they neither show nor vote. Per-review wins over defaults.suppress.
       const suppress = review.suppress ?? config.defaults.suppress ?? [];
@@ -542,6 +929,15 @@ export async function run(): Promise<void> {
               `(${suppress.length} pattern(s))`
           );
         }
+      }
+      // Consensus escalation (issue #56c, opt-in): findings confirmed by
+      // >=2 independent agents escalate one severity before verdict math.
+      if (review.verdict.consensus_escalation) {
+        const esc = escalateConsensus(findings);
+        if (esc.escalated > 0) {
+          logInfo(`Review ${review.id}: consensus escalation raised ${esc.escalated} finding(s) one severity.`);
+        }
+        findings = esc.findings;
       }
       // Noise controls (issue #21): confidence floor + cap, then verdict on survivors.
       const noise = resolveNoise({
@@ -557,6 +953,44 @@ export async function run(): Promise<void> {
             `(profile=${review.profile ?? config.defaults.profile}, min_confidence=${noise.min_confidence}, max_findings=${noise.max_findings})`
         );
       }
+      // Incremental validation (issue #18): link this round's findings back
+      // to the carried priors. Fixed findings neither show nor vote;
+      // still-open and new findings vote as usual. Unmatched priors stay
+      // open (fail-safe) and re-enter next run's state; if any exist the
+      // review cannot report a clean approve.
+      let carried: StickyFindingState[] = [];
+      let ledger: string[] | undefined;
+      let incFloor = false;
+      if (incActive && prior && priorRender && priorRender.total > 0) {
+        const m = matchCarriedFindings(prior.findings, findings);
+        const voteSet = [...m.confirmed, ...m.fresh];
+        const unverified = m.unverified;
+        carried = unverified;
+        findings = voteSet;
+        const baseShort = prior.sha.slice(0, 7);
+        const openCount = m.open.length;
+        ledger = [
+          `\n> 🔁 Incremental since \`${baseShort}\`: ${m.fixed.length} fixed, ` +
+            `${openCount} still open${unverified.length > 0 ? ` (${unverified.length} carried unverified)` : ""}, ${m.fresh.length} new.`,
+        ];
+        if (m.fixed.length > 0) {
+          ledger.push(
+            `<details><summary>Fixed since ${baseShort} (${m.fixed.length})</summary>\n\n` +
+              m.fixed
+                .map((f) => `- \`${f.file}${f.line !== undefined ? `:${f.line}` : ""}\` — ${f.comment.replace(/\s+/g, " ").slice(0, 120)}`)
+                .join("\n") +
+              `\n\n</details>`
+          );
+        }
+        logInfo(
+          `Review ${review.id}: incremental match — ${m.fixed.length} fixed, ${openCount} still open, ${m.fresh.length} new, ${unverified.length} unverified.`
+        );
+        if (unverified.length > 0) {
+          // Unvalidated carry means no clean approve: the next run (or a
+          // human) still has to look. Applied after the verdict math below.
+          incFloor = true;
+        }
+      }
       findings.sort((a, b) =>
         ({ high: 0, medium: 1, suggestion: 2 } as const)[a.severity] -
         ({ high: 0, medium: 1, suggestion: 2 } as const)[b.severity]
@@ -569,23 +1003,16 @@ export async function run(): Promise<void> {
       // it may not report a clean pass either: floor it at `comment` rather
       // than dropping its findings or claiming everything was checked.
       const degraded = counted > 0 && counted < results.length;
-      const verdict = (() => {
+      let verdict = (() => {
         if (counted === 0) return "approve" as Verdict; // placeholder, excluded below
-        // One ballot per distinct provider (issue #12). `any` reproduces the
-        // old pooled behavior exactly; `all`/`majority` resolve disagreement.
-        // Dotted refs (`opencode.flash`) vote under their full ref, so two
-        // models on one transport disagree as two ballots (issue #67).
-        const byProvider = new Map<string, typeof findings>();
-        // A synthesized finding merging several agents' reports votes in
-        // each source provider's ballot.
-        for (const f of findings) {
-          for (const v of f.voters?.length ? f.voters : [f.provider]) {
-            const list = byProvider.get(v) ?? [];
-            list.push(f);
-            byProvider.set(v, list);
-          }
-        }
-        const ballots = [...byProvider.entries()].map(([name, fs]) => {
+        // One ballot per agent (issue #56a). `any` reproduces the old pooled
+        // behavior exactly (max of maxes); `all`/`majority` now resolve real
+        // multi-agent disagreement instead of degenerating to a single voter
+        // when every agent shares one provider (issue #12's per-provider
+        // ballots did that). A merged finding votes in each contributing
+        // agent's ballot.
+        const byAgent = groupByAgent(findings);
+        const ballots = [...byAgent.entries()].map(([name, fs]) => {
           const v = decideReviewVerdict(review.verdict.mode, review.verdict.min_severity, fs);
           logInfo(`Review ${review.id}: ballot ${name} -> ${v} (${fs.length} findings)`);
           return v;
@@ -599,6 +1026,12 @@ export async function run(): Promise<void> {
         }
         return applyDegradedFloor(base, counted, results.length);
       })();
+      if (incFloor && verdict === "approve") {
+        verdict = "comment";
+        logWarning(
+          `Review ${review.id}: ${carried.length} prior finding(s) carried unverified - flooring to comment instead of a clean approve.`
+        );
+      }
       perReview.push({
         id: review.id,
         verdict,
@@ -633,6 +1066,8 @@ export async function run(): Promise<void> {
             startedAt: r.startedAt,
             endedAt: r.endedAt,
           })),
+        carried: carried.length > 0 ? carried : undefined,
+        ledger,
       });
       if (counted === 0) {
         logWarning(
@@ -697,7 +1132,20 @@ export async function run(): Promise<void> {
       findings: all,
       runUrl,
       headSha,
-      stateReviews: perReview.map((r) => ({ id: r.id, verdict: r.verdict, findings: r.findings })),
+      stateReviews: perReview.map((r) => ({
+        id: r.id,
+        verdict: r.verdict,
+        findings: [
+          ...r.findings.map((f) => ({
+            file: f.file,
+            ...(f.line !== undefined ? { line: f.line } : {}),
+            severity: f.severity,
+            category: f.category,
+            comment: f.comment,
+          })),
+          ...(r.carried ?? []),
+        ],
+      })),
     });
     // Derived from actual agent outcomes, not from a hardcoded list of three
     // env var names — a config using key_from: env.GROQ_API_KEY used to be told
@@ -713,6 +1161,9 @@ export async function run(): Promise<void> {
     // Per-run footer extras: shared by update mode (appended to the sticky)
     // and append mode (inside the run's section) — issue #69.
     const extras: string[] = [];
+    if (injectionNote) {
+      extras.push(`\n\n> ⚠️ ${injectionNote}.`);
+    }
     if (truncated || omitted.length > 0) {
       const bits: string[] = [];
       if (truncated) bits.push(`only the first ${MAX_DIFF_FILES} of ${totalFiles} changed files were reviewed`);
@@ -729,6 +1180,11 @@ export async function run(): Promise<void> {
     if (agentsLine) {
       extras.push(`\n<sub>Agents: ${agentsLine}</sub>`);
       logInfo(`Per-agent usage: ${agentsLine}`);
+    }
+    // Incremental ledgers ride the same footer path in both sticky modes
+    // (issue #18): fixed/still-open/new counts plus the fixed list.
+    for (const r of perReview) {
+      if (r.ledger) extras.push(...r.ledger);
     }
     if (skippedNoKey.length > 0) {
       const names = [...new Set(skippedNoKey.map((a) => a.agent))].map((a) => `\`${a}\``).join(", ");
@@ -784,7 +1240,20 @@ export async function run(): Promise<void> {
           headSha,
           runUrl,
           extras,
-          stateReviews: perReview.map((r) => ({ id: r.id, verdict: r.verdict, findings: r.findings })),
+          stateReviews: perReview.map((r) => ({
+        id: r.id,
+        verdict: r.verdict,
+        findings: [
+          ...r.findings.map((f) => ({
+            file: f.file,
+            ...(f.line !== undefined ? { line: f.line } : {}),
+            severity: f.severity,
+            category: f.category,
+            comment: f.comment,
+          })),
+          ...(r.carried ?? []),
+        ],
+      })),
         });
         const { rotated } = await appendStickySection(octokit, owner, repo, prNumber, section);
         logInfo(`Appended sticky section (verdict ${global}, ${all.length} findings${rotated ? ", rotated" : ""}).`);
@@ -792,6 +1261,11 @@ export async function run(): Promise<void> {
         await upsertStickyComment(octokit, owner, repo, prNumber, stickyBase + extras.join(""));
         logInfo(`Published sticky comment (verdict ${global}, ${all.length} findings).`);
       }
+      // Feedback signal (issue #23, learning half of #43): reactions on the
+      // bot's own comments, logged as structured output. Read-only; a
+      // failure here must never fail the run.
+      const signals = await collectFeedbackSignals(octokit, owner, repo, prNumber);
+      logInfo(`Feedback signals: ${JSON.stringify(signals.totals)} across ${signals.comments.length} bot comment(s).`);
     }
     if (global === "request_changes" && config.global_verdict.fail_check_on_request_changes)
       core.setFailed("OpenReview verdict: request_changes");

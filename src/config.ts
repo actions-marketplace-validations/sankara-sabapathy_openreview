@@ -1,4 +1,4 @@
-import { z } from "zod";
+import { z, ZodError } from "zod";
 
 export const ProviderKind = z.enum([
   "anthropic",
@@ -489,6 +489,10 @@ export const VerdictConfig = z.object({
   min_severity: z.enum(["suggestion", "medium", "high"]).default("medium"),
   post_inline: z.boolean().default(true),
   deduplicate: z.boolean().default(true),
+  // Consensus escalation (issue #56): a finding confirmed by >=2 independent
+  // agents (merged attribution) escalates one severity level before verdict
+  // math. Off by default: it makes verdicts stricter.
+  consensus_escalation: z.boolean().default(false),
 });
 export type VerdictConfig = z.infer<typeof VerdictConfig>;
 
@@ -514,6 +518,15 @@ export const ReviewConfig = z.object({
   // Decided items: rebutted patterns suppressed before verdict math (win over
   // defaults.suppress when set).
   suppress: SuppressPatterns.optional(),
+  // Incremental re-review (issue #18): on `synchronize`, review only
+  // head-vs-last-reviewed-SHA (compare API, full-diff fallback) and carry
+  // the previous round's open findings for fix validation, instead of
+  // re-reviewing base..head from scratch. Manual `/review` always runs full.
+  incremental: z.boolean().default(false),
+  // One-click fixes (issue #22): agents attach full replacement lines as
+  // `suggestion`, rendered as GitHub ```suggestion blocks when the finding
+  // is line-mappable and fenced code otherwise. Off saves output tokens.
+  suggest_fixes: z.boolean().default(true),
   main: AgentConfig,
   subagents: z.array(AgentConfig).default([]),
   verdict: VerdictConfig.default({}),
@@ -572,4 +585,32 @@ export type OpenReviewConfig = z.infer<typeof OpenReviewConfig>;
 
 export function parseConfig(raw: unknown): OpenReviewConfig {
   return OpenReviewConfig.parse(raw);
+}
+
+/**
+ * Human-readable Zod failures (issue #58e). The raw `e.message` is a JSON
+ * array dump — the first thing every new user hits deserves field paths
+ * and a docs pointer instead.
+ */
+export function formatZodError(e: ZodError, where: string): string {
+  const bits = e.issues.map((i) => {
+    const at = i.path.length > 0 ? i.path.map(String).join(".") : "(root)";
+    return `${at}: expected ${expectedOf(i)}, received ${receivedOf(i)}`;
+  });
+  return `Invalid config in ${where}:\n- ${bits.join("\n- ")}\nSee website/docs/configuration.md for the full reference.`;
+}
+
+function expectedOf(i: { code: string; options?: readonly unknown[]; expected?: unknown }): string {
+  if (i.code === "invalid_enum_value" && Array.isArray(i.options)) return i.options.map(String).join("|");
+  if (i.expected !== undefined) return String(i.expected);
+  return i.code;
+}
+
+function receivedOf(i: unknown): string {
+  const received = (i as { received?: unknown } | null | undefined)?.received;
+  // Zod reports a missing value as the string "undefined" (its parsed-type
+  // name); collapse both spellings to "missing" for humans.
+  if (received === undefined || received === "undefined") return "missing";
+  const t = typeof received;
+  return t === "string" ? JSON.stringify(received) : t;
 }

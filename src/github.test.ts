@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { renderStickyBody, upsertStickyComment, createInlineReview, renderAppendSection, appendToSticky, appendStickySection, STICKY_MARKER, STICKY_LIMIT, renderStickyState, parseStickyState, STICKY_STATE_COMMENT_CAP, STICKY_STATE_FINDINGS_CAP } from "./github.js";
+import { renderStickyBody, upsertStickyComment, createInlineReview, renderAppendSection, appendToSticky, appendStickySection, STICKY_MARKER, STICKY_LIMIT, renderStickyState, parseStickyState, STICKY_STATE_COMMENT_CAP, STICKY_STATE_FINDINGS_CAP, renderSuggestedFixes, sanitizeSuggestion, sanitizeErrorDetail, SUGGESTED_FIXES_SHOWN } from "./github.js";
 import { countsAsReview, type AgentOutcome } from "./providers.js";
 
 const base = { findings: [], runUrl: "https://example.test/run/1" };
@@ -335,7 +335,6 @@ describe("rotation bookkeeping (dogfood on #75)", () => {
   });
 
   it("a rotated comment is never reselected", async () => {
-    const { markSuperseded } = await import("./github.js");
     const calls: any = {};
     const octokit = {
       paginate: async () => calls.comments,
@@ -488,5 +487,99 @@ describe("sticky run state (issue #18 slice 0)", () => {
     const parsed = parseStickyState(body);
     assert.ok(parsed);
     assert.equal(parsed.reviews[0].findings[0].comment, comment);
+  });
+});
+
+describe("renderSuggestedFixes (issue #22)", () => {
+  const F = (over: Record<string, unknown> = {}) => ({
+    file: "src/a.ts",
+    line: 10,
+    severity: "high",
+    category: "bugs",
+    comment: "Null deref.",
+    ...over,
+  });
+  it("renders nothing without suggestions", () => {
+    assert.deepEqual(renderSuggestedFixes([F(), F({ file: "b.ts" })]), []);
+  });
+  it("fences each fix with a language tag and location", () => {
+    const lines = renderSuggestedFixes([F({ suggestion: "if (x) foo();" })]).join("\n");
+    assert.match(lines, /Suggested fixes \(1\)/);
+    assert.match(lines, /`src\/a\.ts:10`/);
+    assert.match(lines, /```ts/);
+    assert.match(lines, /if \(x\) foo\(\);/);
+  });
+  it("strips fences so model output cannot break the block", () => {
+    assert.equal(sanitizeSuggestion("```js\nx();\n```"), "js\nx();");
+    const lines = renderSuggestedFixes([F({ suggestion: "```\nevil();\n```" })]).join("\n");
+    assert.equal(lines.split("```").length - 1, 2);
+  });
+  it("caps the section and notes the remainder", () => {
+    const many = Array.from({ length: SUGGESTED_FIXES_SHOWN + 3 }, (_, i) =>
+      F({ file: `f${i}.ts`, suggestion: `fix${i}();` })
+    );
+    const lines = renderSuggestedFixes(many).join("\n");
+    assert.match(lines, new RegExp(`Suggested fixes \\(${SUGGESTED_FIXES_SHOWN + 3}\\)`));
+    assert.match(lines, /and 3 more/);
+  });
+});
+
+describe("createInlineReview suggestions (issue #22)", () => {
+  const ranges = new Map([["src/a.ts", [{ start: 10, end: 14 }]]]);
+  const mock = (calls: any) => ({
+    rest: { pulls: { createReview: async (p: any) => { calls.review = p; } } },
+  }) as any;
+
+  it("appends an appliable suggestion block on a valid line", async () => {
+    const calls: any = {};
+    const res = await createInlineReview(
+      mock(calls), "o", "r", 1, "sha", "comment",
+      [{ file: "src/a.ts", line: 12, comment: "Null deref.", suggestion: "if (x) {\n  foo();\n}" }],
+      ranges
+    );
+    assert.deepEqual(res, { posted: 1, dropped: 0 });
+    assert.match(calls.review.comments[0].body, /Null deref\./);
+    assert.match(calls.review.comments[0].body, /```suggestion/);
+    assert.match(calls.review.comments[0].body, /if \(x\) \{/);
+  });
+
+  it("shows file-level suggestions fenced, not as appliable blocks", async () => {
+    const calls: any = {};
+    const res = await createInlineReview(
+      mock(calls), "o", "r", 1, "sha", "comment",
+      [{ file: "src/a.ts", comment: "Config issue.", suggestion: "key: value" }],
+      ranges
+    );
+    assert.deepEqual(res, { posted: 0, dropped: 0 });
+    assert.match(calls.review.body, /Suggested fix for `src\/a\.ts`/);
+    assert.match(calls.review.body, /key: value/);
+    assert.doesNotMatch(calls.review.body, /```suggestion/);
+  });
+});
+
+describe("sanitizeErrorDetail (issue #58f)", () => {
+  it("redacts key-shaped strings", () => {
+    const out = sanitizeErrorDetail("llm 500: key=sk-ant-oat01-abcdef1234567890 rejected");
+    assert.doesNotMatch(out, /sk-ant/);
+    assert.match(out, /\[redacted\]/);
+    assert.match(out, /rejected/);
+  });
+  it("truncates long bodies but keeps short ones intact", () => {
+    assert.equal(sanitizeErrorDetail("boom", 300), "boom");
+    const out = sanitizeErrorDetail("x".repeat(400));
+    assert.ok(out.length <= 301);
+  });
+});
+
+describe("sticky table escaping (issue #58g)", () => {
+  it("neutralizes pipes and backticks in file cells", () => {
+    const body = renderStickyBody({
+      runUrl: "https://example.test/run/1",
+      verdict: "comment",
+      perReview: [{ id: "r", verdict: "comment", count: 1, counted: true }],
+      findings: [{ file: "a`b|c.ts", line: 1, severity: "high", category: "x", comment: "c", agent: "a", provider: "p", model: "m" }],
+    });
+    assert.doesNotMatch(body, /`a`b/);
+    assert.match(body, /a'b\\|c\.ts/);
   });
 });
